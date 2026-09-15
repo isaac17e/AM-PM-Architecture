@@ -370,20 +370,6 @@ def get_spot_safe_bkm(ticker):
 
 # ================================================
 # === INTERVENCION 2: Funciones BKM (Bakshi, Kapadia y Madan, 2003) ===
-#
-# Momentos model-free a partir de la curva continua de precios OTM (calls K>=S, puts K<S):
-#
-#   V(T) = int_S^inf [2*(1-ln(K/S))/K^2] C(K) dK + int_0^S [2*(1+ln(S/K))/K^2] P(K) dK
-#   W(T) = int_S^inf [6*ln(K/S) - 3*ln(K/S)^2]/K^2 C(K) dK - int_0^S [6*ln(S/K) + 3*ln(S/K)^2]/K^2 P(K) dK
-#   X(T) = int_S^inf [12*ln(K/S)^2 - 4*ln(K/S)^3]/K^2 C(K) dK + int_0^S [12*ln(S/K)^2 + 4*ln(S/K)^3]/K^2 P(K) dK
-#
-#   mu(T)   = e^{rT} - 1 - (e^{rT}/2)*V - (e^{rT}/6)*W - (e^{rT}/24)*X
-#   MFIV(T) = e^{rT}*V - mu(T)^2
-#   MFIS(T) = [e^{rT}*W - 3*mu(T)*e^{rT}*V + 2*mu(T)^3] / MFIV(T)^{3/2}
-#   MFIK(T) = [e^{rT}*X - 4*mu(T)*e^{rT}*W + 6*e^{rT}*mu(T)^2*V - 3*mu(T)^4] / MFIV(T)^2
-#
-# La integracion se resuelve numericamente (regla del Trapecio, np.trapz) sobre los
-# strikes OTM disponibles en cada lado (calls/puts).
 # ================================================
 def bkm_iv_chain_to_prices(S, r, T, chain_df):
     if chain_df is None or chain_df.empty:
