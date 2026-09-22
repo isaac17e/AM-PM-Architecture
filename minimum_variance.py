@@ -168,6 +168,14 @@ def safe_scrape_table(url, fallback=None):
         return fallback
 
 
+def _parse_market_cap(x):
+    m = re.match(r"^\$?\s*([0-9]*\.?[0-9]+)\s*([TBMK]?)$", str(x).strip().upper())
+    if not m:
+        return np.nan
+    val, suf = m.groups()
+    return float(val) * {"T": 1e12, "B": 1e9, "M": 1e6, "K": 1e3, "": 1.0}[suf]
+
+
 def clean_symbol_table(tbl):
     tbl = tbl.copy()
     tbl.columns = [str(c).strip().lower().replace(" ", "_") for c in tbl.columns]
@@ -181,7 +189,15 @@ def clean_symbol_table(tbl):
         & ~tbl["symbol"].astype(str).str.match(r"^[0-9]")
     ].copy()
     tbl["symbol"] = tbl["symbol"].astype(str).str.upper().str.replace(".", "-", regex=False)
-    return tbl
+    # Ordena explicitamente por market cap real en vez de confiar en el orden
+    # con el que la fuente sirve la tabla (defensa ante cambios de sort default).
+    if "market_cap" in tbl.columns:
+        cap_num = tbl["market_cap"].apply(_parse_market_cap)
+        if cap_num.notna().any():
+            tbl = tbl.assign(_cap_num=cap_num).sort_values(
+                "_cap_num", ascending=False, kind="stable"
+            ).drop(columns="_cap_num")
+    return tbl.reset_index(drop=True)
 
 
 print("[INFO] Obteniendo tickers del S&P 500 (stockanalysis.com)...")

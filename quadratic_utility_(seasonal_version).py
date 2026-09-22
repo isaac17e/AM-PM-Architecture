@@ -164,6 +164,38 @@ def safe_scrape_table(url, fallback=None, headers=None):
         return fallback
 
 
+def _parse_market_cap(x):
+    m = re.match(r"^\$?\s*([0-9]*\.?[0-9]+)\s*([TBMK]?)$", str(x).strip().upper())
+    if not m:
+        return np.nan
+    val, suf = m.groups()
+    return float(val) * {"T": 1e12, "B": 1e9, "M": 1e6, "K": 1e3, "": 1.0}[suf]
+
+
+def clean_symbol_table(tbl):
+    tbl = tbl.copy()
+    tbl.columns = [str(c).strip().lower().replace(" ", "_") for c in tbl.columns]
+    symbol_col = "symbol" if "symbol" in tbl.columns else tbl.columns[1]
+    tbl = tbl.rename(columns={symbol_col: "symbol"})
+    tbl = tbl[
+        tbl["symbol"].notna()
+        & ~tbl["symbol"].astype(str).str.contains(r"\^|\$", regex=True)
+        & (tbl["symbol"].astype(str).str.len() >= 1)
+        & (tbl["symbol"].astype(str).str.len() <= 5)
+        & ~tbl["symbol"].astype(str).str.match(r"^[0-9]")
+    ].copy()
+    tbl["symbol"] = tbl["symbol"].astype(str).str.upper().str.replace(".", "-", regex=False)
+    # Ordena explicitamente por market cap real en vez de confiar en el orden
+    # con el que la fuente sirve la tabla (defensa ante cambios de sort default).
+    if "market_cap" in tbl.columns:
+        cap_num = tbl["market_cap"].apply(_parse_market_cap)
+        if cap_num.notna().any():
+            tbl = tbl.assign(_cap_num=cap_num).sort_values(
+                "_cap_num", ascending=False, kind="stable"
+            ).drop(columns="_cap_num")
+    return tbl.reset_index(drop=True)
+
+
 # ================================================
 # FUNCIONES AUXILIARES: Polygon.io
 # ================================================
@@ -574,59 +606,24 @@ def polygon_get_sector_etf(ticker):
 
 
 # ================================================
-# OBTENER TICKERS: S&P 500
+# OBTENER TICKERS: S&P 500 (top N por market cap real, stockanalysis.com)
 # ================================================
 print("Obteniendo tickers del S&P 500...")
-sp500_tbl = safe_scrape_table("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+sp500_tbl = safe_scrape_table("https://stockanalysis.com/list/sp-500-stocks/")
 
-if sp500_tbl is None or "Symbol" not in sp500_tbl.columns:
-    raise RuntimeError("No se pudo obtener la lista de miembros del S&P 500 desde Wikipedia.")
+if sp500_tbl is None:
+    print("Reintentando con slickcharts.com como fuente alterna...")
+    sp500_tbl = safe_scrape_table("https://www.slickcharts.com/sp500")
 
-sp500_members = (
-    sp500_tbl["Symbol"].astype(str).str.replace(".", "-", regex=False).str.upper().unique().tolist()
-)
-print(f"Miembros del S&P 500 obtenidos: {len(sp500_members)}")
-print("Consultando market cap (Yahoo Finance) para ordenar por tamaño...")
-
-
-def get_market_cap(ticker):
-    try:
-        fi = yf.Ticker(ticker).fast_info
-        mc = fi.get("marketCap") if hasattr(fi, "get") else None
-        if mc is None:
-            mc = getattr(fi, "market_cap", None)
-        if mc is None or (isinstance(mc, float) and np.isnan(mc)):
-            raise ValueError
-        return float(mc)
-    except Exception:
-        try:
-            info = yf.Ticker(ticker).info
-            mc = info.get("marketCap")
-            return float(mc) if mc is not None else np.nan
-        except Exception:
-            return np.nan
-
-
-market_cap_rows = []
-for i, tk in enumerate(sp500_members, start=1):
-    market_cap_rows.append({"symbol": tk, "market_cap": get_market_cap(tk)})
-    if i % 50 == 0 or i == len(sp500_members):
-        print(f"   Market cap: {i}/{len(sp500_members)}")
-
-sp500_marketcap = pd.DataFrame(market_cap_rows).dropna(subset=["market_cap"])
-
-if len(sp500_marketcap) > 0:
-    sp500_tickers = (
-        sp500_marketcap.sort_values("market_cap", ascending=False)
-        .head(n_top_sp500)["symbol"].tolist()
-    )
+if sp500_tbl is not None:
+    sp500_tbl_clean = clean_symbol_table(sp500_tbl)
+    sp500_tickers = sp500_tbl_clean["symbol"].iloc[: min(n_top_sp500, len(sp500_tbl_clean))].unique().tolist()
     print(f"S&P 500: {n_top_sp500} tickers objetivo, {len(sp500_tickers)} unicos obtenidos "
-          f"(ordenados por market cap real)")
+          f"(ordenados por market cap real, stockanalysis.com)")
 else:
-    print("Error consultando market cap. Se usara el orden de la tabla original.")
-    sp500_tickers = sp500_members[:n_top_sp500]
-    print(f"S&P 500: {n_top_sp500} tickers objetivo, {len(sp500_tickers)} unicos obtenidos "
-          f"(orden de tabla, sin market cap)")
+    sp500_tickers = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "BRK-B", "LLY", "AVGO",
+                      "TSLA", "JPM", "UNH", "V", "XOM", "MA", "JNJ", "PG", "COST", "HD"]
+    print("ADVERTENCIA: Scraping fallo en ambas fuentes - usando fallback S&P 500 (20 tickers hardcodeados)")
 
 # ================================================
 # OBTENER TICKERS: NASDAQ
@@ -635,19 +632,7 @@ print("\nObteniendo tickers del NASDAQ...")
 nasdaq_tbl = safe_scrape_table("https://stockanalysis.com/list/nasdaq-stocks/")
 
 if nasdaq_tbl is not None:
-    nasdaq_tbl_clean = nasdaq_tbl.copy()
-    nasdaq_tbl_clean.columns = [str(c).strip().lower().replace(" ", "_") for c in nasdaq_tbl_clean.columns]
-    symbol_col = "symbol" if "symbol" in nasdaq_tbl_clean.columns else nasdaq_tbl_clean.columns[1]
-    nasdaq_tbl_clean = nasdaq_tbl_clean.rename(columns={symbol_col: "symbol"})
-    nasdaq_tbl_clean = nasdaq_tbl_clean[
-        nasdaq_tbl_clean["symbol"].notna()
-        & ~nasdaq_tbl_clean["symbol"].astype(str).str.contains(r"\^|\$", regex=True)
-        & (nasdaq_tbl_clean["symbol"].astype(str).str.len() >= 1)
-        & (nasdaq_tbl_clean["symbol"].astype(str).str.len() <= 5)
-        & ~nasdaq_tbl_clean["symbol"].astype(str).str.match(r"^[0-9]")
-    ].copy()
-    nasdaq_tbl_clean["symbol"] = nasdaq_tbl_clean["symbol"].astype(str).str.upper().str.replace(".", "-", regex=False)
-
+    nasdaq_tbl_clean = clean_symbol_table(nasdaq_tbl)
     nasdaq_tickers = nasdaq_tbl_clean["symbol"].iloc[: min(n_top_nasdaq, len(nasdaq_tbl_clean))].unique().tolist()
     print(f"NASDAQ: {n_top_nasdaq} tickers objetivo, {len(nasdaq_tickers)} unicos obtenidos")
 
