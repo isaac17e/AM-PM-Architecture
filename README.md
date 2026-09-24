@@ -28,18 +28,34 @@ The repository combines classical portfolio optimization (mean-variance, quadrat
 The scripts run independently, but they are designed to chain together: the output of an optimizer (a `ticker: weight` dictionary) becomes the input for the management and risk modules.
 
 ```
-   [ SELECTION + OPTIMIZATION ]
-   quadratic_utility.py
-   minimum_variance.py            ──►  portfolio  { "GLD": 0.18, "DHR": 0.18, ... }
-   black_litterman.py                        │
-                                             ▼
-                              ┌──────────────┴──────────────┐
+                        risk_estimators.py
+                 (shared estimation layer, imported by all optimizers)
+                                   │
+   [ SELECTION + OPTIMIZATION ]    │
+   quadratic_utility.py     ◄──────┤
+   minimum_variance.py      ◄──────┤  ──►  portfolio  { "GLD": 0.18, "DHR": 0.18, ... }
+   black_litterman.py       ◄──────┘             │
+                                                 ▼
+                              ┌──────────────────┴──────────┐
                               ▼                             ▼
                        [ ENTRY TIMING ]          [ MANAGEMENT AND RISK ]
                    entry_signal_tool.py           active_management.py
                                                   portfolio_risk_score_leverage.py
                                                   portfolio_gex_field.py
 ```
+
+### `risk_estimators.py`
+A dependency-free (numpy/pandas/scipy only) module holding the estimation logic
+the optimizers share, so the same choices are not re-implemented five times:
+
+| Function | Purpose |
+|---|---|
+| `cov_ewma_shrunk` | EWMA covariance + Ledoit-Wolf shrinkage toward a constant-correlation target. Replaces the equal-weighted sample covariance. |
+| `q_to_p_vol` / `q_to_p_correlation` | Risk-neutral → physical corrections for the variance and correlation risk premia. |
+| `standardized_panel` / `rescale_panel` / `portfolio_moments` | Portfolio skewness and kurtosis from co-moments, in `O(J·n)`, instead of averaging marginal moments. |
+| `portfolio_moment_gradients` | Analytic gradients of σ, skew and excess kurtosis, for Euler-style marginal CVaR contributions. |
+| `cornish_fisher_is_monotone` / `var_cvar_cornish_fisher` | Cornish-Fisher VaR/CVaR with a validity (monotonicity) check. |
+| `martin_wagner_excess_return` | **Experimental, off by default.** Expected return from risk-neutral variance. The formula is not verified against the source paper — see the warning in the module. |
 
 ---
 
@@ -103,17 +119,18 @@ Pipeline:
 2. Computes descriptive statistics, correlations, and **Fama-French 3-factor betas** (`pandas_datareader`).
 3. **Joint candidate selection via QUBO/Ising**: brute force when the search space is small, simulated annealing otherwise, with an objective blending Sharpe, low volatility, and decorrelation.
 4. Applies sequential filters: delta, recent volatility, IV vs. realized volatility, and a **BKM MFIS filter** (flags anomalous hedging vs. speculation via a z-score against the asset's own historical MFIS).
-5. Builds the covariance matrix with **shrinkage between implied (BKM) and historical covariance**, penalized by implied skewness and kurtosis (`theta1`, `theta2`).
+5. Builds the covariance matrix as a **shrinkage between implied (BKM) and historical covariance**. The historical leg is estimated from **daily** returns with EWMA weighting and Ledoit-Wolf shrinkage, not from the monthly sample covariance. Implied volatilities and implied correlations are converted from the risk-neutral to the physical measure before use.
 6. Optimizes with `quadprog` and produces: efficient frontier, lambda comparison, risk attribution by Greeks, maximum drawdown analysis, and an executive summary.
 
-Key parameters: `lambda_`, `max_weight`, `horizon_months`, `target_total_tickers`, `bkm_z_threshold`, `cornish_fisher_confidence`.
+Key parameters: `lambda_`, `max_weight`, `horizon_months`, `target_total_tickers`, `bkm_z_threshold`, `cornish_fisher_confidence`, `cov_halflife_days`, `use_q_to_p_vol`, `use_q_to_p_correlation`.
 
 #### `minimum_variance.py` (~2,100 lines)
 Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**, an evolution of the classical minimum-variance approach.
 
 - Replaces the traditional volatility filter with a **Cornish-Fisher VaR** ranking built from risk-neutral moments.
 - **Implied correlation model by factors**: market + sector + country + FX.
-- Blends implied and historical covariance, penalizing the diagonal for kurtosis (`tail_risk_alpha`) and negative skewness (`tail_risk_beta`).
+- Blends the factor covariance with a historical one estimated from **daily** returns via EWMA + Ledoit-Wolf shrinkage. Implied volatilities are converted from the risk-neutral to the physical measure (`use_q_to_p_vol`) before entering Σ.
+- Portfolio tail risk is measured from the **co-moments** of an empirical scenario panel, so skewness and kurtosis diversify. The pruning loop's marginal CVaR contribution uses the analytic gradients of those co-moments.
 - Configurable constraints: max/min weight per asset, maximum number of holdings, ETF participation (`etf_max_weight`), and currency exposure (`max_fx_exposure`).
 - Outputs: efficient frontier, Plotly visualizations, and synthetic risk attribution using Black-Scholes Greeks.
 
@@ -123,8 +140,11 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**, an evolu
 - Equilibrium returns `π` from reverse CAPM, using market capitalizations as reference weights.
 - Implied volatility from Polygon with an **SSVI** surface fit and PCHIP interpolation.
 - **BKM** module for higher-order risk-neutral moments, used as a bridge to systematically construct `Q` and `Ω` (the views and their uncertainty).
+- The correlation structure behind `Σ`, `Σ_P` and `Σ_BL` comes from **daily** returns with EWMA weighting and Ledoit-Wolf shrinkage (`USAR_COV_DIARIA`, `COV_HALFLIFE_DIAS`).
+- Converts risk-neutral moments to the physical measure before optimizing (`COTA_RATIO_VOL_P`), and computes portfolio moments over an entropy-pooled scenario panel — so skewness and kurtosis diversify correctly. These two were already the model's strongest points and are unchanged.
 - **MVSK** optimization (mean-variance-skewness-kurtosis) instead of pure mean-variance.
 - Predefined risk profiles (`conservador`, `moderado`, `agresivo`) that set `tau`, `omega_scale`, and `gamma_ra`.
+- Reports a `CF_monotona` flag alongside the risk metrics: when it is 0, the Cornish-Fisher VaR is outside its validity domain and the historical or Gaussian figures should be read instead.
 - Includes maximum drawdown analysis of the resulting portfolio.
 
 Manager views are edited in **Block 6** of the file.
@@ -133,7 +153,7 @@ Manager views are edited in **Block 6** of the file.
 `minimum_variance_(seasonal_version).py` and `quadratic_utility_(seasonal_version).py` mirror the pipelines above, but restrict the analysis to **specific months of the year** (`execution_months` / `rebalance_months`, defaulting to `[9]`).
 
 Two things change:
-- Return and risk statistics are computed over the **historical seasonal window** rather than the full series (`seasonal_min_weeks` sets the minimum number of valid observations).
+- The **per-asset Cornish-Fisher VaR filter** is computed over the historical seasonal window rather than the full series (`seasonal_min_weeks` sets the minimum number of valid observations). Note that the **covariance matrix deliberately still uses the full sample**: restricting Σ to one month of the year would leave roughly four observations per year, and the estimation error would swamp any seasonal signal.
 - An exclusion filter on `seasonal_vol_ratio_max` is added: if an asset's seasonal volatility exceeds its general volatility by more than that multiple, it is dropped; `seasonal_min_survivors` prevents the universe from emptying out.
 
 Use these when optimizing for a specific entry month rather than a generic horizon.
@@ -201,7 +221,10 @@ Portfolio positions are plotted on the surface along with gradient vectors indic
 ## Key concepts
 
 - **BKM (Bakshi, Kapadia, and Madan, 2003)**: extraction of *risk-neutral* variance, skewness, and kurtosis (MFIV, MFIS, MFIK) by integrating OTM option prices. Used here as a forward-looking risk estimator, in contrast to historical moments.
-- **Cornish-Fisher**: an expansion that adjusts normal quantiles for skewness and kurtosis, producing a VaR/CVaR sensitive to fat tails. The scripts clip the moments because the expansion breaks down under extreme tails.
+- **Cornish-Fisher**: an expansion that adjusts normal quantiles for skewness and kurtosis, producing a VaR/CVaR sensitive to fat tails. The scripts clip the moments because the expansion breaks down under extreme tails, and they check that the transform is still monotone (Maillard, 2012) — outside that domain the result is not a quantile, and the run prints the Gaussian reference instead.
+- **Risk-neutral vs. physical measure (Q vs. P)**: the implied density is the physical one reweighted by the pricing kernel, so implied moments carry risk premia. Implied variance exceeds physical variance (the variance risk premium) and implied correlation exceeds realized correlation (the correlation risk premium). Feeding raw Q moments to an optimizer overstates risk and understates diversification, so the scripts estimate a bounded per-asset Q→P ratio from realized data before building Σ.
+- **EWMA + Ledoit-Wolf**: the historical covariance is estimated from daily returns, exponentially weighted toward the recent regime, then shrunk toward a constant-correlation target. Covariance precision improves with sampling frequency while the mean's does not (Merton, 1980), and shrinkage corrects the downward bias of the small eigenvalues that a minimum-variance optimizer loads on (Michaud).
+- **Co-moments**: portfolio skewness and kurtosis depend on the M3 and M4 tensors, not on the marginal moments alone. Averaging per-asset MFIS/MFIK implicitly assumes perfect dependence and does not diversify; the error grows roughly with √n for weakly correlated assets. The scripts evaluate the exact quantities over a scenario panel in `O(J·n)`.
 - **GEX (Gamma Exposure)**: aggregate dealer gamma exposure. Positive GEX is associated with range-bound markets (dealers dampen moves); negative GEX with amplified moves. The zero-gamma flip marks the boundary between the two regimes.
 - **Implied/historical shrinkage**: the final covariance is a weighted blend of the implied-volatility estimate and the historical one, with the weight controlled by `shrinkage_min`, `shrinkage_max`, and `ratio_band`.
 - **QUBO/Ising**: asset selection is framed as a quadratic binary optimization problem, where the `h_i` terms capture individual quality and `J_ij` penalizes correlation.

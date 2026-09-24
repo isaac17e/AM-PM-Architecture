@@ -29,6 +29,8 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 
+import risk_estimators as rk
+
 # ------------------------------------------------
 # API KEY - Polygon.io
 # ------------------------------------------------
@@ -100,9 +102,38 @@ bkm_hist_sample_freq = "2W"      # frecuencia de muestreo historico BKM (2W=quin
 bkm_max_workers = 6              # tickers evaluados en paralelo durante el filtro BKM (ajustar segun rate limit del plan Polygon)
 bkm_z_threshold = 1.75           # se descarta si (MFIS_hoy - media_hist) / sd_hist supera esto
 bkm_min_survivors = 12           # piso minimo tras el filtro BKM (se repone desde el pool de vol. reciente)
-tail_penalty_theta1 = 0.005       # theta1: escala de penalizacion por asimetria implicita (MFIS) en mu
-tail_penalty_theta2 = 0.001       # theta2: escala de penalizacion por curtosis implicita (MFIK) en mu
 cornish_fisher_confidence = 0.95  # nivel de confianza para VaR/CVaR ajustados por Cornish-Fisher
+
+# NOTA: la penalizacion mu_final = mu - theta1*MFIS - theta2*MFIK fue ELIMINADA.
+# theta1/theta2 eran constantes sin calibrar y MFIS/MFIK estan bajo la medida Q
+# (ya incluyen aversion al riesgo de cola), de modo que restaban un sesgo
+# arbitrario al insumo mas sensible del optimizador. Chopra & Ziemba (1993):
+# los errores en mu pesan un orden de magnitud mas que los de covarianza.
+
+# === COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF ==============
+# Antes Sigma_hist salia de retornos MENSUALES (df_xts.cov()*12). Con ~12 obs
+# por ano y decenas de activos, ese estimador es casi singular y el optimizador
+# carga sobre sus direcciones peor estimadas. La precision de una covarianza
+# crece con la frecuencia de muestreo; la de la media no (Merton, 1980).
+use_daily_cov = True
+cov_halflife_days = 120           # vida media EWMA en dias habiles (~6 meses)
+use_lw_shrinkage = True
+
+# === CORRECCION Q -> P (primas de riesgo) ====================================
+use_q_to_p_vol = True             # MFIV incluye la prima de riesgo de varianza
+vrp_ratio_bounds = (0.70, 1.00)
+vrp_fallback_ratio = 0.90
+use_q_to_p_correlation = True     # la correlacion por dispersion excede a la realizada
+crp_ratio_bounds = (0.60, 1.00)
+crp_fallback_ratio = 0.85
+
+# === PANEL DE ESCENARIOS PARA MOMENTOS DEL PORTAFOLIO =========================
+panel_min_obs = 24                # observaciones minimas (mensuales) para el panel
+
+# === RETORNO ESPERADO VIA SVIX (Martin-Wagner) - EXPERIMENTAL =================
+# APAGADO. Formula sin verificar contra el paper. Ver aviso en risk_estimators.py.
+use_svix_expected_return = False
+svix_blend = 0.50                 # mezcla con mu historico si se activa
 
 correlation_order = 0
 
@@ -1594,6 +1625,21 @@ print(f"   MFIV (BKM) validas: {n_iv_ok} | Sin datos (fallback historico): {n_iv
 sd_hist_annual = df_xts[assets].std().values * math.sqrt(12)
 iv_final = np.array([iv_assets_implied[a] if not pd.isna(iv_assets_implied[a]) else sd_hist_annual[i]
                       for i, a in enumerate(assets)])
+
+# === CORRECCION Q -> P: la MFIV incluye la prima de riesgo de varianza ========
+iv_final_q = iv_final.copy()
+if use_q_to_p_vol:
+    iv_final, vrp_ratio = rk.q_to_p_vol(
+        iv_final_q, sd_hist_annual,
+        ratio_bounds=vrp_ratio_bounds, fallback_ratio=vrp_fallback_ratio)
+    print("   CORRECCION Q -> P (prima de riesgo de varianza):")
+    print(f"      ratio sigma_P/sigma_Q: min={vrp_ratio.min():.3f} | "
+          f"mediana={np.median(vrp_ratio):.3f} | max={vrp_ratio.max():.3f}")
+    print(f"      vol media: Q={np.nanmean(iv_final_q) * 100:.1f}% -> "
+          f"P={np.nanmean(iv_final) * 100:.1f}%")
+else:
+    print("   ADVERTENCIA use_q_to_p_vol=False - se optimiza con vol bajo medida Q")
+
 iv_final_dict = dict(zip(assets, iv_final))
 
 print(f"   IV final - Min: {iv_final.min() * 100:.1f}% | Mediana: {np.median(iv_final) * 100:.1f}% | "
@@ -1655,29 +1701,89 @@ print(f"   Alpha por activo - Pleno (>{alpha_min:.2f}): {n_alpha_full} | Minimo 
 print(f"   Alpha shrinkage global (promedio): {alpha_global:.3f} ({alpha_global * 100:.0f}% implied / "
       f"{(1 - alpha_global) * 100:.0f}% historica)")
 
-Sigma_hist = df_xts[assets].cov().values * 12
+# === COVARIANZA HISTORICA ANUALIZADA =========================================
+# Antes: df_xts[assets].cov() * 12, es decir covarianza muestral sobre retornos
+# MENSUALES. Con ~12 observaciones por ano ese estimador tiene muy pocos grados
+# de libertad frente al numero de activos, y el optimizador de utilidad
+# cuadratica sobrepondera justamente sus direcciones peor estimadas (Michaud).
+# Ahora: retornos DIARIOS -> EWMA -> shrinkage Ledoit-Wolf -> anualizado.
+Sigma_hist = None
+if use_daily_cov:
+    print("\n   Descargando retornos DIARIOS de los finalistas para la covarianza...")
+    try:
+        fx_prices_daily = download_fx_prices(start_date, end_date, period="1d")
+        df_daily = download_period_returns(assets, start_date, end_date,
+                                           period="1d", fx_prices=fx_prices_daily)
+        daily_wide = (df_daily.pivot_table(index="date", columns="symbol", values="return")
+                      .sort_index())
+        daily_wide = daily_wide.reindex(columns=assets).dropna()
+        print(f"   Retornos diarios alineados: {daily_wide.shape[0]} dias x {daily_wide.shape[1]} activos")
+
+        if daily_wide.shape[1] == len(assets) and len(daily_wide) >= 120:
+            Sigma_hist_df, cov_info = rk.cov_ewma_shrunk(
+                daily_wide, halflife=cov_halflife_days, scale=252.0,
+                shrink=use_lw_shrinkage)
+            Sigma_hist = np.asarray(Sigma_hist_df)
+            vol_daily_based = np.sqrt(np.diag(Sigma_hist))
+            vol_monthly_based = df_xts[assets].std().values * math.sqrt(12)
+            print("   COVARIANZA (EWMA + Ledoit-Wolf, base diaria):")
+            print(f"      obs diarias: {cov_info['n_obs']} | t_eff (Kish): {cov_info['t_eff']:.1f} "
+                  f"| delta shrinkage: {cov_info['delta']:.3f}")
+            print(f"      vol anual media: mensual={vol_monthly_based.mean() * 100:.1f}% -> "
+                  f"diaria+EWMA={vol_daily_based.mean() * 100:.1f}%")
+        else:
+            print(f"   ADVERTENCIA Cobertura diaria insuficiente "
+                  f"({daily_wide.shape[1]}/{len(assets)} activos, {len(daily_wide)} dias)")
+    except Exception as e:
+        print(f"   ADVERTENCIA Fallo la descarga diaria ({e})")
+
+if Sigma_hist is None:
+    Sigma_hist = df_xts[assets].cov().values * 12
+    print("   COVARIANZA: muestral mensual anualizada (fallback)")
 
 # --- Correlacion implicita global via dispersion de SPY ---
 w_disp = np.repeat(1 / n_assets, n_assets)
-sigma_i = iv_final
+sigma_i = iv_final          # medida P: entra en D_implied mas abajo
+sigma_i_q = iv_final_q      # medida Q: la dispersion debe calcularse toda en Q
 
+# La correlacion por dispersion solo es coherente si el indice y los
+# constituyentes estan bajo la MISMA medida. Se calcula con volatilidades Q y
+# la correccion a P se aplica despues, sobre la correlacion resultante.
 var_spy_impl = iv_spy_implied ** 2
-weighted_var_i = np.sum(w_disp ** 2 * sigma_i ** 2)
-sigma_total_sq = (np.sum(w_disp * sigma_i)) ** 2
+weighted_var_i = np.sum(w_disp ** 2 * sigma_i_q ** 2)
+sigma_total_sq = (np.sum(w_disp * sigma_i_q)) ** 2
 
-R_hist_full = df_xts[assets].corr().values
-
-if sigma_total_sq > weighted_var_i and sigma_total_sq > 0:
-    rho_implied_avg = (var_spy_impl - weighted_var_i) / (sigma_total_sq - weighted_var_i)
-    rho_implied_avg = max(-0.999, min(0.999, rho_implied_avg))
-    print(f"   Correlacion promedio implicita (dispersion SPY): {rho_implied_avg:.4f}")
-else:
-    tril_idx = np.tril_indices(n_assets, k=-1)
-    rho_implied_avg = np.nanmean(R_hist_full[tril_idx])
-    rho_implied_avg = max(-0.999, min(0.999, rho_implied_avg))
-    print(f"   Correlacion promedio implicita (fallback historico): {rho_implied_avg:.4f}")
+# Correlacion historica desde la Sigma diaria EWMA+LW, no desde los mensuales
+d_hist = np.sqrt(np.clip(np.diag(Sigma_hist), 1e-300, None))
+R_hist_full = Sigma_hist / np.outer(d_hist, d_hist)
+np.fill_diagonal(R_hist_full, 1.0)
 
 tril_idx = np.tril_indices(n_assets, k=-1)
+rho_realized_avg = float(np.nanmean(R_hist_full[tril_idx]))
+
+if sigma_total_sq > weighted_var_i and sigma_total_sq > 0:
+    rho_implied_q = (var_spy_impl - weighted_var_i) / (sigma_total_sq - weighted_var_i)
+    rho_implied_q = max(-0.999, min(0.999, rho_implied_q))
+    print(f"   Correlacion promedio implicita Q (dispersion SPY): {rho_implied_q:.4f}")
+
+    # === CORRECCION Q -> P: prima de riesgo de correlacion ===================
+    # La correlacion implicita excede sistematicamente a la realizada
+    # (Driessen, Maenhout & Vilkov, 2009). Sin corregir, el optimizador
+    # subestima el beneficio de diversificacion.
+    if use_q_to_p_correlation:
+        rho_implied_avg, crp_ratio = rk.q_to_p_correlation(
+            rho_implied_q, rho_realized_avg,
+            ratio_bounds=crp_ratio_bounds, fallback_ratio=crp_fallback_ratio)
+        print(f"   Correlacion realizada (diaria EWMA):        {rho_realized_avg:.4f}")
+        print(f"   Correlacion promedio P (post-correccion):   {rho_implied_avg:.4f} "
+              f"(ratio={crp_ratio:.3f})")
+    else:
+        rho_implied_avg = rho_implied_q
+        print("   ADVERTENCIA use_q_to_p_correlation=False - correlacion bajo medida Q")
+else:
+    rho_implied_avg = max(-0.999, min(0.999, rho_realized_avg))
+    print(f"   Correlacion promedio implicita (fallback historico): {rho_implied_avg:.4f}")
+
 rho_hist_avg_ref = np.nanmean(np.abs(R_hist_full[tril_idx]))
 
 # --- Correlacion implicita SECTORIAL (ETFs sectoriales SPDR + VOX), via MFIV (BKM) ---
@@ -1696,16 +1802,30 @@ for etf in etf_sectoriales:
         continue
 
     idxs = [assets.index(s) for s in stocks_sector]
-    sigma_sector = iv_final[idxs]
+    sigma_sector = iv_final_q[idxs]     # medida Q, igual que el ETF sectorial
     var_etf_impl = sector_etf_iv[etf] ** 2
     w_disp_sector = np.repeat(1 / len(stocks_sector), len(stocks_sector))
     weighted_var_s = np.sum(w_disp_sector ** 2 * sigma_sector ** 2)
     sigma_total_s = (np.sum(w_disp_sector * sigma_sector)) ** 2
 
     if sigma_total_s > weighted_var_s and sigma_total_s > 0:
-        rho_sec = (var_etf_impl - weighted_var_s) / (sigma_total_s - weighted_var_s)
-        rho_sector_lookup[etf] = max(-0.999, min(0.999, rho_sec))
-        print(f"      {etf:<5}: rho implicita = {rho_sector_lookup[etf]:.4f} ({len(stocks_sector)} acciones)")
+        rho_sec_q = (var_etf_impl - weighted_var_s) / (sigma_total_s - weighted_var_s)
+        rho_sec_q = max(-0.999, min(0.999, rho_sec_q))
+
+        # Correccion Q -> P con la correlacion realizada DEL PROPIO SECTOR
+        sub = R_hist_full[np.ix_(idxs, idxs)]
+        m = len(idxs)
+        rho_sec_realized = float(np.nanmean(sub[np.tril_indices(m, k=-1)]))
+        if use_q_to_p_correlation:
+            rho_sec, _ = rk.q_to_p_correlation(
+                rho_sec_q, rho_sec_realized,
+                ratio_bounds=crp_ratio_bounds, fallback_ratio=crp_fallback_ratio)
+        else:
+            rho_sec = rho_sec_q
+
+        rho_sector_lookup[etf] = rho_sec
+        print(f"      {etf:<5}: rho Q = {rho_sec_q:.4f} -> rho P = {rho_sec:.4f} "
+              f"(realizada {rho_sec_realized:.4f}, {len(stocks_sector)} acciones)")
 
 n_sectores_ok = sum(1 for v in rho_sector_lookup.values() if not pd.isna(v))
 print(f"   Correlacion sectorial calculada para {n_sectores_ok} de {len(etf_sectoriales)} sectores")
@@ -1765,10 +1885,8 @@ print(f"      Blend:          {vol_blend_pct.mean():.1f}% (a_global={alpha_globa
 eig_vals = np.linalg.eigvalsh(cov_mat)
 print(f"   Eigenvalue minimo (Sigma blend): {eig_vals.min():.6f}")
 if not np.all(eig_vals >= -1e-8):
-    print("   Sigma blend no es PSD - aplicando correccion Higham...")
-    eig_vals_full, eig_vecs_full = np.linalg.eigh(cov_mat)
-    eig_vals_full = np.maximum(eig_vals_full, 1e-8)
-    cov_mat = eig_vecs_full @ np.diag(eig_vals_full) @ eig_vecs_full.T
+    print("   Sigma blend no es PSD - proyectando al cono PSD...")
+    cov_mat = np.asarray(rk.nearest_psd(cov_mat, eps_rel=1e-8))
 
 if np.any(~np.isfinite(cov_mat)):
     print("   Limpiando valores no finitos en cov_mat...")
@@ -1815,19 +1933,47 @@ delta_scaled = np.where(np.isnan(delta_scaled), 1.0, delta_scaled)
 
 mu_delta_adjusted = mu * delta_scaled
 
-# === INTERVENCION 5: Penalizacion por riesgo de cola (MFIS, MFIK de BKM) ===
-# mu_final = mu_delta_adjusted - theta1*MFIS - theta2*MFIK
+# MFIS/MFIK se conservan solo para el reporte de diagnostico; YA NO se restan a
+# mu. Ver la nota en el bloque de parametros.
 mfis_aligned = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
 mfik_aligned = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])
 mfis_aligned = np.where(np.isnan(mfis_aligned), 0.0, mfis_aligned)
 mfik_aligned = np.where(np.isnan(mfik_aligned), 3.0, mfik_aligned)
-mu_final = mu_delta_adjusted - tail_penalty_theta1 * mfis_aligned - tail_penalty_theta2 * mfik_aligned
+
+mu_final = mu_delta_adjusted.copy()
+
+# === RETORNO ESPERADO VIA SVIX (Martin-Wagner) - EXPERIMENTAL, APAGADO =======
+if use_svix_expected_return:
+    print("\n   AVISO use_svix_expected_return=True: la formula de Martin-Wagner")
+    print("   implementada en risk_estimators.py NO ha sido verificada contra el")
+    print("   paper ni validada empiricamente. No usar para asignar capital sin")
+    print("   contrastarla primero.")
+    # SVIX^2 al horizonte, por activo (proxy: MFIV del tenor objetivo)
+    svix2_assets = np.array([
+        bkm_current_moments.get(a, {}).get("mfiv", np.nan) for a in assets])
+    mom_spy_svix = bkm_current_moments.get("SPY") or mom_spy
+    svix2_mkt = mom_spy_svix.get("mfiv", np.nan) if mom_spy_svix else np.nan
+
+    if np.isfinite(svix2_mkt) and np.isfinite(svix2_assets).sum() >= 2:
+        # Escala del horizonte de opciones (T_bkm anos) al periodo mensual de mu
+        periodos_por_T = (T_bkm * 12.0)
+        exc_annual, mw_info = rk.martin_wagner_excess_return(svix2_assets, svix2_mkt)
+        mu_svix = rf_rate / 12.0 + exc_annual / max(periodos_por_T, 1e-6)
+        mask_mw = np.isfinite(mu_svix)
+        mu_final = np.where(
+            mask_mw,
+            svix_blend * mu_svix + (1 - svix_blend) * mu_delta_adjusted,
+            mu_delta_adjusted)
+        print(f"   SVIX aplicado a {int(mask_mw.sum())}/{n_assets} activos "
+              f"(blend={svix_blend:.2f}) | {mw_info['warning']}")
+    else:
+        print("   Sin SVIX de mercado suficiente - se mantiene mu historico")
 
 dvec = mu_final / lambda_
 
 print(f"   Delta scaling aplicado - activos con delta real: {int((~pd.isna(delta_aligned)).sum())} | "
       f"fallback (sin penalizacion): {int(pd.isna(delta_aligned).sum())}")
-print(f"   Penalizacion de cola (BKM) aplicada - theta1={tail_penalty_theta1:.3f}, theta2={tail_penalty_theta2:.3f}")
+print("   Penalizacion de cola sobre mu: ELIMINADA (MFIS/MFIK son momentos Q sin calibrar)")
 
 A_cols = []
 b_vals = []
@@ -1926,10 +2072,14 @@ var_parametric = ret_opt - norm.ppf(0.95) * sd_opt
 q05 = portfolio_returns_full.quantile(0.05)
 cvar_95 = portfolio_returns_full[portfolio_returns_full <= q05].mean()
 
-# === INTERVENCION 6: VaR/CVaR prospectivos ajustados por Cornish-Fisher (BKM) ===
-# Cornish-Fisher (1937): z_cf = z_a + (z_a^2-1)/6*S + (z_a^3-3z_a)/24*K_exc - (2z_a^3-5z_a)/36*S^2
-# ES modificado (Boudt, Peterson & Croux, 2008):
-#   MES_a = -phi(z_a)/a * (1 + S/6*z_a^2 + K_exc/24*(z_a^3-3z_a) - S^2/36*(2z_a^3-5z_a))
+# === VaR/CVaR PROSPECTIVO - CORNISH-FISHER SOBRE CO-MOMENTOS =================
+# Antes: port_skew y port_kurt_exc eran el promedio ponderado de MFIS/MFIK
+# individuales. Eso supone correlacion perfecta en los momentos de orden
+# superior y no diversifica (el sesgo crece ~sqrt(n) con activos poco
+# correlacionados); ademas mezcla la medida Q con la sigma fisica de cov_mat.
+#
+# Ahora los momentos salen de los co-momentos de un panel empirico reescalado a
+# la volatilidad prospectiva, via w'M3(w x w) y w'M4(w x w x w) en O(J*n).
 alpha_cf = 1 - cornish_fisher_confidence
 z_a = norm.ppf(alpha_cf)
 
@@ -1937,28 +2087,44 @@ w_full = weights_opt.reindex(assets).fillna(0.0).values
 mfis_w = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
 mfik_w = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])
 
-mask_bkm_ok = np.isfinite(mfis_w) & np.isfinite(mfik_w)
-w_bkm_norm = w_full[mask_bkm_ok]
-if w_bkm_norm.sum() > 0:
-    w_bkm_norm = w_bkm_norm / w_bkm_norm.sum()
-    port_skew = float(np.sum(w_bkm_norm * mfis_w[mask_bkm_ok]))
-    port_kurt_exc = float(np.sum(w_bkm_norm * mfik_w[mask_bkm_ok])) - 3.0
-    port_sd_cf = sd_opt  # sigma diversificada (cov_mat), no el promedio ponderado de MFIV individuales
+panel_source_qu = df_xts[assets].dropna()
 
-    z_cf = (z_a + (z_a ** 2 - 1) / 6 * port_skew
-            + (z_a ** 3 - 3 * z_a) / 24 * port_kurt_exc
-            - (2 * z_a ** 3 - 5 * z_a) / 36 * port_skew ** 2)
-    var_cf = ret_opt + z_cf * port_sd_cf
+if len(panel_source_qu) >= panel_min_obs:
+    Z_qu, _ = rk.standardized_panel(panel_source_qu)
+    sd_prosp_qu = np.sqrt(np.clip(np.diag(cov_mat), 1e-16, None))
+    panel_qu = rk.rescale_panel(Z_qu, panel_source_qu.mean().values, sd_prosp_qu)
 
-    mes_a = (norm.pdf(z_a) / alpha_cf) * (
-        1 + port_skew / 6 * z_a ** 2
-        + port_kurt_exc / 24 * (z_a ** 3 - 3 * z_a)
-        - port_skew ** 2 / 36 * (2 * z_a ** 3 - 5 * z_a)
-    )
-    cvar_cf = ret_opt - mes_a * port_sd_cf
+    mom_qu = rk.portfolio_moments(w_full, panel_qu)
+    port_skew = mom_qu["skew"]
+    port_kurt_exc = mom_qu["exkurt"]
+    port_sd_cf = sd_opt          # sigma de cov_mat, la que optimiza quadprog
+
+    cf_qu = rk.var_cvar_cornish_fisher(
+        ret_opt, port_sd_cf, port_skew, port_kurt_exc,
+        confidence=cornish_fisher_confidence)
+    var_cf = cf_qu["var"]
+    cvar_cf = cf_qu["cvar"]
+
+    # Referencia: cuanto sesgaba el atajo anterior
+    mask_bkm_ok = np.isfinite(mfis_w) & np.isfinite(mfik_w)
+    if mask_bkm_ok.sum() > 0 and w_full[mask_bkm_ok].sum() > 0:
+        w_q = w_full[mask_bkm_ok] / w_full[mask_bkm_ok].sum()
+        skew_naive_qu = float(np.sum(w_q * mfis_w[mask_bkm_ok]))
+        kurt_naive_qu = float(np.sum(w_q * mfik_w[mask_bkm_ok])) - 3.0
+        print("\n   MOMENTOS DEL PORTAFOLIO (co-momentos, medida P):")
+        print(f"      asimetria:          {port_skew:+.4f}   (atajo Q anterior: {skew_naive_qu:+.4f})")
+        print(f"      exceso de curtosis: {port_kurt_exc:+.4f}   (atajo Q anterior: {kurt_naive_qu:+.4f})")
+
+    if not cf_qu["monotone"]:
+        print("   ADVERTENCIA Cornish-Fisher NO es monotona con estos momentos:")
+        print("   el 'VaR' resultante no es un cuantil valido (Maillard, 2012).")
+        print(f"   Referencia gaussiana -> VaR {cf_qu['var_gaussian'] * 100:.4f}% | "
+              f"CVaR {cf_qu['cvar_gaussian'] * 100:.4f}%")
 else:
+    port_skew, port_kurt_exc = np.nan, np.nan
     var_cf, cvar_cf = np.nan, np.nan
-    print("   Advertencia: sin cobertura BKM suficiente en el portafolio final - VaR/CVaR Cornish-Fisher = NaN")
+    print(f"   Advertencia: solo {len(panel_source_qu)} observaciones (<{panel_min_obs}) "
+          "para el panel - VaR/CVaR Cornish-Fisher = NaN")
 
 benchmark_series = benchmark_prices.set_index("date")["benchmark_return"]
 df_with_bench = df_xts[ticker_candidates].join(benchmark_series.rename("benchmark"), how="inner").dropna()

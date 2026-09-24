@@ -24,6 +24,8 @@ import quadprog
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+import risk_estimators as rk
+
 # --- statsmodels es opcional: si no esta, se usa un HAC propio --------------
 try:
     import statsmodels.api as sm
@@ -142,6 +144,17 @@ COTA_KURT_P = (1.8, 12.0)
 # realizada, pero la correccion no puede ser arbitrariamente grande).
 COTA_RATIO_VOL_P = (0.55, 1.25)
 
+# === COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF =============
+# Corr_hist es la estructura de dependencia sobre la que se montan Sigma,
+# Sigma_P y Sigma_BL: es el insumo que mas pesa en los pesos resultantes.
+# Antes salia de la covarianza muestral SEMANAL con pesos iguales. Ahora se
+# estima con retornos diarios (mas observaciones para el mismo periodo
+# calendario; Merton, 1980), EWMA para ponderar el regimen reciente y
+# shrinkage de Ledoit-Wolf para corregir el sesgo de los autovalores pequenos.
+USAR_COV_DIARIA = True
+COV_HALFLIFE_DIAS = 120
+USAR_SHRINKAGE_LW = True
+
 # -----------------------------------------------------------------------------
 # 10. [NUEVO] INTEGRACION BAYESIANA NO GAUSSIANA (BLOQUE 7)
 # -----------------------------------------------------------------------------
@@ -257,7 +270,30 @@ if n < len(TICKERS):
     excluidos = [t for t in TICKERS if t not in tickers]
     print(f"  Excluidos: {', '.join(excluidos)}")
 
-Sigma_sem = retornos_sem.cov().values
+# --- Covarianza semanal: base diaria + EWMA + shrinkage ----------------------
+Sigma_sem = None
+if USAR_COV_DIARIA:
+    ret_dia_cov = np.log(precios_diarios[tickers] / precios_diarios[tickers].shift(1))
+    ret_dia_cov = ret_dia_cov.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(ret_dia_cov) >= 120:
+        Sigma_sem_df, cov_info_bl = rk.cov_ewma_shrunk(
+            ret_dia_cov, halflife=COV_HALFLIFE_DIAS, scale=252.0 / 52.0,
+            shrink=USAR_SHRINKAGE_LW)
+        Sigma_sem = np.asarray(Sigma_sem_df)
+        sem_muestral = retornos_sem.cov().values
+        print("\n=== Covarianza semanal (EWMA + Ledoit-Wolf, base diaria) ===")
+        print(f"  obs diarias: {cov_info_bl['n_obs']} | t_eff (Kish): {cov_info_bl['t_eff']:.1f} "
+              f"| delta shrinkage: {cov_info_bl['delta']:.3f}")
+        print(f"  vol semanal media: muestral={np.sqrt(np.diag(sem_muestral)).mean() * 100:.3f}% -> "
+              f"EWMA+LW={np.sqrt(np.diag(Sigma_sem)).mean() * 100:.3f}%")
+        print(f"  correlacion promedio: muestral={rk.average_correlation(sem_muestral):.4f} -> "
+              f"EWMA+LW={rk.average_correlation(Sigma_sem):.4f}")
+    else:
+        print(f"\n  ADVERTENCIA Solo {len(ret_dia_cov)} dias - se usa covarianza semanal muestral")
+
+if Sigma_sem is None:
+    Sigma_sem = retornos_sem.cov().values
+
 Sigma_hist = Sigma_sem * factor_anualizacion
 D_hist_inv = np.diag(1 / np.sqrt(np.diag(Sigma_hist)))
 Corr_hist = D_hist_inv @ Sigma_hist @ D_hist_inv
@@ -1862,6 +1898,11 @@ def calcular_metricas_riesgo_cola(w, retornos_df, nivel_confianza=0.95,
     out = {"Retorno_esperado": mu, "Volatilidad": sigma,
            "Skewness": s_std, "Kurtosis": k_std}
 
+    # Dominio de validez: la expansion de Cornish-Fisher solo define un cuantil
+    # mientras z -> z_CF sea monotona creciente (Maillard, 2012). Fuera de ahi
+    # el VaR_CF no es un cuantil y conviene leer el gaussiano o el historico.
+    out["CF_monotona"] = float(rk.cornish_fisher_is_monotone(s_std, k_std - 3.0))
+
     # --- VaR al nivel principal ---------------------------------------------
     var_h, cvar_h = var_cvar_historico(perdidas, p, nivel_confianza)
     var_cf, cvar_cf = var_cvar_cornish_fisher(mu, sigma, s_std, k_std, nivel_confianza)
@@ -2203,7 +2244,7 @@ metricas_hist = pd.DataFrame({
 
 nc = int(round(NIVEL_CONFIANZA_VAR * 100))
 orden_filas = [
-    "Retorno_esperado", "Volatilidad", "Skewness", "Kurtosis",
+    "Retorno_esperado", "Volatilidad", "Skewness", "Kurtosis", "CF_monotona",
     f"VaR{nc}_historico", f"VaR{nc}_gaussiano", f"VaR{nc}_CornishFisher",
 ] + [f"CVaR{int(round(a * 100))}_historico" for a in NIVELES_CVAR] \
   + [f"CVaR{int(round(a * 100))}_CornishFisher" for a in NIVELES_CVAR] \
