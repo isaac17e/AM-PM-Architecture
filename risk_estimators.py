@@ -12,11 +12,12 @@
 #   3. Panel de escenarios y momentos de portafolio en O(J*n), para calcular
 #      asimetria y curtosis del portafolio SIN promediar los momentos
 #      marginales (que ignora la diversificacion).
-#   4. Cornish-Fisher con verificacion de monotonia (dominio de validez).
+#   4. Admisibilidad de momentos (K >= 1 + S^2) y Cornish-Fisher con
+#      momentos reales (Maillard, 2012): monotono en S y K por construccion.
 #   5. Retorno esperado via SVIX (Martin-Wagner) - EXPERIMENTAL, ver aviso.
 #
-# Todo es forma cerrada salvo el chequeo de monotonia de Cornish-Fisher, que es
-# una evaluacion en malla. No requiere dependencias fuera de numpy/pandas.
+# Todo es forma cerrada salvo la inversion momentos -> parametros de
+# Cornish-Fisher, un ajuste 2x2 con scipy.optimize.least_squares.
 # ==============================================================================
 
 import numpy as np
@@ -38,9 +39,13 @@ __all__ = [
     "rescale_panel",
     "portfolio_moments",
     "portfolio_moment_gradients",
+    "higher_moments_admissible",
     "cornish_fisher_z",
-    "cornish_fisher_is_monotone",
-    "modified_es_multiplier",
+    "cornish_fisher_domain",
+    "cornish_fisher_moments",
+    "cornish_fisher_params",
+    "cornish_fisher_tail",
+    "cornish_fisher_es_gradient",
     "var_cvar_cornish_fisher",
     "martin_wagner_excess_return",
 ]
@@ -458,75 +463,155 @@ def portfolio_moment_gradients(w, panel, probs=None):
 
 
 # ==============================================================================
-# 4. CORNISH-FISHER CON DOMINIO DE VALIDEZ
+# 4. MOMENTOS DE ORDEN SUPERIOR Y CORNISH-FISHER
+# ==============================================================================
+# Antes se recortaban S y K por separado, lo que dejaba dos problemas:
+#
+#  a) Admisibilidad. Toda distribucion cumple K >= 1 + S^2 (desigualdad de
+#     Pearson, K = curtosis total). Un par (MFIS, MFIK) que la viola no es una
+#     cola gorda: delata una integracion BKM defectuosa (pocos strikes, MFIV
+#     diminuta en el denominador). Se anula en vez de recortarse.
+#
+#  b) Cornish-Fisher. En z_cf = z + (z^2-1)s/6 + (z^3-3z)k/24 - (2z^3-5z)s^2/36,
+#     s y k son PARAMETROS de la transformacion, no la asimetria ni la curtosis
+#     de la distribucion que produce. Enchufar los momentos observados como
+#     parametros (i) sale del dominio de monotonia con |S| o K grandes, y ahi
+#     el "cuantil" puede cambiar de signo, y (ii) aun dentro del dominio
+#     invierte el orden: con exceso de curtosis 6, el cuantil al 1% es menos
+#     severo con S = -1.5 que con S = -1. Siguiendo a Maillard (2012) se buscan
+#     los parametros cuya transformacion reproduce los momentos observados; si
+#     el par no es alcanzable por la familia, se usa el alcanzable mas cercano.
 # ==============================================================================
 
-def cornish_fisher_z(z_alpha, skew, exkurt):
-    """Cuantil ajustado de Cornish-Fisher."""
-    z = float(z_alpha)
+# |s| maximo con dominio de monotonia no vacio: raiz de 1 - s^2/6 + s^4/1296 = 0
+CF_SKEW_PARAM_MAX = float(np.sqrt(108.0 - 72.0 * np.sqrt(2.0)))   # ~2.486
+
+# Gauss-Hermite (probabilistas) de 16 nodos: exacto hasta grado 31, sobra para
+# los momentos de orden 4 de un polinomio cubico en Z.
+_GH_Z, _GH_W = np.polynomial.hermite_e.hermegauss(16)
+_GH_W = _GH_W / _GH_W.sum()
+
+
+def higher_moments_admissible(skew, kurt, kurt_max=np.inf):
+    """True si (asimetria, curtosis TOTAL) es un par posible y K <= kurt_max."""
+    if not (np.isfinite(skew) and np.isfinite(kurt)):
+        return False
+    return bool(1.0 + skew ** 2 <= kurt <= kurt_max)
+
+
+def cornish_fisher_z(z_alpha, s, k):
+    """Transformacion de Cornish-Fisher con parametros (s, k); vectorizada en z."""
+    z = np.asarray(z_alpha, dtype=float)
     return (z
-            + (z ** 2 - 1) / 6.0 * skew
-            + (z ** 3 - 3 * z) / 24.0 * exkurt
-            - (2 * z ** 3 - 5 * z) / 36.0 * skew ** 2)
+            + (z ** 2 - 1) / 6.0 * s
+            + (z ** 3 - 3 * z) / 24.0 * k
+            - (2 * z ** 3 - 5 * z) / 36.0 * s ** 2)
 
 
-def cornish_fisher_is_monotone(skew, exkurt, z_lo=-3.5, z_hi=3.5, n_grid=400):
-    """Verifica que la transformacion de Cornish-Fisher sea monotona.
+def cornish_fisher_domain(s):
+    """Intervalo (k_lo, k_hi) de k en que z -> z_cf es estrictamente creciente.
 
-    La expansion solo define un cuantil valido mientras z -> z_cf sea creciente
-    (Maillard, 2012). Fuera de ese dominio el "VaR" resultante no es un cuantil
-    y puede moverse en la direccion equivocada al aumentar la curtosis.
-
-    Se evalua la derivada en malla en vez de usar la region cerrada, porque asi
-    el chequeo cubre exactamente el rango de z que se va a usar.
+    Forma cerrada de la condicion de discriminante negativo de dz_cf/dz
+    (Maillard, 2012). Devuelve (nan, nan) si |s| > CF_SKEW_PARAM_MAX.
     """
-    z = np.linspace(z_lo, z_hi, n_grid)
-    dz = (1.0
-          + (2 * z) / 6.0 * skew
-          + (3 * z ** 2 - 3) / 24.0 * exkurt
-          - (6 * z ** 2 - 5) / 36.0 * skew ** 2)
-    return bool(np.all(dz > 0))
+    x = float(s) ** 2
+    b = 1.0 + 11.0 * x / 36.0
+    c = 7.0 * x / 36.0 + 5.0 * x ** 2 / 216.0
+    disc = b ** 2 - 4.0 * c
+    if disc <= 0.0:
+        return np.nan, np.nan
+    r = np.sqrt(disc)
+    return 4.0 * (b - r), 4.0 * (b + r)
 
 
-def modified_es_multiplier(alpha, skew, exkurt):
-    """Multiplicador del Expected Shortfall modificado.
+def cornish_fisher_moments(s, k):
+    """(sd, asimetria, exceso de curtosis) de z_cf(Z), Z ~ N(0,1). Media = 0."""
+    y = cornish_fisher_z(_GH_Z, s, k)
+    m2 = float(_GH_W @ y ** 2)
+    sd = np.sqrt(m2)
+    return sd, float(_GH_W @ y ** 3) / m2 ** 1.5, float(_GH_W @ y ** 4) / m2 ** 2 - 3.0
 
-    Boudt, Peterson & Croux (2008). CVaR = mu - MES * sigma.
+
+def cornish_fisher_params(skew, exkurt):
+    """Parametros (s, k) cuya transformacion CF tiene los momentos pedidos.
+
+    Busca dentro del dominio de monotonia, parametrizado como s en
+    [0, CF_SKEW_PARAM_MAX) y k = k_lo(s) + t (k_hi(s) - k_lo(s)), t en (0, 1).
+    La asimetria es impar en s, asi que se resuelve para |skew| y se devuelve
+    el signo. Si el par no es alcanzable (p. ej. asimetria alta con poca
+    curtosis) se devuelve el punto alcanzable mas cercano en el plano de
+    momentos. Devuelve (s, k, exacto).
     """
+    from scipy.optimize import least_squares
+
+    objetivo = np.array([abs(float(skew)), float(exkurt)])
+    s_max = CF_SKEW_PARAM_MAX * (1.0 - 1e-6)
+
+    def a_parametros(p):
+        k_lo, k_hi = cornish_fisher_domain(p[0])
+        return p[0], k_lo + p[1] * (k_hi - k_lo)
+
+    def residuo(p):
+        _, sk, ek = cornish_fisher_moments(*a_parametros(p))
+        return np.array([sk, ek]) - objetivo
+
+    mejor = None
+    for x0 in ([min(objetivo[0], 1.0), 0.5], [0.1, 0.2], [0.5 * s_max, 0.5]):
+        res = least_squares(residuo, x0, bounds=([0.0, 0.0], [s_max, 1.0 - 1e-3]),
+                            xtol=1e-12, ftol=1e-12)
+        if mejor is None or res.cost < mejor.cost:
+            mejor = res
+    s, k = a_parametros(mejor.x)
+    # Tolerancia de 1e-3 en momentos: por debajo no mueve el cuantil de forma apreciable
+    return float(np.sign(skew) * s), float(k), bool(np.max(np.abs(mejor.fun)) < 1e-3)
+
+
+def cornish_fisher_tail(alpha, skew, exkurt):
+    """Cuantil y ES de la cola izquierda (probabilidad alpha), estandarizados.
+
+    La distribucion es la CF con media 0, varianza 1 y los momentos pedidos.
+    El ES es cerrado: int_{-inf}^z He_n(u) phi(u) du = -He_{n-1}(z) phi(z).
+    Devuelve dict con q, es (ambos negativos en la cola), s, k y exacto.
+    """
+    s, k, exacto = cornish_fisher_params(skew, exkurt)
+    sd = cornish_fisher_moments(s, k)[0]
     z = norm.ppf(alpha)
-    return float((norm.pdf(z) / alpha) * (
-        1.0
-        + skew / 6.0 * z ** 2
-        + exkurt / 24.0 * (z ** 3 - 3 * z)
-        - skew ** 2 / 36.0 * (2 * z ** 3 - 5 * z)
-    ))
+    c1, c2, c3 = 1.0 - s ** 2 / 36.0, s / 6.0, k / 24.0 - s ** 2 / 18.0
+    q = float(cornish_fisher_z(z, s, k)) / sd
+    es = -norm.pdf(z) / alpha * (c1 + c2 * z + c3 * (z ** 2 - 1.0)) / sd
+    return {"q": q, "es": float(es), "s": s, "k": k, "exact": exacto}
 
 
-def var_cvar_cornish_fisher(mu, sd, skew, exkurt, confidence=0.95,
-                            check_monotone=True):
-    """VaR y CVaR de Cornish-Fisher con diagnostico de validez.
+def cornish_fisher_es_gradient(alpha, skew, exkurt, h=1e-4):
+    """ES estandarizado y sus derivadas respecto a (skew, exkurt), por diferencias centrales."""
+    es = cornish_fisher_tail(alpha, skew, exkurt)["es"]
+    d_s = (cornish_fisher_tail(alpha, skew + h, exkurt)["es"]
+           - cornish_fisher_tail(alpha, skew - h, exkurt)["es"]) / (2.0 * h)
+    d_k = (cornish_fisher_tail(alpha, skew, exkurt + h)["es"]
+           - cornish_fisher_tail(alpha, skew, exkurt - h)["es"]) / (2.0 * h)
+    return es, d_s, d_k
 
-    Devuelve dict con var, cvar, z_cf, monotone y fallback_gaussian.
-    Si la expansion no es monotona en el rango relevante, se reportan tambien
-    los valores gaussianos para que el llamador decida.
+
+def var_cvar_cornish_fisher(mu, sd, skew, exkurt, confidence=0.95):
+    """VaR y CVaR (como retornos, negativos en perdida) de Cornish-Fisher.
+
+    'exact' es False cuando los momentos no eran alcanzables por la familia CF
+    y se usaron los mas cercanos; se reportan tambien los valores gaussianos.
     """
     alpha = 1.0 - confidence
     z_a = norm.ppf(alpha)
-
-    monotone = cornish_fisher_is_monotone(skew, exkurt) if check_monotone else True
-
-    z_cf = cornish_fisher_z(z_a, skew, exkurt)
-    var_cf = mu + z_cf * sd
-    mes = modified_es_multiplier(alpha, skew, exkurt)
-    cvar_cf = mu - mes * sd
-    # El CVaR no puede ser menos severo que el VaR
-    cvar_cf = min(cvar_cf, var_cf)
-
     var_g = mu + z_a * sd
     cvar_g = mu - (norm.pdf(z_a) / alpha) * sd
 
-    return {"var": float(var_cf), "cvar": float(cvar_cf), "z_cf": float(z_cf),
-            "mes": float(mes), "monotone": monotone,
+    if not (np.isfinite(skew) and np.isfinite(exkurt)):
+        return {"var": np.nan, "cvar": np.nan, "z_cf": np.nan, "exact": False,
+                "cf_s": np.nan, "cf_k": np.nan,
+                "var_gaussian": float(var_g), "cvar_gaussian": float(cvar_g),
+                "skew": float(skew), "exkurt": float(exkurt)}
+
+    cola = cornish_fisher_tail(alpha, skew, exkurt)
+    return {"var": float(mu + cola["q"] * sd), "cvar": float(mu + cola["es"] * sd),
+            "z_cf": cola["q"], "exact": cola["exact"], "cf_s": cola["s"], "cf_k": cola["k"],
             "var_gaussian": float(var_g), "cvar_gaussian": float(cvar_g),
             "skew": float(skew), "exkurt": float(exkurt)}
 

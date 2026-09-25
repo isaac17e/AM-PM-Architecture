@@ -75,12 +75,9 @@ seasonal_min_weeks = 20
 bkm_moneyness_lo = 0.70            # limite inferior de moneyness K/S para strikes OTM
 bkm_moneyness_hi = 1.30            # limite superior de moneyness K/S para strikes OTM
 bkm_min_options_per_side = 3       # minimo de strikes OTM por lado (calls/puts) para integracion valida
-bkm_mfis_clip = 10.0               # cota de winsorizacion para MFIS (estabilidad numerica en activos de baja MFIV)
-bkm_mfik_clip = 30.0               # cota de winsorizacion para MFIK (idem)
+bkm_mfik_max = 20.0                # techo de sanidad de MFIK (curtosis total); por encima, o si K < 1 + S^2, MFIS/MFIK se anulan
 tail_risk_filter_confidence = 0.99  # confianza del VaR_CF usado para rankear/filtrar candidatos
 cornish_fisher_confidence = 0.95    # confianza del VaR/CVaR prospectivo del portafolio final
-cornish_fisher_mfis_clip = 5.0      # cota de MFIS para el termino de Cornish-Fisher (la expansion pierde validez con colas extremas)
-cornish_fisher_mfik_clip = 15.0     # cota de MFIK-3 (exceso) para el termino de Cornish-Fisher (idem)
 # NOTA: la penalizacion de cola que sumaba diag(alpha*(MFIK-3) - beta*MFIS) a
 # Sigma fue ELIMINADA. Sus coeficientes eran fijos y no calibrados, y MFIS/MFIK
 # son momentos bajo la medida Q (incluyen aversion al riesgo de cola), asi que
@@ -872,13 +869,12 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfis = (erT * W - 3 * mu * erT * V + 2 * mu ** 3) / mfiv ** 1.5
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
-    if not (np.isfinite(mfis) and np.isfinite(mfik)):
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+    # Un par fuera de K >= 1 + S^2 o sobre el techo delata una integracion mala:
+    # se anulan MFIS/MFIK (sin recortar) y se conserva la MFIV, que es mas robusta.
+    if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
+        mfis, mfik = np.nan, np.nan
 
-    mfis = float(np.clip(mfis, -bkm_mfis_clip, bkm_mfis_clip))
-    mfik = float(np.clip(mfik, 0.0, bkm_mfik_clip))
-
-    return dict(mfiv=mfiv, mfis=mfis, mfik=mfik, mu=mu, ok=True)
+    return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True)
 
 
 def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
@@ -1021,8 +1017,6 @@ log_returns_seasonal = log_returns.loc[log_returns.index.month.isin(execution_mo
 n_seasonal_weeks = len(log_returns_seasonal)
 print(f"  OK Semanas dentro de {execution_label} disponibles: {n_seasonal_weeks}")
 
-z_a_filter = norm.ppf(1 - tail_risk_filter_confidence)
-
 tail_risk_rows = []
 for ticker in selected_pre_seasonal:
     r_seasonal = log_returns_seasonal[ticker].dropna()
@@ -1031,7 +1025,8 @@ for ticker in selected_pre_seasonal:
 
     mom = bkm_get_current_moments_cached(ticker)
 
-    if n_obs < seasonal_min_weeks or not mom["ok"]:
+    # Sin MFIS/MFIK admisibles no hay forma de cola que rankear: se descarta.
+    if n_obs < seasonal_min_weeks or not mom["ok"] or not np.isfinite(mom["mfis"]):
         tail_risk_rows.append(dict(Symbol=ticker, MFIV=mom.get("mfiv", np.nan), MFIS=mom.get("mfis", np.nan),
                                     MFIK=mom.get("mfik", np.nan), VaR_CF=np.nan,
                                     Seasonal_SD=r_seasonal.std() if n_obs > 1 else np.nan, N_Obs=n_obs))
@@ -1039,13 +1034,10 @@ for ticker in selected_pre_seasonal:
 
     mu_T = mu_weekly_seasonal * (target_dte_iv / 7) if not pd.isna(mu_weekly_seasonal) else 0.0
     sigma_T = math.sqrt(mom["mfiv"])
-    S_skew = mom["mfis"]
-    K_exc = mom["mfik"] - 3.0
-
-    z_cf = (z_a_filter + (z_a_filter ** 2 - 1) / 6 * S_skew
-            + (z_a_filter ** 3 - 3 * z_a_filter) / 24 * K_exc
-            - (2 * z_a_filter ** 3 - 5 * z_a_filter) / 36 * S_skew ** 2)
-    var_cf_i = -(mu_T + sigma_T * z_cf)
+    # Cuantil CF con los momentos reales (Maillard): monotono en MFIS y MFIK, de
+    # modo que una cola izquierda mas pesada nunca mejora el ranking.
+    cola = rk.cornish_fisher_tail(1 - tail_risk_filter_confidence, mom["mfis"], mom["mfik"] - 3.0)
+    var_cf_i = -(mu_T + sigma_T * cola["q"])
 
     tail_risk_rows.append(dict(Symbol=ticker, MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"],
                                 VaR_CF=var_cf_i, Seasonal_SD=r_seasonal.std(), N_Obs=n_obs))
@@ -1060,7 +1052,7 @@ n_sin_tail = len(selected_pre_seasonal) - n_con_tail
 
 print(f"  OK Candidatos previos al filtro (post-Delta): {len(selected_pre_seasonal)}")
 print(f"  OK Con VaR_CF calculable (BKM + estacional, >={seasonal_min_weeks} sem): {n_con_tail}")
-print(f"  ADVERTENCIA Descartados (sin cobertura de opciones BKM o datos estacionales insuficientes): {n_sin_tail}")
+print(f"  ADVERTENCIA Descartados (sin cobertura BKM, MFIS/MFIK inadmisibles o datos estacionales insuficientes): {n_sin_tail}")
 
 tail_risk_final = tail_risk_stats.head(n_divers_candidates)
 
@@ -1684,7 +1676,6 @@ def run_minvar_qp(tickers_subset):
 # respecto a cada peso w_i, ponderada por w_i (estilo Euler), para podar por aporte marginal
 # al riesgo de cola real en vez de solo la contribucion marginal a la varianza.
 alpha_final = 1 - cornish_fisher_confidence
-z_a_final = norm.ppf(alpha_final)
 
 _panel_pool_df = log_returns_selected[selected_tickers].dropna()
 if len(_panel_pool_df) >= panel_min_obs:
@@ -1716,28 +1707,13 @@ def compute_marginal_cvar_contrib(tickers_subset, w_vec, cm_sub):
 
     grad = rk.portfolio_moment_gradients(w_vec, panel_sub)
 
-    # Al saturar la cota, el momento deja de responder a w: el gradiente de esa
-    # componente es cero (subgradiente correcto en el punto de corte).
-    S_raw, K_raw = grad["skew"], grad["exkurt"]
-    S_p_clip = float(np.clip(S_raw, -cornish_fisher_mfis_clip, cornish_fisher_mfis_clip))
-    K_exc_p_clip = float(np.clip(K_raw, 0.0, cornish_fisher_mfik_clip))
-
-    phi_za = norm.pdf(z_a_final)
-    mes_alpha = (phi_za / alpha_final) * (
-        1 + S_p_clip / 6 * z_a_final ** 2
-        + K_exc_p_clip / 24 * (z_a_final ** 3 - 3 * z_a_final)
-        - S_p_clip ** 2 / 36 * (2 * z_a_final ** 3 - 5 * z_a_final)
-    )
-
-    d_mes_dS = (phi_za / alpha_final) * (
-        z_a_final ** 2 / 6 - S_p_clip * (2 * z_a_final ** 3 - 5 * z_a_final) / 18
-    )
-    d_mes_dK = (phi_za / alpha_final) * (z_a_final ** 3 - 3 * z_a_final) / 24
+    # ES de Cornish-Fisher con los momentos reales del portafolio (Maillard),
+    # sin recortes: MES = -ES estandarizado y sus derivadas respecto a (S, K_exc).
+    es_std, d_es_dS, d_es_dK = rk.cornish_fisher_es_gradient(alpha_final, grad["skew"], grad["exkurt"])
+    mes_alpha = -es_std
 
     d_sigma_dw = (cm_sub @ w_vec) / sigma_p
-    d_S_dw = grad["d_skew_dw"] if np.isclose(S_p_clip, S_raw) else np.zeros_like(w_vec)
-    d_Kexc_dw = grad["d_exkurt_dw"] if np.isclose(K_exc_p_clip, K_raw) else np.zeros_like(w_vec)
-    d_mes_dw = d_mes_dS * d_S_dw + d_mes_dK * d_Kexc_dw
+    d_mes_dw = -(d_es_dS * grad["d_skew_dw"] + d_es_dK * grad["d_exkurt_dw"])
 
     # Riesgo_p = -CVaR_p = -mu_p + MES_alpha * sigma_p
     d_risk_dw = -mu_vec + mes_alpha * d_sigma_dw + sigma_p * d_mes_dw
@@ -1919,13 +1895,10 @@ def extract_metrics(opt_obj, label):
 metrics_minvar = extract_metrics(opt_min_var, "Minima Varianza")
 
 # ==============================================================================
-# VaR/CVaR (Expected Shortfall) prospectivo global, Cornish-Fisher (BKM)
-# Cornish-Fisher (1937): z_cf = z_a + (z_a^2-1)/6*S + (z_a^3-3z_a)/24*K_exc - (2z_a^3-5z_a)/36*S^2
-# ES modificado (Boudt, Peterson & Croux, 2008):
-#   MES_a = -phi(z_a)/a * (1 + S/6*z_a^2 + K_exc/24*(z_a^3-3z_a) - S^2/36*(2z_a^3-5z_a))
+# VaR/CVaR (Expected Shortfall) prospectivo global, Cornish-Fisher
+# Cuantil y ES de la distribucion CF con los momentos reales del portafolio
+# (Maillard, 2012); ver rk.cornish_fisher_tail.
 # ==============================================================================
-alpha_final = 1 - cornish_fisher_confidence
-z_a_final = norm.ppf(alpha_final)
 
 # Los momentos de orden superior del portafolio salen de los CO-MOMENTOS de un
 # panel empirico reescalado a la vol prospectiva, no del promedio ponderado de
@@ -1964,22 +1937,19 @@ if len(panel_source) >= panel_min_obs:
     print(f"     exceso de curtosis: {port_kurt_exc_final:+.4f}"
           + (f"   (atajo Q anterior: {kurt_naive:+.4f})" if np.isfinite(kurt_naive) else ""))
 
-    port_skew_cf = float(np.clip(port_skew_final, -cornish_fisher_mfis_clip, cornish_fisher_mfis_clip))
-    port_kurt_exc_cf = float(np.clip(port_kurt_exc_final, 0.0, cornish_fisher_mfik_clip))
-
     port_sd_horizon = metrics_minvar["Risk_Horizon"]
     port_mu_horizon = metrics_minvar["Return_Horizon"]
 
     cf_res = rk.var_cvar_cornish_fisher(
-        port_mu_horizon, port_sd_horizon, port_skew_cf, port_kurt_exc_cf,
+        port_mu_horizon, port_sd_horizon, port_skew_final, port_kurt_exc_final,
         confidence=cornish_fisher_confidence)
 
     var_cf_final = cf_res["var"]
     cvar_cf_final = cf_res["cvar"]
 
-    if not cf_res["monotone"]:
-        print("     ADVERTENCIA Cornish-Fisher NO es monotona con estos momentos:")
-        print("     el 'VaR' resultante no es un cuantil valido (Maillard, 2012).")
+    if not cf_res["exact"]:
+        print("     AVISO: la familia Cornish-Fisher no alcanza estos momentos; se usaron")
+        print("     los alcanzables mas cercanos (Maillard, 2012).")
         print(f"     Referencia gaussiana -> VaR {cf_res['var_gaussian'] * 100:.4f}% | "
               f"CVaR {cf_res['cvar_gaussian'] * 100:.4f}%")
 else:

@@ -173,6 +173,7 @@ EP_TOL_ENS = 0.10                      # ENS minimo aceptable (fraccion de J)
 # 11. [NUEVO] RIESGO DE COLA Y MODO DE OPTIMIZACION (BLOQUES 7B / 8B)
 # -----------------------------------------------------------------------------
 NIVEL_CONFIANZA_VAR = 0.95
+BKM_MFIK_MAX = 20.0             # techo de sanidad de MFIK; por encima, o si K < 1 + S^2, MFIS/MFIK pasan a neutro
 NIVELES_CVAR = (0.95, 0.99)
 UMBRAL_OMEGA_RATIO = 0.0        # umbral tau del Omega ratio (en exceso de 0)
 
@@ -592,7 +593,9 @@ def sigma_desde_ssvi(K, F, T, rho, eta, gamma, theta_tau):
 
 def otm_price_ssvi(K, S, F, T, r, rho, eta, gamma, theta_tau):
     sigma_k = sigma_desde_ssvi(K, F, T, rho, eta, gamma, theta_tau)
-    tipo = "put" if K < F else "call"
+    # Frontera OTM en S, no en F: los pesos de BKM se escriben en ln(K/S) y
+    # separan calls (K > S) de puts (K < S).
+    tipo = "put" if K < S else "call"
     return bs_price(S, K, T, r, sigma_k, tipo=tipo)
 
 
@@ -611,16 +614,17 @@ def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
         for K in strikes
     ])
 
-    lnKF = np.log(strikes / S)
+    lnKS = np.log(strikes / S)
 
-    peso_V = 2.0 * (1 - lnKF) / strikes ** 2
-    peso_W = (6.0 * lnKF - 3.0 * lnKF ** 2) / strikes ** 2
-    peso_X = (12.0 * lnKF ** 2 - 4.0 * lnKF ** 3) / strikes ** 2
+    peso_V = 2.0 * (1 - lnKS) / strikes ** 2
+    peso_W = (6.0 * lnKS - 3.0 * lnKS ** 2) / strikes ** 2
+    peso_X = (12.0 * lnKS ** 2 - 4.0 * lnKS ** 3) / strikes ** 2
 
-    factor = np.exp(r * T)
-    V_T = factor * _trapz(peso_V * precios, strikes)
-    W_T = factor * _trapz(peso_W * precios, strikes)
-    X_T = factor * _trapz(peso_X * precios, strikes)
+    # V, W y X son PRECIOS (valor presente) de los contratos de varianza, cubo y
+    # cuarta potencia: e^{rT} se aplica una sola vez, en las formulas de abajo.
+    V_T = _trapz(peso_V * precios, strikes)
+    W_T = _trapz(peso_W * precios, strikes)
+    X_T = _trapz(peso_X * precios, strikes)
 
     mu_T = (np.exp(r * T) - 1
             - np.exp(r * T) / 2 * V_T
@@ -660,6 +664,12 @@ for tk in tickers:
             rho=det["rho"], eta=det["eta"], gamma=det["gamma"],
             theta_tau=theta_tau_tk,
         )
+        # Un par fuera de K >= 1 + S^2 o sobre el techo delata una integracion
+        # mala: MFIS/MFIK pasan al neutro (0, 3) y se conserva la MFIV.
+        if not rk.higher_moments_admissible(resultado_bkm["MFIS"], resultado_bkm["MFIK"], BKM_MFIK_MAX):
+            print(f"  {tk}: MFIS/MFIK inadmisibles ({resultado_bkm['MFIS']:.3f}, "
+                  f"{resultado_bkm['MFIK']:.3f}) -> neutro (MFIS=0, MFIK=3)")
+            resultado_bkm = {**resultado_bkm, "MFIS": 0.0, "MFIK": 3.0}
         bkm_moments[tk] = resultado_bkm
         print(f"  {tk}: MFIV={resultado_bkm['MFIV']:.4f} | MFIS={resultado_bkm['MFIS']:.3f} "
               f"| MFIK={resultado_bkm['MFIK']:.3f}")
@@ -1807,39 +1817,16 @@ def var_cvar_historico(perdidas, p, alpha):
     return var, float(cvar)
 
 
-def cornish_fisher_z(alpha_cola, s, k):
-    """Cuantil de Cornish-Fisher para la probabilidad de cola alpha_cola.
+def var_cvar_cornish_fisher(mu, sigma, s, k, alpha):
+    """VaR y CVaR (como perdidas) bajo la distribucion de Cornish-Fisher.
 
-    Inversa de la expansion de Gram-Charlier / Edgeworth: corrige el cuantil
-    normal z con la asimetria S y la curtosis K del portafolio,
-
-        z_CF = z + (z^2-1)S/6 + (z^3-3z)(K-3)/24 - (2z^3-5z)S^2/36
-
-    de modo que VaR = -(mu + sigma*z_CF) recoge la forma real de la cola y no
-    la normal implicita del VaR parametrico clasico.
+    s y k son la asimetria y la curtosis REALES del portafolio. No se enchufan
+    como parametros de la expansion (eso invierte el orden del cuantil con
+    colas pesadas): rk.cornish_fisher_tail busca los parametros que reproducen
+    esos momentos (Maillard, 2012) y da el cuantil y el ES en forma cerrada.
     """
-    z = norm.ppf(alpha_cola)
-    ex = k - 3.0
-    return (z
-            + (z ** 2 - 1.0) * s / 6.0
-            + (z ** 3 - 3.0 * z) * ex / 24.0
-            - (2.0 * z ** 3 - 5.0 * z) * s ** 2 / 36.0)
-
-
-def var_cvar_cornish_fisher(mu, sigma, s, k, alpha, n_grid=2000):
-    """VaR y CVaR bajo la distribucion implicita por Cornish-Fisher.
-
-    El CVaR se obtiene integrando el cuantil CF sobre la cola izquierda:
-        ES = -( mu + sigma * (1/(1-alpha)) * integral_0^{1-alpha} z_CF(u) du )
-    """
-    z_cf = cornish_fisher_z(1.0 - alpha, s, k)
-    var = -(mu + sigma * z_cf)
-
-    u = np.linspace(1e-6, 1.0 - alpha, n_grid)
-    z_u = cornish_fisher_z(u, s, k)
-    media_cola = float(_trapz(z_u, u) / (1.0 - alpha))
-    cvar = -(mu + sigma * media_cola)
-    return float(var), float(cvar)
+    cola = rk.cornish_fisher_tail(1.0 - alpha, s, k - 3.0)
+    return float(-(mu + sigma * cola["q"])), float(-(mu + sigma * cola["es"]))
 
 
 def calcular_metricas_riesgo_cola(w, retornos_df, nivel_confianza=0.95,
@@ -1898,10 +1885,9 @@ def calcular_metricas_riesgo_cola(w, retornos_df, nivel_confianza=0.95,
     out = {"Retorno_esperado": mu, "Volatilidad": sigma,
            "Skewness": s_std, "Kurtosis": k_std}
 
-    # Dominio de validez: la expansion de Cornish-Fisher solo define un cuantil
-    # mientras z -> z_CF sea monotona creciente (Maillard, 2012). Fuera de ahi
-    # el VaR_CF no es un cuantil y conviene leer el gaussiano o el historico.
-    out["CF_monotona"] = float(rk.cornish_fisher_is_monotone(s_std, k_std - 3.0))
+    # CF_exacta = 0 si la familia Cornish-Fisher no alcanza (S, K) y se usaron
+    # los momentos alcanzables mas cercanos (Maillard, 2012).
+    out["CF_exacta"] = float(rk.cornish_fisher_params(s_std, k_std - 3.0)[2])
 
     # --- VaR al nivel principal ---------------------------------------------
     var_h, cvar_h = var_cvar_historico(perdidas, p, nivel_confianza)
@@ -2244,7 +2230,7 @@ metricas_hist = pd.DataFrame({
 
 nc = int(round(NIVEL_CONFIANZA_VAR * 100))
 orden_filas = [
-    "Retorno_esperado", "Volatilidad", "Skewness", "Kurtosis", "CF_monotona",
+    "Retorno_esperado", "Volatilidad", "Skewness", "Kurtosis", "CF_exacta",
     f"VaR{nc}_historico", f"VaR{nc}_gaussiano", f"VaR{nc}_CornishFisher",
 ] + [f"CVaR{int(round(a * 100))}_historico" for a in NIVELES_CVAR] \
   + [f"CVaR{int(round(a * 100))}_CornishFisher" for a in NIVELES_CVAR] \

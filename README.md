@@ -54,7 +54,8 @@ the optimizers share, so the same choices are not re-implemented five times:
 | `q_to_p_vol` / `q_to_p_correlation` | Risk-neutral → physical corrections for the variance and correlation risk premia. |
 | `standardized_panel` / `rescale_panel` / `portfolio_moments` | Portfolio skewness and kurtosis from co-moments, in `O(J·n)`, instead of averaging marginal moments. |
 | `portfolio_moment_gradients` | Analytic gradients of σ, skew and excess kurtosis, for Euler-style marginal CVaR contributions. |
-| `cornish_fisher_is_monotone` / `var_cvar_cornish_fisher` | Cornish-Fisher VaR/CVaR with a validity (monotonicity) check. |
+| `higher_moments_admissible` | Checks that a (skewness, kurtosis) pair is possible (K ≥ 1 + S²) and below a sanity ceiling. Used to reject bad BKM integrations instead of clipping them. |
+| `cornish_fisher_tail` / `var_cvar_cornish_fisher` / `cornish_fisher_es_gradient` | Cornish-Fisher quantile and closed-form ES built from the **actual** skewness and kurtosis (Maillard, 2012): the expansion parameters are solved so the resulting distribution has those moments, which keeps the quantile monotone in S and K. |
 | `martin_wagner_excess_return` | **Experimental, off by default.** Expected return from risk-neutral variance. The formula is not verified against the source paper — see the warning in the module. |
 
 ---
@@ -144,7 +145,7 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**, an evolu
 - Converts risk-neutral moments to the physical measure before optimizing (`COTA_RATIO_VOL_P`), and computes portfolio moments over an entropy-pooled scenario panel — so skewness and kurtosis diversify correctly. These two were already the model's strongest points and are unchanged.
 - **MVSK** optimization (mean-variance-skewness-kurtosis) instead of pure mean-variance.
 - Predefined risk profiles (`conservador`, `moderado`, `agresivo`) that set `tau`, `omega_scale`, and `gamma_ra`.
-- Reports a `CF_monotona` flag alongside the risk metrics: when it is 0, the Cornish-Fisher VaR is outside its validity domain and the historical or Gaussian figures should be read instead.
+- Reports a `CF_exacta` flag alongside the risk metrics: when it is 0, the portfolio's (skewness, kurtosis) pair is not reachable by the Cornish-Fisher family and the nearest reachable pair was used.
 - Includes maximum drawdown analysis of the resulting portfolio.
 
 Manager views are edited in **Block 6** of the file.
@@ -221,7 +222,7 @@ Portfolio positions are plotted on the surface along with gradient vectors indic
 ## Key concepts
 
 - **BKM (Bakshi, Kapadia, and Madan, 2003)**: extraction of *risk-neutral* variance, skewness, and kurtosis (MFIV, MFIS, MFIK) by integrating OTM option prices. Used here as a forward-looking risk estimator, in contrast to historical moments.
-- **Cornish-Fisher**: an expansion that adjusts normal quantiles for skewness and kurtosis, producing a VaR/CVaR sensitive to fat tails. The scripts clip the moments because the expansion breaks down under extreme tails, and they check that the transform is still monotone (Maillard, 2012) — outside that domain the result is not a quantile, and the run prints the Gaussian reference instead.
+- **Cornish-Fisher**: an expansion that adjusts normal quantiles for skewness and kurtosis, producing a VaR/CVaR sensitive to fat tails. The S and K in the formula are *parameters*, not the moments of the resulting distribution; plugging observed moments in directly leaves the monotonicity domain for heavy tails and, even inside it, can rank a more negatively skewed asset as *safer*. The scripts therefore solve for the parameters that reproduce the observed moments (Maillard, 2012), projecting onto the nearest reachable pair when needed. BKM moment pairs that violate K ≥ 1 + S² or exceed `bkm_mfik_max` are discarded rather than clipped: the MFIV is kept, and MFIS/MFIK become NaN (or neutral 0/3 in Black-Litterman).
 - **Risk-neutral vs. physical measure (Q vs. P)**: the implied density is the physical one reweighted by the pricing kernel, so implied moments carry risk premia. Implied variance exceeds physical variance (the variance risk premium) and implied correlation exceeds realized correlation (the correlation risk premium). Feeding raw Q moments to an optimizer overstates risk and understates diversification, so the scripts estimate a bounded per-asset Q→P ratio from realized data before building Σ.
 - **EWMA + Ledoit-Wolf**: the historical covariance is estimated from daily returns, exponentially weighted toward the recent regime, then shrunk toward a constant-correlation target. Covariance precision improves with sampling frequency while the mean's does not (Merton, 1980), and shrinkage corrects the downward bias of the small eigenvalues that a minimum-variance optimizer loads on (Michaud).
 - **Co-moments**: portfolio skewness and kurtosis depend on the M3 and M4 tensors, not on the marginal moments alone. Averaging per-asset MFIS/MFIK implicitly assumes perfect dependence and does not diversify; the error grows roughly with √n for weakly correlated assets. The scripts evaluate the exact quantities over a scenario panel in `O(J·n)`.

@@ -96,8 +96,7 @@ bkm_moneyness_lo = 0.70          # limite inferior de moneyness K/S para strikes
 bkm_moneyness_hi = 1.40          # limite superior de moneyness K/S para strikes OTM (integracion BKM)
 bkm_hist_moneyness_grid = np.array([0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15])  # grid reducido, reconstruccion historica
 bkm_min_options_per_side = 3     # minimo de strikes OTM por lado (calls/puts) para integracion valida
-bkm_mfis_clip = 10.0              # cota de winsorizacion para MFIS (estabilidad numerica en activos de baja MFIV)
-bkm_mfik_clip = 30.0              # cota de winsorizacion para MFIK (idem)
+bkm_mfik_max = 20.0               # techo de sanidad de MFIK (curtosis total); por encima, o si K < 1 + S^2, MFIS/MFIK se anulan
 bkm_lookback_months = 12         # ventana para reconstruir el MFIS historico "normal" del activo
 bkm_hist_sample_freq = "2W"      # frecuencia de muestreo historico BKM (2W=quincenal; toleramos huecos, min. 8 puntos validos)
 bkm_max_workers = 6              # tickers evaluados en paralelo durante el filtro BKM (ajustar segun rate limit del plan Polygon)
@@ -502,13 +501,12 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfis = (erT * W - 3 * mu * erT * V + 2 * mu ** 3) / mfiv ** 1.5
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
-    if not (np.isfinite(mfis) and np.isfinite(mfik)):
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+    # Un par fuera de K >= 1 + S^2 o sobre el techo delata una integracion mala:
+    # se anulan MFIS/MFIK (sin recortar) y se conserva la MFIV, que es mas robusta.
+    if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
+        mfis, mfik = np.nan, np.nan
 
-    mfis = float(np.clip(mfis, -bkm_mfis_clip, bkm_mfis_clip))
-    mfik = float(np.clip(mfik, 0.0, bkm_mfik_clip))
-
-    return dict(mfiv=mfiv, mfis=mfis, mfik=mfik, mu=mu, ok=True)
+    return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True)
 
 
 def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_hi, api_key=None):
@@ -1495,6 +1493,8 @@ def evaluar_bkm_activo(ticker):
     bkm_current_moments[ticker] = mom_actual
     if not mom_actual["ok"]:
         return dict(symbol=ticker, decision="mantener", motivo="sin_mfis_actual", z=np.nan)
+    if not np.isfinite(mom_actual["mfis"]):
+        return dict(symbol=ticker, decision="mantener", motivo="mfis_inadmisible", z=np.nan)
 
     try:
         start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
@@ -2082,10 +2082,9 @@ q05 = portfolio_returns_full.quantile(0.05)
 cvar_95 = portfolio_returns_full[portfolio_returns_full <= q05].mean()
 
 # ================================================
-# VaR/CVaR prospectivos ajustados por Cornish-Fisher (BKM)
-# Cornish-Fisher (1937): z_cf = z_a + (z_a^2-1)/6*S + (z_a^3-3z_a)/24*K_exc - (2z_a^3-5z_a)/36*S^2
-# ES modificado (Boudt, Peterson & Croux, 2008):
-#   MES_a = -phi(z_a)/a * (1 + S/6*z_a^2 + K_exc/24*(z_a^3-3z_a) - S^2/36*(2z_a^3-5z_a))
+# VaR/CVaR prospectivos ajustados por Cornish-Fisher
+# Cuantil y ES de la distribucion CF con los momentos reales del portafolio
+# (Maillard, 2012); ver rk.cornish_fisher_tail.
 # ================================================
 w_full = weights_opt.reindex(assets).fillna(0.0).values
 mfis_w = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
@@ -2122,9 +2121,9 @@ if len(panel_source_qu) >= panel_min_obs:
         print(f"      asimetria:          {port_skew:+.4f}   (atajo Q anterior: {skew_naive_qu:+.4f})")
         print(f"      exceso de curtosis: {port_kurt_exc:+.4f}   (atajo Q anterior: {kurt_naive_qu:+.4f})")
 
-    if not cf_qu["monotone"]:
-        print("   ADVERTENCIA Cornish-Fisher NO es monotona con estos momentos:")
-        print("   el 'VaR' resultante no es un cuantil valido (Maillard, 2012).")
+    if not cf_qu["exact"]:
+        print("   AVISO: la familia Cornish-Fisher no alcanza estos momentos; se usaron")
+        print("   los alcanzables mas cercanos (Maillard, 2012).")
         print(f"   Referencia gaussiana -> VaR {cf_qu['var_gaussian'] * 100:.4f}% | "
               f"CVaR {cf_qu['cvar_gaussian'] * 100:.4f}%")
 else:
