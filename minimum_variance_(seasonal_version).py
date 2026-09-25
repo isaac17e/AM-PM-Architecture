@@ -77,7 +77,7 @@ bkm_moneyness_hi = 1.30            # limite superior de moneyness K/S para strik
 bkm_min_options_per_side = 3       # minimo de strikes OTM por lado (calls/puts) para integracion valida
 bkm_mfis_clip = 10.0               # cota de winsorizacion para MFIS (estabilidad numerica en activos de baja MFIV)
 bkm_mfik_clip = 30.0               # cota de winsorizacion para MFIK (idem)
-tail_risk_filter_confidence = 0.99  # confianza del VaR_CF usado para rankear/filtrar candidatos (reemplaza SD estacional)
+tail_risk_filter_confidence = 0.99  # confianza del VaR_CF usado para rankear/filtrar candidatos
 cornish_fisher_confidence = 0.95    # confianza del VaR/CVaR prospectivo del portafolio final
 cornish_fisher_mfis_clip = 5.0      # cota de MFIS para el termino de Cornish-Fisher (la expansion pierde validez con colas extremas)
 cornish_fisher_mfik_clip = 15.0     # cota de MFIK-3 (exceso) para el termino de Cornish-Fisher (idem)
@@ -144,10 +144,6 @@ vrp_fallback_ratio = 0.90
 
 # === PANEL DE ESCENARIOS PARA MOMENTOS DEL PORTAFOLIO =========================
 panel_min_obs = 104                 # semanas minimas para armar el panel
-
-# === RETORNO ESPERADO VIA SVIX (Martin-Wagner) - EXPERIMENTAL =================
-# APAGADO. Formula sin verificar contra el paper. Ver aviso en risk_estimators.py.
-use_svix_expected_return = False
 
 # === CORRELACION IMPLICITA DE FACTORES (MERCADO + SECTOR + PAIS + FX) ===
 use_sector_factor = True
@@ -1011,12 +1007,11 @@ else:
     iv_cache = {t: get_atm_iv_safe(t) for t in selected_pre_seasonal}
 
 # ==============================================================================
-# FILTRO ESTACIONAL DE TAIL RISK BKM: VaR_CF (Cornish-Fisher) CON mu/HV
+# FILTRO ESTACIONAL DE TAIL RISK BKM: VaR_CF (Cornish-Fisher) CON mu
 # DE LA VENTANA ESTACIONAL + MFIS/MFIK FORWARD DE BKM
-# (reemplaza el ranking por SD estacional simple: la mu y la HV historica que
-#  alimentan el VaR_CF se calculan SOLO con las semanas dentro de execution_months,
-#  preservando la senal de estacionalidad, y se le suma la vista prospectiva de
-#  asimetria/curtosis implicita del mercado de opciones vigente)
+# (la mu historica que alimenta el VaR_CF se calcula SOLO con las semanas dentro
+#  de execution_months, preservando la senal de estacionalidad; sigma, asimetria
+#  y curtosis salen del mercado de opciones vigente via MFIV/MFIS/MFIK)
 # ==============================================================================
 print(f"\nAplicando filtro de Tail Risk BKM estacional ({execution_label}) - "
       f"VaR_CF a {tail_risk_filter_confidence * 100:.0f}% de confianza...")
@@ -1032,7 +1027,6 @@ tail_risk_rows = []
 for ticker in selected_pre_seasonal:
     r_seasonal = log_returns_seasonal[ticker].dropna()
     n_obs = len(r_seasonal)
-    hv_annual = r_seasonal.std() * math.sqrt(annualization_factor) if n_obs > 5 else np.nan
     mu_weekly_seasonal = r_seasonal.mean() if n_obs > 5 else np.nan
 
     mom = bkm_get_current_moments_cached(ticker)
@@ -1155,9 +1149,6 @@ sd_ret = log_returns_selected.std()
 benchmark_iv = "SPY"
 
 print("\nEstimando MFIV (BKM) para covarianza forward-looking...")
-
-mfik_arr = np.array([bkm_moments_cache.get(t, {}).get("mfik", np.nan) for t in selected_tickers])
-mfis_arr = np.array([bkm_moments_cache.get(t, {}).get("mfis", np.nan) for t in selected_tickers])
 
 iv_assets_implied = np.array([bkm_annual_vol(t) for t in selected_tickers])
 
@@ -1510,8 +1501,7 @@ print(f"     sqrt(diag(cov_mat)) = vol semanal: {np.sqrt(np.diag(cov_mat.values)
       f"{np.sqrt(np.diag(cov_mat.values)).max() * 100:.4f}%")
 
 # ==============================================================================
-# BLEND CON COVARIANZA HISTORICA SIMPLE + PENALIZACION DE RIESGO DE COLA (BKM)
-# Sigma_modificada = Sigma_final + diag(alpha*MFIK - beta*MFIS)
+# BLEND CON COVARIANZA HISTORICA (EWMA diaria + Ledoit-Wolf)
 # ==============================================================================
 # Antes: log_returns_selected.cov(), covarianza muestral semanal con pesos
 # iguales. Ahora: EWMA sobre retornos diarios + shrinkage de Ledoit-Wolf hacia

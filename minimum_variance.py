@@ -58,7 +58,7 @@ execution_date = date.today()
 
 options_horizon_cap_months = 3
 
-# === INTERVENCION 1: Parametros BKM y Tail Risk (reemplaza filtro Vol_Score EWMA/IV) ===
+# === PARAMETROS BKM Y TAIL RISK ===
 bkm_moneyness_lo = 0.70            # limite inferior de moneyness K/S para strikes OTM
 bkm_moneyness_hi = 1.30            # limite superior de moneyness K/S para strikes OTM
 bkm_min_options_per_side = 3       # minimo de strikes OTM por lado (calls/puts) para integracion valida
@@ -139,10 +139,6 @@ vrp_fallback_ratio = 0.90
 # La asimetria/curtosis del portafolio se calculan sobre un panel que preserva
 # la copula empirica, no promediando las marginales (que ignora diversificacion).
 panel_min_obs = 104                 # semanas minimas para armar el panel
-
-# === RETORNO ESPERADO VIA SVIX (Martin-Wagner) - EXPERIMENTAL =================
-# APAGADO. Formula sin verificar contra el paper. Ver aviso en risk_estimators.py.
-use_svix_expected_return = False
 
 use_sector_factor = True
 use_country_factor = True
@@ -724,7 +720,7 @@ def get_atm_iv_safe(ticker):
 
 
 # ==============================================================================
-# === INTERVENCION 2: Funciones BKM (Bakshi, Kapadia y Madan, 2003) ===
+# FUNCIONES BKM (Bakshi, Kapadia y Madan, 2003)
 #
 #   V(T) = int_S^inf [2*(1-ln(K/S))/K^2] C(K) dK + int_0^S [2*(1+ln(S/K))/K^2] P(K) dK
 #   W(T) = int_S^inf [6*ln(K/S)-3*ln(K/S)^2]/K^2 C(K) dK - int_0^S [6*ln(S/K)+3*ln(S/K)^2]/K^2 P(K) dK
@@ -735,7 +731,7 @@ def get_atm_iv_safe(ticker):
 #   MFIS(T) = [e^{rT}*W - 3*mu(T)*e^{rT}*V + 2*mu(T)^3] / MFIV(T)^{3/2}
 #   MFIK(T) = [e^{rT}*X - 4*mu(T)*e^{rT}*W + 6*e^{rT}*mu(T)^2*V - 3*mu(T)^4] / MFIV(T)^2
 #
-# Integracion numerica via regla del Trapecio (np.trapz) sobre strikes OTM disponibles.
+# Integracion numerica via regla del Trapecio (np.trapezoid) sobre strikes OTM disponibles.
 # ==============================================================================
 def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
     if T_yrs <= 0 or sigma <= 0:
@@ -968,8 +964,7 @@ else:
         iv_cache = {t: np.nan for t in selected_pre_seasonal}
 
 # ==============================================================================
-# FILTRO DE TAIL RISK BKM (VaR Cornish-Fisher) - reemplaza Vol_Score EWMA/IV
-# === INTERVENCION 1: BKM + Cornish-Fisher para rankear/filtrar candidatos ===
+# FILTRO DE TAIL RISK BKM: VaR Cornish-Fisher para rankear/filtrar candidatos
 # ==============================================================================
 print(f"\nAplicando filtro de Tail Risk BKM (VaR_CF a {tail_risk_filter_confidence * 100:.0f}% de confianza)...")
 
@@ -1041,7 +1036,7 @@ log_returns_selected = log_returns[selected_tickers]
 
 # ==============================================================================
 # SECCION 7: ESTADISTICAS DESCRIPTIVAS
-# === INTERVENCION 2: metricas prospectivas BKM (medida Q) junto a las historicas (medida P) ===
+# Metricas prospectivas BKM (medida Q) junto a las historicas (medida P)
 # ==============================================================================
 
 print("\n" + "=" * 67)
@@ -1096,7 +1091,7 @@ benchmark_iv = "SPY"
 
 print("\nEstimando MFIV (BKM) para covarianza forward-looking...")
 
-# === INTERVENCION 3: MFIV (BKM) reemplaza IV ATM Black-Scholes para activos y factores ===
+# MFIV (BKM) como volatilidad implicita de activos y factores
 def bkm_annual_vol(ticker):
     mom = bkm_get_current_moments_cached(ticker)
     if mom["ok"] and mom["mfiv"] > 0:
@@ -1105,8 +1100,6 @@ def bkm_annual_vol(ticker):
 
 
 iv_assets_implied = np.array([bkm_annual_vol(t) for t in selected_tickers])
-mfik_arr = np.array([bkm_moments_cache.get(t, {}).get("mfik", np.nan) for t in selected_tickers])
-mfis_arr = np.array([bkm_moments_cache.get(t, {}).get("mfis", np.nan) for t in selected_tickers])
 
 n_iv_ok = np.sum(~pd.isna(iv_assets_implied))
 n_iv_na = np.sum(pd.isna(iv_assets_implied))
@@ -1360,7 +1353,7 @@ for c in currencies_presentes:
 
 corr_factors = factor_returns_mat.corr()
 
-# === INTERVENCION 3 (cont.): MFIV (BKM) tambien para los factores proxy (mercado/sector/pais) ===
+# MFIV (BKM) tambien para los factores proxy (mercado/sector/pais)
 iv_factor = {f: np.nan for f in factor_names}
 iv_factor["MKT"] = iv_spy_implied
 for s in sectores_unicos:
@@ -2164,7 +2157,7 @@ print("  Vega por 1% de cambio en IV | Theta por dia | Delta sin normalizar (adi
 print("=" * 65 + "\n")
 
 # ==============================================================================
-# === INTERVENCION 5 (cont.): ATRIBUCION DE RIESGO DE COLA (BKM) ===
+# ATRIBUCION DE RIESGO DE COLA (BKM)
 # ==============================================================================
 print("ATRIBUCION DE RIESGO DE COLA (BKM) - DIAGNOSTICO")
 print("=" * 65)

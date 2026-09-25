@@ -90,7 +90,7 @@ options_dte_cap_days = 90
 iv_vs_realized_ratio_max = 1.80
 iv_min_survivors = 10
 
-# === INTERVENCION 1: Parametros BKM (reemplaza filtro de skew 25-delta) ===
+# === PARAMETROS BKM ===
 bkm_moneyness_lo = 0.70          # limite inferior de moneyness K/S para strikes OTM (integracion BKM)
 bkm_moneyness_hi = 1.40          # limite superior de moneyness K/S para strikes OTM (integracion BKM)
 bkm_hist_moneyness_grid = np.array([0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15])  # grid reducido, reconstruccion historica
@@ -432,7 +432,7 @@ def get_spot_safe_bkm(ticker):
 
 
 # ================================================
-# === INTERVENCION 2: Funciones BKM (Bakshi, Kapadia y Madan, 2003) ===
+# FUNCIONES BKM (Bakshi, Kapadia y Madan, 2003)
 # ================================================
 def bkm_iv_chain_to_prices(S, r, T, chain_df):
     if chain_df is None or chain_df.empty:
@@ -1457,7 +1457,6 @@ print(f"\nConjunto tras filtro de IV vs volatilidad reciente: {len(ticker_candid
 
 # ================================================
 # FILTRO MFIS (BKM) - cobertura anomala vs especulacion
-# === INTERVENCION 3: reemplaza el filtro de skew 25-delta por BKM ===
 # ================================================
 print(f"\nAplicando filtro MFIS (Bakshi-Kapadia-Madan) (z_threshold={bkm_z_threshold:.2f}, "
       f"lookback={bkm_lookback_months} meses)...")
@@ -1594,7 +1593,7 @@ n_assets = len(assets)
 
 # ================================================
 # MATRIZ DE COVARIANZA: SHRINKAGE IMPLIED (BKM) + HISTORICA
-# === INTERVENCION 4: IV objetivo via MFIV (BKM) en lugar de IV ATM Black-Scholes ===
+# IV objetivo via MFIV (BKM)
 # ================================================
 iv_rank_low = 0.20
 iv_rank_high = 0.80
@@ -2080,9 +2079,6 @@ cvar_95 = portfolio_returns_full[portfolio_returns_full <= q05].mean()
 #
 # Ahora los momentos salen de los co-momentos de un panel empirico reescalado a
 # la volatilidad prospectiva, via w'M3(w x w) y w'M4(w x w x w) en O(J*n).
-alpha_cf = 1 - cornish_fisher_confidence
-z_a = norm.ppf(alpha_cf)
-
 w_full = weights_opt.reindex(assets).fillna(0.0).values
 mfis_w = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
 mfik_w = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])

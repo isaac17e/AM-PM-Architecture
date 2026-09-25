@@ -2087,9 +2087,6 @@ cvar_95 = portfolio_returns_full[portfolio_returns_full <= q05].mean()
 # ES modificado (Boudt, Peterson & Croux, 2008):
 #   MES_a = -phi(z_a)/a * (1 + S/6*z_a^2 + K_exc/24*(z_a^3-3z_a) - S^2/36*(2z_a^3-5z_a))
 # ================================================
-alpha_cf = 1 - cornish_fisher_confidence
-z_a = norm.ppf(alpha_cf)
-
 w_full = weights_opt.reindex(assets).fillna(0.0).values
 mfis_w = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
 mfik_w = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])
