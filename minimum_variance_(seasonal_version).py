@@ -28,9 +28,13 @@ import plotly.graph_objects as go
 
 import risk_estimators as rk
 
-# ------------------------------------------------
+# ==============================================================================
+# SECCION 1: PARAMETROS CONFIGURABLES
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
 # API KEY - Polygon.io
-# ------------------------------------------------
+# ------------------------------------------------------------------------------
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -40,81 +44,104 @@ if not POLYGON_API_KEY:
     print("ADVERTENCIA: No hay POLYGON_API_KEY configurada. Todas las consultas de opciones")
     print("             fallaran y cada activo caera a volatilidad historica (sin IV real).")
 
-# ==============================================================================
-# SECCION 1: PARAMETROS CONFIGURABLES
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# BENCHMARK
+# ------------------------------------------------------------------------------
 
 benchmark = "SPY"
 
+# ------------------------------------------------------------------------------
+# UNIVERSO DE ACTIVOS
+# ------------------------------------------------------------------------------
 n_top_sp500 = 80
 n_top_nasdaq = 80
 n_top_international = 20
 target_total_tickers = 130
 
+# ------------------------------------------------------------------------------
 # HORIZONTE DE DATOS HISTORICOS
+# ------------------------------------------------------------------------------
 start_date = "2018-01-01"
 end_date = date.today()
 
-# MESES DE EJECUCION: define el horizonte de inversion.
+# ------------------------------------------------------------------------------
+# MESES DE EJECUCION
+# ------------------------------------------------------------------------------
 execution_months = [9]
 
-# PARAMETROS FINANCIEROS
+# ------------------------------------------------------------------------------
+# TASA LIBRE DE RIESGO
+# ------------------------------------------------------------------------------
 risk_free_rate = 0.045
 risk_free_rate_weekly = risk_free_rate / 52
 
+# ------------------------------------------------------------------------------
+# TAMANO DE LOS FILTROS DE CANDIDATOS
+# ------------------------------------------------------------------------------
 n_pre_seasonal = 70
 n_divers_candidates = 45
 
+# ------------------------------------------------------------------------------
+# PERCENTILES DE FILTRO Y NUMERO MAXIMO DE ACTIVOS
+# ------------------------------------------------------------------------------
 volatility_percentile = 0.55
 correlation_percentile = 0.60
 max_assets_in_portfolio = 15
 
+# ------------------------------------------------------------------------------
+# FILTRO ESTACIONAL
+# ------------------------------------------------------------------------------
 seasonal_min_weeks = 20
 
-# === PARAMETROS BKM Y TAIL RISK (VaR_CF Cornish-Fisher, fusionado con la ventana estacional) ===
-bkm_moneyness_lo = 0.70            # limite inferior de moneyness K/S para strikes OTM
-bkm_moneyness_hi = 1.30            # limite superior de moneyness K/S para strikes OTM
-bkm_min_options_per_side = 3       # minimo de strikes OTM por lado (calls/puts) para integracion valida
-bkm_mfik_max = 20.0                # techo de sanidad de MFIK (curtosis total); por encima, o si K < 1 + S^2, MFIS/MFIK se anulan
-tail_risk_filter_confidence = 0.99  # confianza del VaR_CF usado para rankear/filtrar candidatos
-cornish_fisher_confidence = 0.95    # confianza del VaR/CVaR prospectivo del portafolio final
-# NOTA: la penalizacion de cola que sumaba diag(alpha*(MFIK-3) - beta*MFIS) a
-# Sigma fue ELIMINADA. Sus coeficientes eran fijos y no calibrados, y MFIS/MFIK
-# son momentos bajo la medida Q (incluyen aversion al riesgo de cola), asi que
-# inflaban la varianza fisica por un factor arbitrario. El riesgo de cola del
-# portafolio ahora se mide con los co-momentos del panel empirico (medida P),
-# que si diversifican correctamente. Ver el bloque de Cornish-Fisher final.
+# ------------------------------------------------------------------------------
+# PARAMETROS BKM Y TAIL RISK
+# ------------------------------------------------------------------------------
+bkm_moneyness_lo = 0.70
+bkm_moneyness_hi = 1.30
+bkm_min_options_per_side = 3
+bkm_mfik_max = 20.0
+tail_risk_filter_confidence = 0.99
+cornish_fisher_confidence = 0.95
 
+# ------------------------------------------------------------------------------
 # RESTRICCIONES DE PONDERACION
+# ------------------------------------------------------------------------------
 max_weight_per_asset = 0.12
 min_weight_per_asset = 0.001
 
+# ------------------------------------------------------------------------------
 # ESTRATEGIA DE PONDERACION
+# ------------------------------------------------------------------------------
 require_full_investment = False
 min_total_weight = 1.00
 max_total_weight = 1.00
 
-# === RESTRICCION DE PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL ===
+# ------------------------------------------------------------------------------
+# RESTRICCION DE PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL
+# ------------------------------------------------------------------------------
 use_etf_constraint = True
 etf_min_weight = 0.30
 etf_max_weight = 0.55
 
-# === ETFs EN EL PORTAFOLIO RESULTANTE ===
-# True : el portafolio final puede incluir ETFs y, si use_etf_constraint = True,
-#        su participacion respeta la banda etf_min_weight - etf_max_weight.
-# False: el portafolio final solo contiene acciones y commodities (commodity_tickers).
-#        Los ETFs se siguen descargando y usando en todo el pipeline (factores de
-#        sector/pais, matrices de covarianza, filtros); solo se excluyen como
-#        candidatos del optimizador final, y la banda de % ETF deja de aplicarse.
+# ------------------------------------------------------------------------------
+# ETFs EN EL PORTAFOLIO RESULTANTE
+# ------------------------------------------------------------------------------
 include_etfs_in_portfolio = True
 
-# === RESTRICCION DE EXPOSICION CAMBIARIA (tickers no denominados en USD) ===
+# ------------------------------------------------------------------------------
+# RESTRICCION DE EXPOSICION CAMBIARIA
+# ------------------------------------------------------------------------------
 use_fx_factor = True
 max_fx_exposure = 0.45
 
+# ------------------------------------------------------------------------------
+# ANUALIZACION
+# ------------------------------------------------------------------------------
 annualization_factor = 52
 
-# === FILTRO DELTA (Black-Scholes) ===
+# ------------------------------------------------------------------------------
+# FILTRO DELTA (BLACK-SCHOLES)
+# ------------------------------------------------------------------------------
 use_delta_filter = True
 delta_min = 0.3
 delta_strike_mode = "atm"
@@ -122,36 +149,36 @@ target_dte_iv = 30
 dte_tol_iv = 7
 moneyness_tol_iv = 0.02
 
-# === SHRINKAGE COVARIANZA: IMPLIED vs HISTORICA ===
+# ------------------------------------------------------------------------------
+# SHRINKAGE COVARIANZA: IMPLIED vs HISTORICA
+# ------------------------------------------------------------------------------
 use_iv_shrinkage = True
 shrinkage_max = 0.85
 shrinkage_min = 0.35
 ratio_band = 0.30
 
-# === COVARIANZA HISTORICA: EWMA + SHRINKAGE LEDOIT-WOLF =======================
-# La precision de una covarianza crece con la frecuencia de muestreo, a
-# diferencia de la media (Merton, 1980): Sigma se estima con retornos DIARIOS y
-# se reescala a semanal. EWMA pondera el regimen reciente; el shrinkage de
-# Ledoit-Wolf corrige el sesgo de los autovalores pequenos, que es lo que el
-# optimizador sobrepondera (Michaud).
-#
-# OJO (version estacional): la ventana estacional (execution_months) se aplica
-# al filtro de VaR_CF por activo, NO a Sigma. Sigma usa la serie completa a
-# proposito: restringirla a un mes del ano dejaria ~4 observaciones por ano y
-# el error de estimacion dominaria cualquier ganancia por estacionalidad.
+# ------------------------------------------------------------------------------
+# COVARIANZA HISTORICA: EWMA + SHRINKAGE LEDOIT-WOLF
+# ------------------------------------------------------------------------------
 use_daily_cov = True
-cov_halflife_days = 120             # vida media EWMA en dias habiles (~6 meses)
+cov_halflife_days = 120
 use_lw_shrinkage = True
 
-# === CORRECCION Q -> P (prima de riesgo de varianza) ==========================
+# ------------------------------------------------------------------------------
+# CORRECCION Q -> P (PRIMA DE RIESGO DE VARIANZA)
+# ------------------------------------------------------------------------------
 use_q_to_p_vol = True
 vrp_ratio_bounds = (0.70, 1.00)
 vrp_fallback_ratio = 0.90
 
-# === PANEL DE ESCENARIOS PARA MOMENTOS DEL PORTAFOLIO =========================
-panel_min_obs = 104                 # semanas minimas para armar el panel
+# ------------------------------------------------------------------------------
+# PANEL DE ESCENARIOS PARA MOMENTOS DEL PORTAFOLIO
+# ------------------------------------------------------------------------------
+panel_min_obs = 104
 
-# === CORRELACION IMPLICITA DE FACTORES (MERCADO + SECTOR + PAIS + FX) ===
+# ------------------------------------------------------------------------------
+# CORRELACION IMPLICITA DE FACTORES (MERCADO + SECTOR + PAIS + FX)
+# ------------------------------------------------------------------------------
 use_sector_factor = True
 use_country_factor = True
 
@@ -187,9 +214,6 @@ horizon_factor = horizon_weeks
 horizon_sqrt = math.sqrt(horizon_weeks)
 rf_horizon = risk_free_rate * (horizon_months / 12)
 
-# El horizonte de esta variante siempre es <=3 meses (validado arriba), por lo que
-# siempre cae dentro de la cobertura tipica de opciones - no hace falta un cap
-# analogo a options_horizon_cap_months de la version general.
 use_iv_for_horizon = True
 T_options = horizon_months / 12
 
@@ -251,8 +275,6 @@ def clean_symbol_table(tbl):
         & ~tbl["symbol"].astype(str).str.match(r"^[0-9]")
     ].copy()
     tbl["symbol"] = tbl["symbol"].astype(str).str.upper().str.replace(".", "-", regex=False)
-    # Ordena explicitamente por market cap real en vez de confiar en el orden
-    # con el que la fuente sirve la tabla (defensa ante cambios de sort default).
     if "market_cap" in tbl.columns:
         cap_num = tbl["market_cap"].apply(_parse_market_cap)
         if cap_num.notna().any():
@@ -262,7 +284,9 @@ def clean_symbol_table(tbl):
     return tbl.reset_index(drop=True)
 
 
-# === OBTENER TICKERS: S&P 500 (ordenado por cap. de mercado) ===
+# ==============================================================================
+# OBTENER TICKERS: S&P 500 (ORDENADO POR CAP. DE MERCADO)
+# ==============================================================================
 print("[INFO] Obteniendo tickers del S&P 500 (stockanalysis.com)...")
 sp500_tbl = safe_scrape_table("https://stockanalysis.com/list/sp-500-stocks/")
 
@@ -279,7 +303,9 @@ else:
                       "TSLA", "JPM", "UNH", "V", "XOM", "MA", "JNJ", "PG", "COST", "HD"]
     print("  ADVERTENCIA: Scraping fallo en ambas fuentes - usando fallback S&P 500 (20 tickers hardcodeados)")
 
-# === OBTENER TICKERS: NASDAQ (ordenado por cap. de mercado) ===
+# ==============================================================================
+# OBTENER TICKERS: NASDAQ (ORDENADO POR CAP. DE MERCADO)
+# ==============================================================================
 print("\n[INFO] Obteniendo tickers del NASDAQ (stockanalysis.com)...")
 nasdaq_tbl = safe_scrape_table("https://stockanalysis.com/list/nasdaq-stocks/")
 
@@ -293,7 +319,9 @@ else:
                        "NFLX", "AMD", "ADBE", "QCOM", "INTU", "AMAT", "TXN", "MU", "BKNG", "NOW"]
     print("  ADVERTENCIA: Scraping fallo - usando fallback NASDAQ (20 tickers hardcodeados)")
 
-# === ETFs ===
+# ==============================================================================
+# ETFs
+# ==============================================================================
 etf_core = ["SPY", "QQQ", "VOO", "VTI", "VYM", "IWM", "GLD", "SLV", "USO", "PDBC", "HYG", "VNQ"]
 etf_sectoriales = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOX"]
 etf_subsectoriales = [
@@ -319,10 +347,14 @@ etf_geograficos = [
 ]
 etf_tickers = list(dict.fromkeys(etf_core + etf_sectoriales + etf_subsectoriales + etf_geograficos))
 
-# === COMMODITIES ===
+# ==============================================================================
+# COMMODITIES
+# ==============================================================================
 commodity_tickers = ["SLV", "UNG"]
 
-# === TICKERS INTERNACIONALES ===
+# ==============================================================================
+# TICKERS INTERNACIONALES
+# ==============================================================================
 international_tickers_full = [
     "RY.TO", "SHOP.TO", "TD.TO", "BN.TO", "ENB.TO", "TRI.TO", "BNS.TO",
     "CP.TO", "CNQ.TO", "AEM.TO", "SU.TO", "TRP.TO", "WCN.TO", "FNV.TO",
@@ -341,7 +373,9 @@ international_tickers = international_tickers_full[:n_top_international]
 
 etf_universe_tickers = list(dict.fromkeys(etf_tickers + commodity_tickers))
 
-# === COMBINAR Y LIMPIAR ===
+# ==============================================================================
+# COMBINAR Y LIMPIAR
+# ==============================================================================
 print("\n[INFO] Combinando y limpiando tickers...")
 
 sp500_tickers_clean = list(dict.fromkeys(t.upper() for t in sp500_tickers))
@@ -495,9 +529,9 @@ benchmark_data = download_ticker_data(benchmark, start_date, end_date)
 if len(stock_data) == 0 or benchmark_data is None or len(benchmark_data) == 0:
     raise RuntimeError("Error: No se descargaron datos suficientes.")
 
-# ---------------------------------------------------------------------------
-# DESCARGA DE PARES FX (para convertir precios de internacionales a USD)
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# DESCARGA DE PARES FX (PARA CONVERTIR PRECIOS DE INTERNACIONALES A USD)
+# ==============================================================================
 print("\n[INFO] Descargando pares FX para conversion a USD...")
 fx_data = {}
 for cur, info in fx_pairs.items():
@@ -509,9 +543,9 @@ for cur, info in fx_pairs.items():
         print(f"  ADVERTENCIA: no se pudo descargar {info['ticker']} para {cur} "
               f"- los tickers en {cur} quedaran en moneda local")
 
-# ---------------------------------------------------------------------------
-# CONVERTIR A RETORNOS SEMANALES (precios internacionales convertidos a USD)
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# CONVERTIR A RETORNOS SEMANALES (PRECIOS INTERNACIONALES CONVERTIDOS A USD)
+# ==============================================================================
 print("\n[INFO] Convirtiendo precios diarios -> retornos semanales...")
 
 prices_wide = stock_data.pivot_table(index="date", columns="symbol", values="adjusted")
@@ -551,11 +585,9 @@ print(f"  OK Tickers convertidos a USD: {n_convertidos}")
 weekly_returns = np.log(prices_weekly_usd / prices_weekly_usd.shift(1)).dropna(how="all")
 weekly_returns = weekly_returns.dropna()
 
-# --- Retornos DIARIOS en USD: insumo de la covarianza historica ---------------
-# El pipeline sigue razonando en semanas (retornos, horizonte, filtros), pero
-# Sigma se estima con la serie diaria y se reescala: con ~5x mas observaciones
-# el error de estimacion de la covarianza cae de forma sustancial, mientras que
-# la media no gana nada por muestrear mas fino (Merton, 1980).
+# ==============================================================================
+# RETORNOS DIARIOS EN USD: INSUMO DE LA COVARIANZA HISTORICA
+# ==============================================================================
 fx_daily_price_usd = {}
 for cur, s in fx_data.items():
     fx_daily_price_usd[cur] = (1 / s) if fx_pairs[cur]["invert"] else s
@@ -669,7 +701,9 @@ if len(selected_pre_seasonal) < 5:
 print(f"\n[INFO] Pool pre-filtro estacional: {len(selected_pre_seasonal)} candidatos "
       f"(max configurado: {n_pre_seasonal})")
 
-# === FILTRO DELTA (Black-Scholes) ============================================
+# ==============================================================================
+# FILTRO DELTA (BLACK-SCHOLES)
+# ==============================================================================
 
 
 def get_spot_safe(ticker):
@@ -757,10 +791,6 @@ def get_polygon_option_snapshot(ticker):
 
 def get_atm_iv_safe(ticker):
     if get_currency_for_ticker(ticker) != "USD":
-        # Polygon solo cubre opciones de emisores listados en EE.UU. Para
-        # tickers internacionales no se consulta - el fallback historico
-        # ya existente en cada punto de uso se activa automaticamente
-        # al recibir NaN aqui.
         return np.nan
     poly = get_polygon_option_snapshot(ticker)
     if poly is not None and not pd.isna(poly["iv"]) and poly["iv"] > 0:
@@ -769,19 +799,7 @@ def get_atm_iv_safe(ticker):
 
 
 # ==============================================================================
-# FUNCIONES BKM (Bakshi, Kapadia y Madan, 2003) - extraccion de momentos
-# implicitos (MFIV/MFIS/MFIK) a partir de la cadena de opciones OTM.
-#
-#   V(T) = int_S^inf [2*(1-ln(K/S))/K^2] C(K) dK + int_0^S [2*(1+ln(S/K))/K^2] P(K) dK
-#   W(T) = int_S^inf [6*ln(K/S)-3*ln(K/S)^2]/K^2 C(K) dK - int_0^S [6*ln(S/K)+3*ln(S/K)^2]/K^2 P(K) dK
-#   X(T) = int_S^inf [12*ln(K/S)^2-4*ln(K/S)^3]/K^2 C(K) dK + int_0^S [12*ln(S/K)^2+4*ln(S/K)^3]/K^2 P(K) dK
-#
-#   mu(T)   = e^{rT} - 1 - (e^{rT}/2)*V - (e^{rT}/6)*W - (e^{rT}/24)*X
-#   MFIV(T) = e^{rT}*V - mu(T)^2
-#   MFIS(T) = [e^{rT}*W - 3*mu(T)*e^{rT}*V + 2*mu(T)^3] / MFIV(T)^{3/2}
-#   MFIK(T) = [e^{rT}*X - 4*mu(T)*e^{rT}*W + 6*e^{rT}*mu(T)^2*V - 3*mu(T)^4] / MFIV(T)^2
-#
-# Integracion numerica via regla del Trapecio (np.trapezoid) sobre strikes OTM disponibles.
+# FUNCIONES BKM (Bakshi, Kapadia y Madan, 2003)
 # ==============================================================================
 def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
     if T_yrs <= 0 or sigma <= 0:
@@ -878,8 +896,6 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfis = (erT * W - 3 * mu * erT * V + 2 * mu ** 3) / mfiv ** 1.5
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
-    # Un par fuera de K >= 1 + S^2 o sobre el techo delata una integracion mala:
-    # se anulan MFIS/MFIK (sin recortar) y se conserva la MFIV, que es mas robusta.
     if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
         mfis, mfik = np.nan, np.nan
 
@@ -1012,11 +1028,7 @@ else:
     iv_cache = {t: get_atm_iv_safe(t) for t in selected_pre_seasonal}
 
 # ==============================================================================
-# FILTRO ESTACIONAL DE TAIL RISK BKM: VaR_CF (Cornish-Fisher) CON mu
-# DE LA VENTANA ESTACIONAL + MFIS/MFIK FORWARD DE BKM
-# (la mu historica que alimenta el VaR_CF se calcula SOLO con las semanas dentro
-#  de execution_months, preservando la senal de estacionalidad; sigma, asimetria
-#  y curtosis salen del mercado de opciones vigente via MFIV/MFIS/MFIK)
+# FILTRO ESTACIONAL DE TAIL RISK BKM: VaR_CF (Cornish-Fisher)
 # ==============================================================================
 print(f"\nAplicando filtro de Tail Risk BKM estacional ({execution_label}) - "
       f"VaR_CF a {tail_risk_filter_confidence * 100:.0f}% de confianza...")
@@ -1034,7 +1046,6 @@ for ticker in selected_pre_seasonal:
 
     mom = bkm_get_current_moments_cached(ticker)
 
-    # Sin MFIS/MFIK admisibles no hay forma de cola que rankear: se descarta.
     if n_obs < seasonal_min_weeks or not mom["ok"] or not np.isfinite(mom["mfis"]):
         tail_risk_rows.append(dict(Symbol=ticker, MFIV=mom.get("mfiv", np.nan), MFIS=mom.get("mfis", np.nan),
                                     MFIK=mom.get("mfik", np.nan), VaR_CF=np.nan,
@@ -1043,8 +1054,6 @@ for ticker in selected_pre_seasonal:
 
     mu_T = mu_weekly_seasonal * (target_dte_iv / 7) if not pd.isna(mu_weekly_seasonal) else 0.0
     sigma_T = math.sqrt(mom["mfiv"])
-    # Cuantil CF con los momentos reales (Maillard): monotono en MFIS y MFIK, de
-    # modo que una cola izquierda mas pesada nunca mejora el ranking.
     cola = rk.cornish_fisher_tail(1 - tail_risk_filter_confidence, mom["mfis"], mom["mfik"] - 3.0)
     var_cf_i = -(mu_T + sigma_T * cola["q"])
 
@@ -1115,7 +1124,6 @@ descriptive_stats = pd.DataFrame({
     "Max_Drawdown": [max_drawdown_from_returns(log_returns_selected[c]) for c in log_returns_selected.columns],
 })
 
-# Metricas prospectivas BKM (medida Q) junto a las historicas (medida P) de arriba
 descriptive_stats["MFIV_T"] = [bkm_moments_cache.get(c, {}).get("mfiv", np.nan) for c in log_returns_selected.columns]
 descriptive_stats["MFIS_Q"] = [bkm_moments_cache.get(c, {}).get("mfis", np.nan) for c in log_returns_selected.columns]
 descriptive_stats["MFIK_Q"] = [bkm_moments_cache.get(c, {}).get("mfik", np.nan) for c in log_returns_selected.columns]
@@ -1146,7 +1154,9 @@ print("=" * 67 + "\n")
 mean_ret = log_returns_selected.mean()
 sd_ret = log_returns_selected.std()
 
-# --- MATRIZ DE COVARIANZA: MFIV (BKM) model-free implied variance -----------
+# ==============================================================================
+# MATRIZ DE COVARIANZA: MFIV (BKM) MODEL-FREE IMPLIED VARIANCE
+# ==============================================================================
 benchmark_iv = "SPY"
 
 print("\nEstimando MFIV (BKM) para covarianza forward-looking...")
@@ -1163,7 +1173,9 @@ sd_hist_annual = sd_ret.values * math.sqrt(annualization_factor)
 iv_final = np.where(~pd.isna(iv_assets_implied), iv_assets_implied, sd_hist_annual)
 iv_final = np.where(pd.isna(iv_final), sd_hist_annual, iv_final)
 
-# === CORRECCION Q -> P: la MFIV incluye la prima de riesgo de varianza ========
+# ==============================================================================
+# CORRECCION Q -> P: LA MFIV INCLUYE LA PRIMA DE RIESGO DE VARIANZA
+# ==============================================================================
 iv_final_q = iv_final.copy()
 if use_q_to_p_vol:
     iv_final, vrp_ratio = rk.q_to_p_vol(
@@ -1213,9 +1225,6 @@ sector_etf_map = {
     "Materials": "XLB",
     "Utilities": "XLU",
     "Real Estate": "XLRE",
-    # XLC (lanzado en 2018) no cubre start_date=2014 con suficiente historia
-    # y queda descartado en el filtro de completitud - se usa VOX (Vanguard
-    # Communication Services ETF, inception 2004) como proxy equivalente.
     "Communication Services": "VOX",
 }
 
@@ -1238,29 +1247,21 @@ if use_sector_factor:
         print("  ADVERTENCIA No se pudo obtener el mapeo de sectores (Wikipedia) - cae a modelo de 1 factor (solo mercado) para domesticos")
         ticker_sector_etf = {}
 
-    # === MAPEO DE SECTOR PARA TICKERS INTERNACIONALES (mismos ETFs sectoriales
-    # ya presentes en etf_sectoriales, no se abren nuevos conjuntos) ===
     international_sector_etf_map = {
-        # Canada (.TO)
         "RY.TO": "XLF", "SHOP.TO": "XLK", "TD.TO": "XLF", "BN.TO": "XLF",
         "ENB.TO": "XLE", "TRI.TO": "XLI", "BNS.TO": "XLF", "CP.TO": "XLI",
         "CNQ.TO": "XLE", "AEM.TO": "XLB", "SU.TO": "XLE", "TRP.TO": "XLE",
         "WCN.TO": "XLI", "FNV.TO": "XLB", "SAP.TO": "XLP",
-        # Alemania (.DE)
         "SIE.DE": "XLI", "DTE.DE": "VOX", "ALV.DE": "XLF", "MBG.DE": "XLY",
         "IFX.DE": "XLK", "BMW.DE": "XLY", "DB1.DE": "XLF", "DHL.DE": "XLI",
         "DBK.DE": "XLF", "MUV2.DE": "XLF",
-        # Reino Unido (.L, y HSBC/BP sin sufijo)
         "AZN.L": "XLV", "HSBC": "XLF", "ULVR.L": "XLP", "BP": "XLE",
         "GSK.L": "XLV", "RIO.L": "XLB", "BATS.L": "XLP", "GLEN.L": "XLB",
         "DGE.L": "XLP", "NG.L": "XLU",
-        # Francia (.PA)
         "MC.PA": "XLY", "TTE.PA": "XLE", "SAN.PA": "XLV", "OR.PA": "XLP",
         "SU.PA": "XLI", "AI.PA": "XLB", "BNP.PA": "XLF", "RMS.PA": "XLY",
         "CS.PA": "XLF", "SAF.PA": "XLI", "CAP.PA": "XLK",
-        # Espana (.MC)
         "ITX.MC": "XLY", "IBE.MC": "XLU", "BBVA.MC": "XLF", "SAN.MC": "XLF",
-        # Japon (.T)
         "7203.T": "XLY", "6758.T": "XLY", "6861.T": "XLK", "8306.T": "XLF",
         "9984.T": "VOX", "6367.T": "XLI", "6098.T": "XLI", "4063.T": "XLB",
         "7974.T": "VOX", "9432.T": "VOX", "6501.T": "XLI", "7267.T": "XLY",
@@ -1346,7 +1347,9 @@ n_con_fx = sum(1 for v in asset_currency.values() if v != "USD" and v in fx_week
 print(f"  OK Moneda no-USD con factor FX: {n_con_fx} de {n_sel} activos | {k_currencies} monedas distintas en el pool"
       + (f" ({', '.join(currencies_presentes)})" if k_currencies > 0 else ""))
 
-# --- Betas de factores por activo: r_i ~ r_MKT + r_SECTOR + r_PAIS + r_FX ---
+# ==============================================================================
+# BETAS DE FACTORES POR ACTIVO: r_i ~ r_MKT + r_SECTOR + r_PAIS + r_FX
+# ==============================================================================
 beta_hist_implied = {}
 beta_sector_implied = {}
 beta_country_implied = {}
@@ -1407,7 +1410,9 @@ print(f"     beta_sector (primeros 3):          {beta_sector_arr[0]:.4f} | {beta
 print(f"     beta_pais (primeros 3):            {beta_country_arr[0]:.4f} | {beta_country_arr[1]:.4f} | {beta_country_arr[2]:.4f}")
 print(f"     beta_fx (primeros 3):              {beta_fx_arr[0]:.4f} | {beta_fx_arr[1]:.4f} | {beta_fx_arr[2]:.4f}")
 
-# --- Matriz de factores F: MKT + cada sector presente + cada pais presente + cada moneda presente ---
+# ==============================================================================
+# MATRIZ DE FACTORES F: MKT + CADA SECTOR PRESENTE + CADA PAIS PRESENTE + CADA MONEDA PRESENTE
+# ==============================================================================
 factor_names = ["MKT"] + sectores_unicos + paises_unicos + currencies_presentes
 
 factor_returns_mat = pd.DataFrame(index=log_returns.index, columns=factor_names, dtype=float)
@@ -1434,7 +1439,6 @@ for p in paises_unicos:
         iv_p = log_returns[p].std() * math.sqrt(annualization_factor)
     iv_factor[p] = iv_p
 for c in currencies_presentes:
-    # Polygon no cubre opciones sobre pares FX - se usa volatilidad historica del par
     iv_c = fx_weekly_returns[c].std() * math.sqrt(annualization_factor)
     iv_factor[c] = iv_c
 
@@ -1442,7 +1446,9 @@ iv_factor_weekly = np.array([iv_factor[f] / math.sqrt(annualization_factor) for 
 D_factor = np.diag(iv_factor_weekly)
 F_mat = D_factor @ corr_factors.loc[factor_names, factor_names].values @ D_factor
 
-# --- Matriz de cargas B y covarianza explicada por factores ------------------
+# ==============================================================================
+# MATRIZ DE CARGAS B Y COVARIANZA EXPLICADA POR FACTORES
+# ==============================================================================
 B_load = np.zeros((n_sel, len(factor_names)))
 mkt_idx = factor_names.index("MKT")
 B_load[:, mkt_idx] = beta_hist_arr
@@ -1488,7 +1494,9 @@ else:
 
 print(f"     vol_final semanal rango:           {vol_final_weekly.min() * 100:.4f}% - {vol_final_weekly.max() * 100:.4f}%")
 
-# --- Varianza idiosincratica --------------------------------------------------
+# ==============================================================================
+# VARIANZA IDIOSINCRATICA
+# ==============================================================================
 explained_var = np.diag(Cov_explained)
 idio_var = np.maximum(vol_final_weekly ** 2 - explained_var, 1e-8)
 
@@ -1504,10 +1512,7 @@ print(f"     sqrt(diag(cov_mat)) = vol semanal: {np.sqrt(np.diag(cov_mat.values)
 # ==============================================================================
 # BLEND CON COVARIANZA HISTORICA (EWMA diaria + Ledoit-Wolf)
 # ==============================================================================
-# Antes: log_returns_selected.cov(), covarianza muestral semanal con pesos
-# iguales. Ahora: EWMA sobre retornos diarios + shrinkage de Ledoit-Wolf hacia
-# correlacion constante, reescalada a semanal.
-cov_scale_d2w = 252.0 / annualization_factor    # diaria -> semanal
+cov_scale_d2w = 252.0 / annualization_factor
 
 daily_sel = None
 if use_daily_cov:
@@ -1544,8 +1549,6 @@ print(f"     |cov_hist - cov_factor| fuera de diagonal, max:      {diff_offdiag[
 
 cov_mat_values = (1 - hist_shrink_alpha) * cov_mat.values + hist_shrink_alpha * cov_hist_simple
 
-# MFIS/MFIK (medida Q) YA NO se suman a la diagonal de Sigma; se reportan como
-# diagnostico en la atribucion final. Ver la nota en la Seccion 1.
 cov_mat = pd.DataFrame(cov_mat_values, index=selected_tickers, columns=selected_tickers)
 
 print(f"     diag(cov_mat) tras blend, rango: "
@@ -1565,9 +1568,9 @@ print(f"  Rango beta_mercado: {beta_hist_arr.min():.3f} - {beta_hist_arr.max():.
       f"Rango beta_pais: {beta_country_arr.min():.3f} - {beta_country_arr.max():.3f} | "
       f"Rango beta_fx: {beta_fx_arr.min():.3f} - {beta_fx_arr.max():.3f}")
 
-# === OPTIMIZACION MINIMA VARIANZA (quadprog) =================================
-# ETFs que no pueden entrar al portafolio resultante si include_etfs_in_portfolio = False.
-# Los commodities (commodity_tickers) siempre son elegibles, aunque coticen como ETF.
+# ==============================================================================
+# OPTIMIZACION MINIMA VARIANZA (quadprog)
+# ==============================================================================
 etf_excluded_from_portfolio = set(etf_tickers) - set(commodity_tickers)
 use_etf_band = use_etf_constraint and include_etfs_in_portfolio
 
@@ -1612,9 +1615,6 @@ print(f"\n[INFO] Ejecutando optimizacion iterativa - maximo {max_assets_in_portf
 print("[INFO] Poda ETF/FX-aware activa (constraints_feasible)\n")
 
 
-# chequeo de factibilidad estructural de las bandas ETF/FX: dado max_weight_per_asset,
-# evita que la poda deje un subconjunto donde la banda de % ETF o el limite de exposicion
-# cambiaria ya no puedan cumplirse matematicamente.
 def constraints_feasible(tickers_list):
     if len(tickers_list) == 0:
         return False
@@ -1702,10 +1702,6 @@ def run_minvar_qp(tickers_subset):
     return w
 
 
-# Contribucion Marginal al CVaR (MTR) via Cornish-Fisher: deriva analiticamente el CVaR_CF
-# del portafolio (misma formula de Boudt-Peterson-Croux usada mas abajo en el reporte final)
-# respecto a cada peso w_i, ponderada por w_i (estilo Euler), para podar por aporte marginal
-# al riesgo de cola real en vez de solo la contribucion marginal a la varianza.
 alpha_final = 1 - cornish_fisher_confidence
 
 _panel_pool_df = log_returns_selected[selected_tickers].dropna()
@@ -1725,28 +1721,22 @@ def compute_marginal_cvar_contrib(tickers_subset, w_vec, cm_sub):
     w_sum = w_vec.sum()
     var_p = float(w_vec @ cm_sub @ w_vec)
     if w_sum <= 0 or var_p <= 1e-12 or Z_pool is None:
-        # Fallback: contribucion marginal a la varianza
         return pd.Series(w_vec * (cm_sub @ w_vec), index=tickers_subset)
 
     sigma_p = math.sqrt(var_p)
 
-    # Panel del subset reescalado a la vol prospectiva de Sigma. La media no
-    # afecta a los momentos centrales, asi que se deja en cero.
     idx = [Z_pool_cols.index(t) for t in tickers_subset]
     sd_prosp = np.sqrt(np.clip(np.diag(cm_sub), 1e-16, None))
     panel_sub = Z_pool[:, idx] * sd_prosp
 
     grad = rk.portfolio_moment_gradients(w_vec, panel_sub)
 
-    # ES de Cornish-Fisher con los momentos reales del portafolio (Maillard),
-    # sin recortes: MES = -ES estandarizado y sus derivadas respecto a (S, K_exc).
     es_std, d_es_dS, d_es_dK = rk.cornish_fisher_es_gradient(alpha_final, grad["skew"], grad["exkurt"])
     mes_alpha = -es_std
 
     d_sigma_dw = (cm_sub @ w_vec) / sigma_p
     d_mes_dw = -(d_es_dS * grad["d_skew_dw"] + d_es_dK * grad["d_exkurt_dw"])
 
-    # Riesgo_p = -CVaR_p = -mu_p + MES_alpha * sigma_p
     d_risk_dw = -mu_vec + mes_alpha * d_sigma_dw + sigma_p * d_mes_dw
 
     return pd.Series(w_vec * d_risk_dw, index=tickers_subset)
@@ -1780,7 +1770,6 @@ while True:
     if n_active <= max_assets_in_portfolio:
         break
 
-    # Poda por Marginal Tail Risk (MTR) via CVaR, sin romper la banda ETF/FX
     mtr = compute_marginal_cvar_contrib(current_tickers, w_vec, cm_iter)
     mtr_active = mtr.loc[active.index].sort_values(ascending=False)
 
@@ -1927,14 +1916,8 @@ metrics_minvar = extract_metrics(opt_min_var, "Minima Varianza")
 
 # ==============================================================================
 # VaR/CVaR (Expected Shortfall) prospectivo global, Cornish-Fisher
-# Cuantil y ES de la distribucion CF con los momentos reales del portafolio
-# (Maillard, 2012); ver rk.cornish_fisher_tail.
 # ==============================================================================
 
-# Los momentos de orden superior del portafolio salen de los CO-MOMENTOS de un
-# panel empirico reescalado a la vol prospectiva, no del promedio ponderado de
-# MFIS/MFIK individuales (que supone correlacion perfecta y no diversifica, con
-# un sesgo que crece ~sqrt(n), ademas de mezclar la medida Q con la sigma de P).
 w_final_bkm = metrics_minvar["Weights"]
 w_final_vals = w_final_bkm.values
 tickers_final = list(w_final_bkm.index)

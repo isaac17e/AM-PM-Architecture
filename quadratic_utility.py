@@ -1,6 +1,6 @@
-# ===============================================
+# ==============================================================================
 # Script: Optimizacion de portafolio - Utilidad Cuadratica
-# ===============================================
+# ==============================================================================
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -31,9 +31,13 @@ import plotly.graph_objects as go
 
 import risk_estimators as rk
 
-# ------------------------------------------------
+# ==============================================================================
+# PARAMETROS CONFIGURABLES
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
 # API KEY - Polygon.io
-# ------------------------------------------------
+# ------------------------------------------------------------------------------
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -43,19 +47,25 @@ if not POLYGON_API_KEY:
     print("ADVERTENCIA: No hay POLYGON_API_KEY configurada. Todas las consultas de opciones")
     print("             fallaran y cada activo caera a fallback historico (sin BKM real).")
 
-polygon_dte_tol = 10  # +/- dias alrededor del tenor objetivo
+polygon_dte_tol = 10
 
-# ================================================
-# PARAMETROS CONFIGURABLES
-# ================================================
+# ------------------------------------------------------------------------------
+# UNIVERSO DE ACTIVOS
+# ------------------------------------------------------------------------------
 
 n_top_nasdaq = 90
 n_top_sp500 = 90
 n_top_int = 50
 
+# ------------------------------------------------------------------------------
+# FECHA DE REFERENCIA Y HORIZONTE
+# ------------------------------------------------------------------------------
 as_of_date = date.today()
 horizon_months = 2
 
+# ------------------------------------------------------------------------------
+# PARAMETROS GENERALES
+# ------------------------------------------------------------------------------
 target_years = list(range(2014, 2026))
 mdd_start_year = 2014
 rf_rate = 0.047
@@ -64,101 +74,137 @@ max_weight = 0.30
 n_sim = 5000
 target_total_tickers = 210
 
+# ------------------------------------------------------------------------------
+# VENTANA DE ENTRENAMIENTO
+# ------------------------------------------------------------------------------
 lookback_months = None
 
+# ------------------------------------------------------------------------------
+# AVERSION AL RIESGO Y PONDERADORES DE SELECCION
+# ------------------------------------------------------------------------------
 lambda_ = 0.5
 weight_sharpe = 0.55
 weight_low_vol = 0.15
 weight_decorr = 0.30
 
+# ------------------------------------------------------------------------------
+# TAMANO DE LOS FILTROS DE CANDIDATOS
+# ------------------------------------------------------------------------------
 n_pre_filter = 65
 n_filter_candidates = 40
 
+# ------------------------------------------------------------------------------
+# SELECCION CONJUNTA QUBO/ISING
+# ------------------------------------------------------------------------------
 qubo_exact_threshold = 2e6
 qubo_sa_iterations = 20000
 
+# ------------------------------------------------------------------------------
+# PERCENTILES DE VOLATILIDAD Y CORRELACION
+# ------------------------------------------------------------------------------
 volatility_percentile = 0.85
 correlation_percentile = 0.85
 
+# ------------------------------------------------------------------------------
+# FILTRO DE VOLATILIDAD RECIENTE
+# ------------------------------------------------------------------------------
 recent_vol_window_min_weeks = 13
 recent_vol_window_max_weeks = 18
 recent_vol_ratio_max = 1.80
 recent_vol_min_survivors = 14
 
+# ------------------------------------------------------------------------------
+# TENOR MAXIMO DE OPCIONES
+# ------------------------------------------------------------------------------
 options_dte_cap_days = 90
 
+# ------------------------------------------------------------------------------
+# FILTRO DE IV vs VOLATILIDAD RECIENTE
+# ------------------------------------------------------------------------------
 iv_vs_realized_ratio_max = 1.80
 iv_min_survivors = 10
 
-# === PARAMETROS BKM ===
-bkm_moneyness_lo = 0.70          # limite inferior de moneyness K/S para strikes OTM (integracion BKM)
-bkm_moneyness_hi = 1.40          # limite superior de moneyness K/S para strikes OTM (integracion BKM)
-bkm_hist_moneyness_grid = np.array([0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15])  # grid reducido, reconstruccion historica
-bkm_min_options_per_side = 3     # minimo de strikes OTM por lado (calls/puts) para integracion valida
-bkm_mfik_max = 20.0               # techo de sanidad de MFIK (curtosis total); por encima, o si K < 1 + S^2, MFIS/MFIK se anulan
-bkm_lookback_months = 12         # ventana para reconstruir el MFIS historico "normal" del activo
-bkm_hist_sample_freq = "2W"      # frecuencia de muestreo historico BKM (2W=quincenal; toleramos huecos, min. 8 puntos validos)
-bkm_max_workers = 6              # tickers evaluados en paralelo durante el filtro BKM (ajustar segun rate limit del plan Polygon)
-bkm_z_threshold = 1.75           # se descarta si (MFIS_hoy - media_hist) / sd_hist supera esto
-bkm_min_survivors = 12           # piso minimo tras el filtro BKM (se repone desde el pool de vol. reciente)
-cornish_fisher_confidence = 0.95  # nivel de confianza para VaR/CVaR ajustados por Cornish-Fisher
+# ------------------------------------------------------------------------------
+# PARAMETROS BKM
+# ------------------------------------------------------------------------------
+bkm_moneyness_lo = 0.70
+bkm_moneyness_hi = 1.40
+bkm_hist_moneyness_grid = np.array([0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15])
+bkm_min_options_per_side = 3
+bkm_mfik_max = 20.0
+bkm_lookback_months = 12
+bkm_hist_sample_freq = "2W"
+bkm_max_workers = 6
+bkm_z_threshold = 1.75
+bkm_min_survivors = 12
+cornish_fisher_confidence = 0.95
 
-# NOTA: la penalizacion mu_final = mu - theta1*MFIS - theta2*MFIK fue ELIMINADA.
-# theta1/theta2 eran constantes sin calibrar y MFIS/MFIK estan bajo la medida Q
-# (ya incluyen aversion al riesgo de cola), de modo que restaban un sesgo
-# arbitrario al insumo mas sensible del optimizador. Chopra & Ziemba (1993):
-# los errores en mu pesan un orden de magnitud mas que los de covarianza.
-
-# === COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF ==============
-# Antes Sigma_hist salia de retornos MENSUALES (df_xts.cov()*12). Con ~12 obs
-# por ano y decenas de activos, ese estimador es casi singular y el optimizador
-# carga sobre sus direcciones peor estimadas. La precision de una covarianza
-# crece con la frecuencia de muestreo; la de la media no (Merton, 1980).
+# ------------------------------------------------------------------------------
+# COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF
+# ------------------------------------------------------------------------------
 use_daily_cov = True
-cov_halflife_days = 120           # vida media EWMA en dias habiles (~6 meses)
+cov_halflife_days = 120
 use_lw_shrinkage = True
 
-# === CORRECCION Q -> P (primas de riesgo) ====================================
-use_q_to_p_vol = True             # MFIV incluye la prima de riesgo de varianza
+# ------------------------------------------------------------------------------
+# CORRECCION Q -> P (PRIMAS DE RIESGO)
+# ------------------------------------------------------------------------------
+use_q_to_p_vol = True
 vrp_ratio_bounds = (0.70, 1.00)
 vrp_fallback_ratio = 0.90
-use_q_to_p_correlation = True     # la correlacion por dispersion excede a la realizada
+use_q_to_p_correlation = True
 crp_ratio_bounds = (0.60, 1.00)
 crp_fallback_ratio = 0.85
 
-# === PANEL DE ESCENARIOS PARA MOMENTOS DEL PORTAFOLIO =========================
-panel_min_obs = 24                # observaciones minimas (mensuales) para el panel
+# ------------------------------------------------------------------------------
+# PANEL DE ESCENARIOS PARA MOMENTOS DEL PORTAFOLIO
+# ------------------------------------------------------------------------------
+panel_min_obs = 24
 
-# === RETORNO ESPERADO VIA SVIX (Martin-Wagner) - EXPERIMENTAL =================
-# APAGADO. Formula sin verificar contra el paper. Ver aviso en risk_estimators.py.
+# ------------------------------------------------------------------------------
+# RETORNO ESPERADO VIA SVIX (MARTIN-WAGNER) - EXPERIMENTAL
+# ------------------------------------------------------------------------------
 use_svix_expected_return = False
-svix_blend = 0.50                 # mezcla con mu historico si se activa
+svix_blend = 0.50
 
+# ------------------------------------------------------------------------------
+# ORDEN DE CORRELACION
+# ------------------------------------------------------------------------------
 correlation_order = 0
 
+# ------------------------------------------------------------------------------
+# OBSERVACIONES MINIMAS E IDEALES
+# ------------------------------------------------------------------------------
 min_observations = 24
 ideal_observations = 60
 
+# ------------------------------------------------------------------------------
+# FILTRO DELTA
+# ------------------------------------------------------------------------------
 use_delta_filter = True
 delta_min = 0.30
 delta_strike_mode = "atm"
 iv_outlier_multiplier = 6.0
 
+# ------------------------------------------------------------------------------
+# LIMITE DE PESO POR REGION
+# ------------------------------------------------------------------------------
 max_region_weight = 0.80
 
+# ------------------------------------------------------------------------------
+# PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL
+# ------------------------------------------------------------------------------
 pct_etf_deseado = 0.10
 pct_etf_tolerancia = 0.1
 
-# === ETFs EN EL PORTAFOLIO RESULTANTE ===
-# True : el portafolio final puede incluir ETFs y su participacion respeta la banda
-#        pct_etf_deseado +/- pct_etf_tolerancia.
-# False: el portafolio final solo contiene acciones y commodities (commodity_tickers).
-#        Los ETFs se siguen usando en todo el pipeline (seleccion, factores de sector,
-#        matrices de covarianza); solo se fija su peso en 0 en la optimizacion final,
-#        y la banda de % ETF deja de aplicarse.
+# ------------------------------------------------------------------------------
+# ETFs EN EL PORTAFOLIO RESULTANTE
+# ------------------------------------------------------------------------------
 include_etfs_in_portfolio = True
 
-# === VALIDACION DE PARAMETROS ===
+# ==============================================================================
+# VALIDACION DE PARAMETROS
+# ==============================================================================
 if not (1 <= horizon_months <= 24):
     raise ValueError("Error: horizon_months debe estar entre 1 y 24")
 if not (0 <= pct_etf_deseado <= 1):
@@ -177,9 +223,9 @@ print("=" * 60 + "\n")
 rf_rate_monthly = rf_rate / 12
 
 
-# ================================================
+# ==============================================================================
 # FUNCION AUXILIAR: Web scraping seguro
-# ================================================
+# ==============================================================================
 def safe_scrape_table(url, fallback=None, headers=None):
     try:
         headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; PortfolioBot/1.0)"}
@@ -215,8 +261,6 @@ def clean_symbol_table(tbl):
         & ~tbl["symbol"].astype(str).str.match(r"^[0-9]")
     ].copy()
     tbl["symbol"] = tbl["symbol"].astype(str).str.upper().str.replace(".", "-", regex=False)
-    # Ordena explicitamente por market cap real en vez de confiar en el orden
-    # con el que la fuente sirve la tabla (defensa ante cambios de sort default).
     if "market_cap" in tbl.columns:
         cap_num = tbl["market_cap"].apply(_parse_market_cap)
         if cap_num.notna().any():
@@ -226,9 +270,9 @@ def clean_symbol_table(tbl):
     return tbl.reset_index(drop=True)
 
 
-# ================================================
+# ==============================================================================
 # FUNCIONES AUXILIARES: Polygon.io
-# ================================================
+# ==============================================================================
 import re
 
 
@@ -246,7 +290,7 @@ polygon_diag = {
     "total_attempts": 0,
     "empty_match_count": 0,
 }
-polygon_diag_lock = threading.Lock()  # protege polygon_diag: el filtro BKM ahora evalua tickers en paralelo
+polygon_diag_lock = threading.Lock()
 
 
 def polygon_log_status(status, body=None):
@@ -348,9 +392,9 @@ def polygon_get_atm_option(ticker, target_dte, dte_tol=10, api_key=None, contrac
         return vacio
 
 
-# ================================================
+# ==============================================================================
 # FUNCIONES AUXILIARES: Black-Scholes y contratos historicos (Polygon)
-# ================================================
+# ==============================================================================
 def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
     if T_yrs <= 0 or sigma <= 0:
         return np.nan
@@ -439,9 +483,9 @@ def get_spot_safe_bkm(ticker):
         return np.nan
 
 
-# ================================================
+# ==============================================================================
 # FUNCIONES BKM (Bakshi, Kapadia y Madan, 2003)
-# ================================================
+# ==============================================================================
 def bkm_iv_chain_to_prices(S, r, T, chain_df):
     if chain_df is None or chain_df.empty:
         return chain_df
@@ -487,8 +531,6 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfis = (erT * W - 3 * mu * erT * V + 2 * mu ** 3) / mfiv ** 1.5
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
-    # Un par fuera de K >= 1 + S^2 o sobre el techo delata una integracion mala:
-    # se anulan MFIS/MFIK (sin recortar) y se conserva la MFIV, que es mas robusta.
     if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
         mfis, mfik = np.nan, np.nan
 
@@ -578,7 +620,6 @@ def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, 
     return np.array(mfis_hist)
 
 
-# Mapeo heuristico de SIC description (Polygon reference endpoint) a ETF sectorial SPDR.
 sector_keywords = {
     "XLK": ["SEMICONDUCTOR", "COMPUTER", "SOFTWARE", "ELECTRONIC COMPONENTS", "COMPUTER PROGRAMMING", "COMPUTER PERIPHERAL"],
     "XLV": ["PHARMACEUTICAL", "BIOLOGICAL", "MEDICAL", "HOSPITAL", "HEALTH", "SURGICAL", "DRUG"],
@@ -620,9 +661,9 @@ def polygon_get_sector_etf(ticker):
     return None
 
 
-# ================================================
+# ==============================================================================
 # OBTENER TICKERS: S&P 500 (top N por market cap real, stockanalysis.com)
-# ================================================
+# ==============================================================================
 print("Obteniendo tickers del S&P 500...")
 sp500_tbl = safe_scrape_table("https://stockanalysis.com/list/sp-500-stocks/")
 
@@ -640,9 +681,9 @@ else:
                       "TSLA", "JPM", "UNH", "V", "XOM", "MA", "JNJ", "PG", "COST", "HD"]
     print("ADVERTENCIA: Scraping fallo en ambas fuentes - usando fallback S&P 500 (20 tickers hardcodeados)")
 
-# ================================================
+# ==============================================================================
 # OBTENER TICKERS: NASDAQ
-# ================================================
+# ==============================================================================
 print("\nObteniendo tickers del NASDAQ...")
 nasdaq_tbl = safe_scrape_table("https://stockanalysis.com/list/nasdaq-stocks/")
 
@@ -669,9 +710,9 @@ else:
                        "AVGO", "ASML", "COST", "NFLX", "AMD", "PEP", "ADBE", "CSCO"]
     print("Usando NASDAQ fallback")
 
-# ================================================
+# ==============================================================================
 # ETFs
-# ================================================
+# ==============================================================================
 etf_core = ["SPY", "QQQ", "VOO", "VTI", "VYM", "IWM", "GLD", "SLV", "USO", "PDBC", "HYG", "VNQ"]
 
 etf_sectoriales = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOX"]
@@ -700,14 +741,14 @@ etf_geograficos = [
 
 etf_tickers = list(dict.fromkeys(etf_core + etf_sectoriales + etf_subsectoriales + etf_geograficos))
 
-# ================================================
+# ==============================================================================
 # COMMODITIES
-# ================================================
+# ==============================================================================
 commodity_tickers = ["SLV", "UNG"]
 
-# ================================================
+# ==============================================================================
 # TICKERS INTERNACIONALES
-# ================================================
+# ==============================================================================
 international_tickers_full = [
     "RY.TO", "SHOP.TO", "TD.TO", "BN.TO", "ENB.TO", "TRI.TO", "BNS.TO",
     "CP.TO", "CNQ.TO", "AEM.TO", "SU.TO", "TRP.TO", "WCN.TO", "FNV.TO",
@@ -723,9 +764,9 @@ international_tickers_full = [
 
 international_tickers = international_tickers_full[:n_top_int]
 
-# ================================================
+# ==============================================================================
 # MAPEO DE MONEDA POR SUFIJO DE TICKER + PARES FX (para conversion a USD)
-# ================================================
+# ==============================================================================
 
 fx_pairs = {
     "CAD": {"ticker": "CAD=X", "invert": True},
@@ -755,9 +796,9 @@ def get_currency_for_ticker(ticker):
             return cur
     return "USD"
 
-# ================================================
+# ==============================================================================
 # COMBINAR Y LIMPIAR
-# ================================================
+# ==============================================================================
 print("\nCombinando y limpiando tickers...")
 
 sp500_tickers_clean = list(dict.fromkeys(t.upper() for t in sp500_tickers))
@@ -797,9 +838,9 @@ all_tickers = list(dict.fromkeys(all_tickers))
 print(f"Total tickers FINAL (unicos): {len(all_tickers)}")
 
 
-# ================================================
+# ==============================================================================
 # DESCARGA DE PRECIOS (helper generico yfinance)
-# ================================================
+# ==============================================================================
 def download_fx_prices(start, end, period="1mo"):
     fx_prices = {}
     for cur, info in fx_pairs.items():
@@ -877,7 +918,9 @@ df_prices = df_prices[["symbol", "date", "monthly_return"]]
 print(f"Meses disponibles en entrenamiento: {df_prices['date'].nunique()}")
 print(f"Tickers con al menos 1 observacion: {df_prices['symbol'].nunique()}")
 
-# === BENCHMARK (SPY) ===
+# ==============================================================================
+# BENCHMARK (SPY)
+# ==============================================================================
 print("Procesando benchmark (SPY)...")
 benchmark_prices = download_period_returns(["SPY"], start_date, end_date, period="1mo",
                                             fx_prices=fx_prices_monthly)
@@ -886,9 +929,9 @@ if lookback_months is not None:
     cutoff_date = benchmark_prices["date"].max() - relativedelta(months=lookback_months - 1)
     benchmark_prices = benchmark_prices[benchmark_prices["date"] >= cutoff_date]
 
-# ================================================
+# ==============================================================================
 # RETORNOS DIARIOS RECIENTES PARA FILTRO DE VOLATILIDAD RECIENTE
-# ================================================
+# ==============================================================================
 recent_vol_window_weeks = int(min(max(round(horizon_months * 4), recent_vol_window_min_weeks),
                                    recent_vol_window_max_weeks))
 print(f"Descargando retornos DIARIOS recientes para filtro de volatilidad reciente "
@@ -919,9 +962,9 @@ recent_vol_stats = recent_vol_stats[
 
 print(f"Tickers con volatilidad reciente calculable: {len(recent_vol_stats)}")
 
-# ================================================
+# ==============================================================================
 # ESTADISTICAS DESCRIPTIVAS
-# ================================================
+# ==============================================================================
 rf_rate_period = rf_rate_monthly
 
 summary_stats = (
@@ -953,9 +996,9 @@ if len(summary_stats) > 0:
 else:
     raise RuntimeError("No hay tickers con datos suficientes. Ajusta los parametros.")
 
-# ================================================
+# ==============================================================================
 # CORRELACIONES
-# ================================================
+# ==============================================================================
 returns_wide = df_prices.pivot_table(index="date", columns="symbol", values="monthly_return")
 cor_matrix_full = returns_wide.corr(min_periods=1)
 
@@ -970,9 +1013,9 @@ avg_cor_by_ticker = (
     .rename(columns={"Var1": "symbol", "abs_freq": "avg_cor"})
 )
 
-# ================================================
+# ==============================================================================
 # FAMA-FRENCH
-# ================================================
+# ==============================================================================
 print("Descargando datos Fama-French...")
 try:
     ff_raw = pdr.DataReader("F-F_Research_Data_Factors", "famafrench",
@@ -991,9 +1034,9 @@ except Exception as e:
     print(f"Error con Fama-French ({e}). Continuando sin ellos.")
     ff_data = None
 
-# ================================================
+# ==============================================================================
 # BETAS FF3
-# ================================================
+# ==============================================================================
 if ff_data is not None:
     ff_data_m = ff_data.copy()
     ff_data_m.index = ff_data_m.index.to_period("M")
@@ -1040,9 +1083,9 @@ if ff_data is not None:
 else:
     ff_stats = pd.DataFrame(columns=["symbol", "beta_mkt", "beta_smb", "beta_hml", "ff_expected_return"])
 
-# ================================================
+# ==============================================================================
 # COMBINAR METRICAS
-# ================================================
+# ==============================================================================
 combined_stats = summary_stats.merge(avg_cor_by_ticker, on="symbol", how="left")
 combined_stats = combined_stats.merge(
     ff_stats[["symbol", "beta_mkt", "beta_smb", "beta_hml", "ff_expected_return"]], on="symbol", how="left"
@@ -1064,9 +1107,9 @@ if combined_stats is None or len(combined_stats) == 0:
 print(f"combined_stats creado: {len(combined_stats)} activos")
 
 
-# ================================================
+# ==============================================================================
 # SELECCION CONJUNTA VIA QUBO/ISING
-# ================================================
+# ==============================================================================
 def qubo_energy(idx_sel, h, J):
     idx_sel = list(idx_sel)
     if len(idx_sel) < 2:
@@ -1192,16 +1235,16 @@ def select_optimal_candidates(df, n_candidates):
 ticker_candidates = select_optimal_candidates(combined_stats, n_pre_filter)
 print(f"\nPool pre-filtro: {len(ticker_candidates)} candidatos\n")
 
-# ================================================
+# ==============================================================================
 # TENOR DE OPCIONES OBJETIVO (Polygon) - tope universal
-# ================================================
+# ==============================================================================
 target_dte_polygon = min(max(round(horizon_months * 30), 15), options_dte_cap_days)
 print(f"Tenor de opciones objetivo (Polygon): {target_dte_polygon} dias "
       f"(horizonte={horizon_months}m, tope universal={options_dte_cap_days}d)\n")
 
-# ================================================
+# ==============================================================================
 # DATOS DE MERCADO VIA POLYGON (IV, GRIEGAS, SECTOR)
-# ================================================
+# ==============================================================================
 print("Consultando datos de mercado (Polygon) para tickers estadounidenses...")
 
 us_candidates = [t for t in ticker_candidates if is_us_ticker(t)]
@@ -1275,9 +1318,9 @@ if polygon_diag["sample_errors"]:
         cuerpo = (e["body"] or "(sin cuerpo)")[:200] if e["body"] else "(sin cuerpo)"
         print(f"     status={e['status']} | {cuerpo}")
 
-# ================================================
+# ==============================================================================
 # FILTRO DELTA
-# ================================================
+# ==============================================================================
 if use_delta_filter:
     print(f"\nAplicando filtro Delta (delta_min={delta_min:.2f}, T={horizon_months / 12:.3f} anios)...")
     print("   Fuente: delta real de mercado (Polygon) para US, formula BS con vol historica para el resto")
@@ -1355,9 +1398,9 @@ else:
     print("Filtro Delta desactivado\n")
     delta_named = {t: np.nan for t in ticker_candidates}
 
-# ================================================
+# ==============================================================================
 # FILTRO DE VOLATILIDAD RECIENTE
-# ================================================
+# ==============================================================================
 print(f"Aplicando filtro de volatilidad reciente (ventana={recent_vol_window_weeks} semanas, "
       f"ratio max={recent_vol_ratio_max:.2f}x)...")
 
@@ -1408,9 +1451,9 @@ print(disp.rename(columns={"symbol": "Symbol", "n_obs": "Obs_Mensuales"})
 ticker_candidates = recent_vol_candidates["symbol"].tolist()
 print(f"\nConjunto tras filtro de volatilidad reciente: {len(ticker_candidates)} tickers\n")
 
-# ================================================
+# ==============================================================================
 # FILTRO DE IV vs VOLATILIDAD RECIENTE (flujo de opciones, forward-looking)
-# ================================================
+# ==============================================================================
 print(f"Aplicando filtro de IV vs volatilidad reciente (DTE={target_dte_polygon}d, "
       f"ratio max={iv_vs_realized_ratio_max:.2f}x)...")
 
@@ -1462,9 +1505,9 @@ if len(iv_flow_keep) < iv_min_survivors:
 ticker_candidates = list(dict.fromkeys(iv_flow_keep))
 print(f"\nConjunto tras filtro de IV vs volatilidad reciente: {len(ticker_candidates)} tickers\n")
 
-# ================================================
+# ==============================================================================
 # FILTRO MFIS (BKM) - cobertura anomala vs especulacion
-# ================================================
+# ==============================================================================
 print(f"\nAplicando filtro MFIS (Bakshi-Kapadia-Madan) (z_threshold={bkm_z_threshold:.2f}, "
       f"lookback={bkm_lookback_months} meses)...")
 
@@ -1578,9 +1621,9 @@ for tk in ticker_candidates:
     if tk not in bkm_current_moments or not bkm_current_moments[tk]["ok"]:
         bkm_current_moments[tk] = bkm_get_current_moments(tk, target_dte_polygon, polygon_dte_tol, rf_rate)
 
-# ================================================
+# ==============================================================================
 # CONSTRUCCION DE MATRIZ DE RETORNOS
-# ================================================
+# ==============================================================================
 df_wide = (
     df_prices[df_prices["symbol"].isin(ticker_candidates)]
     .pivot_table(index="date", columns="symbol", values="monthly_return")
@@ -1594,16 +1637,17 @@ df_xts = df_wide.copy()
 
 print(f"Matriz de retornos: {df_xts.shape[0]} observaciones x {df_xts.shape[1]} activos")
 
-# === MEDIA ===
+# ==============================================================================
+# MEDIA
+# ==============================================================================
 assets = ticker_candidates
 mu = df_xts[assets].mean().values
 mu = np.where(np.isfinite(mu), mu, 0.0)
 n_assets = len(assets)
 
-# ================================================
+# ==============================================================================
 # MATRIZ DE COVARIANZA: SHRINKAGE IMPLIED (BKM) + HISTORICA
-# IV objetivo via MFIV (BKM)
-# ================================================
+# ==============================================================================
 iv_rank_low = 0.20
 iv_rank_high = 0.80
 alpha_min = 0.20
@@ -1634,7 +1678,9 @@ sd_hist_annual = df_xts[assets].std().values * math.sqrt(12)
 iv_final = np.array([iv_assets_implied[a] if not pd.isna(iv_assets_implied[a]) else sd_hist_annual[i]
                       for i, a in enumerate(assets)])
 
-# === CORRECCION Q -> P: la MFIV incluye la prima de riesgo de varianza ========
+# ==============================================================================
+# CORRECCION Q -> P: LA MFIV INCLUYE LA PRIMA DE RIESGO DE VARIANZA
+# ==============================================================================
 iv_final_q = iv_final.copy()
 if use_q_to_p_vol:
     iv_final, vrp_ratio = rk.q_to_p_vol(
@@ -1709,12 +1755,9 @@ print(f"   Alpha por activo - Pleno (>{alpha_min:.2f}): {n_alpha_full} | Minimo 
 print(f"   Alpha shrinkage global (promedio): {alpha_global:.3f} ({alpha_global * 100:.0f}% implied / "
       f"{(1 - alpha_global) * 100:.0f}% historica)")
 
-# === COVARIANZA HISTORICA ANUALIZADA =========================================
-# Antes: df_xts[assets].cov() * 12, es decir covarianza muestral sobre retornos
-# MENSUALES. Con ~12 observaciones por ano ese estimador tiene muy pocos grados
-# de libertad frente al numero de activos, y el optimizador de utilidad
-# cuadratica sobrepondera justamente sus direcciones peor estimadas (Michaud).
-# Ahora: retornos DIARIOS -> EWMA -> shrinkage Ledoit-Wolf -> anualizado.
+# ==============================================================================
+# COVARIANZA HISTORICA ANUALIZADA
+# ==============================================================================
 Sigma_hist = None
 if use_daily_cov:
     print("\n   Descargando retornos DIARIOS de los finalistas para la covarianza...")
@@ -1749,19 +1792,17 @@ if Sigma_hist is None:
     Sigma_hist = df_xts[assets].cov().values * 12
     print("   COVARIANZA: muestral mensual anualizada (fallback)")
 
-# --- Correlacion implicita global via dispersion de SPY ---
+# ==============================================================================
+# CORRELACION IMPLICITA GLOBAL VIA DISPERSION DE SPY
+# ==============================================================================
 w_disp = np.repeat(1 / n_assets, n_assets)
-sigma_i = iv_final          # medida P: entra en D_implied mas abajo
-sigma_i_q = iv_final_q      # medida Q: la dispersion debe calcularse toda en Q
+sigma_i = iv_final
+sigma_i_q = iv_final_q
 
-# La correlacion por dispersion solo es coherente si el indice y los
-# constituyentes estan bajo la MISMA medida. Se calcula con volatilidades Q y
-# la correccion a P se aplica despues, sobre la correlacion resultante.
 var_spy_impl = iv_spy_implied ** 2
 weighted_var_i = np.sum(w_disp ** 2 * sigma_i_q ** 2)
 sigma_total_sq = (np.sum(w_disp * sigma_i_q)) ** 2
 
-# Correlacion historica desde la Sigma diaria EWMA+LW, no desde los mensuales
 d_hist = np.sqrt(np.clip(np.diag(Sigma_hist), 1e-300, None))
 R_hist_full = Sigma_hist / np.outer(d_hist, d_hist)
 np.fill_diagonal(R_hist_full, 1.0)
@@ -1774,10 +1815,6 @@ if sigma_total_sq > weighted_var_i and sigma_total_sq > 0:
     rho_implied_q = max(-0.999, min(0.999, rho_implied_q))
     print(f"   Correlacion promedio implicita Q (dispersion SPY): {rho_implied_q:.4f}")
 
-    # === CORRECCION Q -> P: prima de riesgo de correlacion ===================
-    # La correlacion implicita excede sistematicamente a la realizada
-    # (Driessen, Maenhout & Vilkov, 2009). Sin corregir, el optimizador
-    # subestima el beneficio de diversificacion.
     if use_q_to_p_correlation:
         rho_implied_avg, crp_ratio = rk.q_to_p_correlation(
             rho_implied_q, rho_realized_avg,
@@ -1794,7 +1831,9 @@ else:
 
 rho_hist_avg_ref = np.nanmean(np.abs(R_hist_full[tril_idx]))
 
-# --- Correlacion implicita SECTORIAL (ETFs sectoriales SPDR + VOX), via MFIV (BKM) ---
+# ==============================================================================
+# CORRELACION IMPLICITA SECTORIAL (ETFs SECTORIALES SPDR + VOX), VIA MFIV (BKM)
+# ==============================================================================
 print("   Calculando correlacion implicita por sector (MFIV de ETFs sectoriales)...")
 
 rho_sector_lookup = {etf: np.nan for etf in etf_sectoriales}
@@ -1810,7 +1849,7 @@ for etf in etf_sectoriales:
         continue
 
     idxs = [assets.index(s) for s in stocks_sector]
-    sigma_sector = iv_final_q[idxs]     # medida Q, igual que el ETF sectorial
+    sigma_sector = iv_final_q[idxs]
     var_etf_impl = sector_etf_iv[etf] ** 2
     w_disp_sector = np.repeat(1 / len(stocks_sector), len(stocks_sector))
     weighted_var_s = np.sum(w_disp_sector ** 2 * sigma_sector ** 2)
@@ -1820,7 +1859,6 @@ for etf in etf_sectoriales:
         rho_sec_q = (var_etf_impl - weighted_var_s) / (sigma_total_s - weighted_var_s)
         rho_sec_q = max(-0.999, min(0.999, rho_sec_q))
 
-        # Correccion Q -> P con la correlacion realizada DEL PROPIO SECTOR
         sub = R_hist_full[np.ix_(idxs, idxs)]
         m = len(idxs)
         rho_sec_realized = float(np.nanmean(sub[np.tril_indices(m, k=-1)]))
@@ -1838,7 +1876,6 @@ for etf in etf_sectoriales:
 n_sectores_ok = sum(1 for v in rho_sector_lookup.values() if not pd.isna(v))
 print(f"   Correlacion sectorial calculada para {n_sectores_ok} de {len(etf_sectoriales)} sectores")
 
-# Construir R_implied
 R_implied = np.eye(n_assets)
 for i in range(n_assets):
     for j in range(n_assets):
@@ -1905,16 +1942,14 @@ print(f"   Rango MFIV anualizada (post-cap): {vol_impl_pct.min():.1f}% - {vol_im
 tril_R = R_implied[np.tril_indices(n_assets, k=-1)]
 print(f"   Rango correlaciones implicitas (off-diagonal R_implied): {tril_R.min():.3f} - {tril_R.max():.3f}")
 
-# ================================================
+# ==============================================================================
 # OPTIMIZACION CUADRATICA (quadprog)
-# ================================================
+# ==============================================================================
 print(f"\nEjecutando optimizacion cuadratica (quadprog) con lambda={lambda_:.2f}...")
 
 etf_commodity_assets = [i for i, a in enumerate(assets) if a in (etf_tickers + commodity_tickers)]
 stock_assets = [i for i, a in enumerate(assets) if a not in (etf_tickers + commodity_tickers)]
 
-# ETFs que no pueden entrar al portafolio resultante si include_etfs_in_portfolio = False.
-# Los commodities (commodity_tickers) siempre son elegibles, aunque coticen como ETF.
 etf_excluded_from_portfolio = set(etf_tickers) - set(commodity_tickers)
 excluded_etf_assets = [] if include_etfs_in_portfolio else [
     i for i, a in enumerate(assets) if a in etf_excluded_from_portfolio]
@@ -1943,7 +1978,9 @@ print(f"   Grupos geograficos - CA: {len(canada_assets)} | EU: {len(europe_asset
 n = n_assets
 Dmat = cov_mat + np.eye(n) * 1e-8
 
-# --- Delta como ponderador de retorno esperado en el vector dvec ---
+# ==============================================================================
+# DELTA COMO PONDERADOR DE RETORNO ESPERADO EN EL VECTOR dvec
+# ==============================================================================
 delta_aligned = np.array([delta_named.get(a, np.nan) for a in assets])
 
 delta_valid = delta_aligned[~pd.isna(delta_aligned)]
@@ -1960,8 +1997,6 @@ delta_scaled = np.where(np.isnan(delta_scaled), 1.0, delta_scaled)
 
 mu_delta_adjusted = mu * delta_scaled
 
-# MFIS/MFIK se conservan solo para el reporte de diagnostico; YA NO se restan a
-# mu. Ver la nota en el bloque de parametros.
 mfis_aligned = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
 mfik_aligned = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])
 mfis_aligned = np.where(np.isnan(mfis_aligned), 0.0, mfis_aligned)
@@ -1969,20 +2004,20 @@ mfik_aligned = np.where(np.isnan(mfik_aligned), 3.0, mfik_aligned)
 
 mu_final = mu_delta_adjusted.copy()
 
-# === RETORNO ESPERADO VIA SVIX (Martin-Wagner) - EXPERIMENTAL, APAGADO =======
+# ==============================================================================
+# RETORNO ESPERADO VIA SVIX (MARTIN-WAGNER) - EXPERIMENTAL, APAGADO
+# ==============================================================================
 if use_svix_expected_return:
     print("\n   AVISO use_svix_expected_return=True: la formula de Martin-Wagner")
     print("   implementada en risk_estimators.py NO ha sido verificada contra el")
     print("   paper ni validada empiricamente. No usar para asignar capital sin")
     print("   contrastarla primero.")
-    # SVIX^2 al horizonte, por activo (proxy: MFIV del tenor objetivo)
     svix2_assets = np.array([
         bkm_current_moments.get(a, {}).get("mfiv", np.nan) for a in assets])
     mom_spy_svix = bkm_current_moments.get("SPY") or mom_spy
     svix2_mkt = mom_spy_svix.get("mfiv", np.nan) if mom_spy_svix else np.nan
 
     if np.isfinite(svix2_mkt) and np.isfinite(svix2_assets).sum() >= 2:
-        # Escala del horizonte de opciones (T_bkm anos) al periodo mensual de mu
         periodos_por_T = (T_bkm * 12.0)
         exc_annual, mw_info = rk.martin_wagner_excess_return(svix2_assets, svix2_mkt)
         mu_svix = rf_rate / 12.0 + exc_annual / max(periodos_por_T, 1e-6)
@@ -2080,9 +2115,9 @@ for region_name, idx_region in geo_groups.items():
     if len(idx_region) > 0:
         print(f"  Peso {region_name}: {weights_opt.iloc[idx_region].sum() * 100:.1f}%")
 
-# ================================================
+# ==============================================================================
 # RESULTADOS
-# ================================================
+# ==============================================================================
 w_vec = weights_opt.values
 ret_opt = float(np.sum(w_vec * mu))
 sd_opt = float(np.sqrt(w_vec @ cov_mat @ w_vec))
@@ -2100,14 +2135,9 @@ var_parametric = ret_opt - norm.ppf(0.95) * sd_opt
 q05 = portfolio_returns_full.quantile(0.05)
 cvar_95 = portfolio_returns_full[portfolio_returns_full <= q05].mean()
 
-# === VaR/CVaR PROSPECTIVO - CORNISH-FISHER SOBRE CO-MOMENTOS =================
-# Antes: port_skew y port_kurt_exc eran el promedio ponderado de MFIS/MFIK
-# individuales. Eso supone correlacion perfecta en los momentos de orden
-# superior y no diversifica (el sesgo crece ~sqrt(n) con activos poco
-# correlacionados); ademas mezcla la medida Q con la sigma fisica de cov_mat.
-#
-# Ahora los momentos salen de los co-momentos de un panel empirico reescalado a
-# la volatilidad prospectiva, via w'M3(w x w) y w'M4(w x w x w) en O(J*n).
+# ==============================================================================
+# VaR/CVaR PROSPECTIVO - CORNISH-FISHER SOBRE CO-MOMENTOS
+# ==============================================================================
 w_full = weights_opt.reindex(assets).fillna(0.0).values
 mfis_w = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
 mfik_w = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])
@@ -2122,7 +2152,7 @@ if len(panel_source_qu) >= panel_min_obs:
     mom_qu = rk.portfolio_moments(w_full, panel_qu)
     port_skew = mom_qu["skew"]
     port_kurt_exc = mom_qu["exkurt"]
-    port_sd_cf = sd_opt          # sigma de cov_mat, la que optimiza quadprog
+    port_sd_cf = sd_opt
 
     cf_qu = rk.var_cvar_cornish_fisher(
         ret_opt, port_sd_cf, port_skew, port_kurt_exc,
@@ -2130,7 +2160,6 @@ if len(panel_source_qu) >= panel_min_obs:
     var_cf = cf_qu["var"]
     cvar_cf = cf_qu["cvar"]
 
-    # Referencia: cuanto sesgaba el atajo anterior
     mask_bkm_ok = np.isfinite(mfis_w) & np.isfinite(mfik_w)
     if mask_bkm_ok.sum() > 0 and w_full[mask_bkm_ok].sum() > 0:
         w_q = w_full[mask_bkm_ok] / w_full[mask_bkm_ok].sum()
@@ -2174,9 +2203,9 @@ downside_neg = downside_returns[downside_returns < 0]
 downside_dev = np.sqrt(np.mean(downside_neg ** 2)) if len(downside_neg) else np.nan
 sortino_opt = (ret_opt - rf_rate_monthly) / downside_dev
 
-# ================================================
+# ==============================================================================
 # PORTAFOLIO FINAL
-# ================================================
+# ==============================================================================
 print("\n" + "=" * 60)
 print("PORTAFOLIO OPTIMO - PONDERACIONES FINALES")
 print("=" * 60)
@@ -2214,9 +2243,9 @@ print("\n=== METRICAS ANUALIZADAS (x12) ===")
 print(f"  Retorno anual:     {ret_opt * annualization_factor * 100:.2f}%")
 print(f"  Volatilidad anual: {sd_opt * math.sqrt(annualization_factor) * 100:.2f}%")
 
-# ================================================
+# ==============================================================================
 # ATRIBUCION DE RIESGO POR GRIEGAS
-# ================================================
+# ==============================================================================
 print("\n=== ATRIBUCION DE RIESGO POR GRIEGAS (BLACK-SCHOLES) ===")
 
 griegas_df = pd.DataFrame({"symbol": assets, "weight": weights_opt.reindex(assets).values})
@@ -2250,9 +2279,9 @@ top_griegas["Vega"] = top_griegas["vega"].map(lambda x: "-" if pd.isna(x) else f
 print("\n  Griegas por activo (peso > 1%):")
 print(top_griegas.rename(columns={"symbol": "Symbol"})[["Symbol", "Peso", "Delta", "Gamma", "Vega"]].to_string(index=False))
 
-# ================================================
+# ==============================================================================
 # FRONTERA EFICIENTE
-# ================================================
+# ==============================================================================
 print("\nGenerando frontera eficiente...")
 
 
@@ -2342,9 +2371,9 @@ fig.update_layout(
 )
 fig.show()
 
-# ================================================
+# ==============================================================================
 # COMPARACION DE LAMBDAS
-# ================================================
+# ==============================================================================
 print("\n" + "=" * 70)
 print("ANALISIS COMPARATIVO: Portafolios por nivel de lambda")
 print("=" * 70 + "\n")
@@ -2422,9 +2451,9 @@ if len(results_comparison) > 0:
 
 print("\nOptimizacion completada exitosamente")
 
-# ================================================
+# ==============================================================================
 # ANALISIS DE MDD
-# ================================================
+# ==============================================================================
 print("\n\n=== ANALISIS DE MAXIMUM DRAWDOWN DEL PORTAFOLIO ===")
 
 tickers_portfolio = pesos["symbol"].tolist()
@@ -2574,9 +2603,9 @@ if len(yearly_mdd_valid) >= 1:
 
 print("\nAnalisis completado exitosamente!")
 
-# ================================================
+# ==============================================================================
 # RESUMEN EJECUTIVO
-# ================================================
+# ==============================================================================
 print("\n" + "=" * 60)
 print("RESUMEN EJECUTIVO FINAL")
 print("=" * 60)
@@ -2599,9 +2628,9 @@ for _, row in pesos.iterrows():
     print(f"   {row['symbol']:<8}  {row['weight'] * 100:.2f}%")
 print("=" * 60)
 
-# ================================================
+# ==============================================================================
 # CALIDAD DE DATOS EN PORTAFOLIO FINAL
-# ================================================
+# ==============================================================================
 print("\n=== CALIDAD DE DATOS EN PORTAFOLIO FINAL ===")
 
 portfolio_data_quality = (
