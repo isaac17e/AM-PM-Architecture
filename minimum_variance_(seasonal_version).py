@@ -27,6 +27,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 import risk_estimators as rk
+import polygon_client as pc
 
 # ==============================================================================
 # SECCION 1: PARAMETROS CONFIGURABLES
@@ -102,6 +103,15 @@ bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
 tail_risk_filter_confidence = 0.99
 cornish_fisher_confidence = 0.95
+
+# ------------------------------------------------------------------------------
+# FALLBACK HISTORICO DEL FILTRO DE TAIL RISK
+# ------------------------------------------------------------------------------
+# False: solo pasan el filtro los activos con momentos BKM validos.
+# True: los activos sin BKM (sin cobertura de opciones, no-USD o MFIS/MFIK
+# inadmisibles) usan asimetria y curtosis historicas llevadas al horizonte.
+tail_risk_hist_fallback = False
+tail_risk_min_survivors = 5
 
 # ------------------------------------------------------------------------------
 # RESTRICCIONES DE PONDERACION
@@ -728,6 +738,7 @@ def get_polygon_option_snapshot(ticker):
         return _polygon_cache[ticker]
 
     resultado = None
+    transitorio = False
     try:
         S = get_spot_safe(ticker)
         if pd.isna(S) or S <= 0:
@@ -744,15 +755,13 @@ def get_polygon_option_snapshot(ticker):
             f"contract_type=call&"
             f"strike_price.gte={strike_min:.2f}&strike_price.lte={strike_max:.2f}&"
             f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
-            f"limit=250&apiKey={POLYGON_API_KEY}"
+            f"limit=250"
         )
 
-        resp = requests.get(url, timeout=15)
-        if resp.status_code != 200:
-            raise ValueError("HTTP != 200")
-
-        data_json = resp.json()
-        results = data_json.get("results")
+        results, completo, status = pc.get_all(url, api_key=POLYGON_API_KEY)
+        if not completo:
+            transitorio = pc.es_transitorio(status)
+            raise ValueError(f"cadena incompleta (status {status})")
         if not results:
             raise ValueError("sin resultados")
 
@@ -785,7 +794,8 @@ def get_polygon_option_snapshot(ticker):
     except Exception:
         resultado = None
 
-    _polygon_cache[ticker] = resultado
+    if not transitorio:
+        _polygon_cache[ticker] = resultado
     return resultado
 
 
@@ -813,42 +823,13 @@ def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
 
 
 def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_hi):
-    resultado = {"call": pd.DataFrame(columns=["strike", "iv", "type"]),
-                 "put": pd.DataFrame(columns=["strike", "iv", "type"])}
-    if pd.isna(S) or S <= 0:
-        return resultado["call"], resultado["put"]
+    """Cadena OTM paginada de un unico vencimiento (el mas cercano a target_dte)."""
     hoy = date.today()
     fecha_min = (hoy + timedelta(days=target_dte - dte_tol)).strftime("%Y-%m-%d")
     fecha_max = (hoy + timedelta(days=target_dte + dte_tol)).strftime("%Y-%m-%d")
-    strike_min = round(S * moneyness_lo, 2)
-    strike_max = round(S * moneyness_hi, 2)
-    for tipo in ("call", "put"):
-        try:
-            url = (
-                f"https://api.polygon.io/v3/snapshot/options/{ticker}?"
-                f"contract_type={tipo}&"
-                f"strike_price.gte={strike_min:.2f}&strike_price.lte={strike_max:.2f}&"
-                f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
-                f"limit=250&apiKey={POLYGON_API_KEY}"
-            )
-            resp = requests.get(url, timeout=15)
-            if resp.status_code != 200:
-                continue
-            results = resp.json().get("results")
-            if not results:
-                continue
-            df = pd.json_normalize(results)
-            df = df[df.get("implied_volatility").notna() & (df.get("implied_volatility") > 0)].copy()
-            if df.empty:
-                continue
-            df["strike"] = df["details.strike_price"]
-            df["iv"] = df["implied_volatility"]
-            df["type"] = tipo
-            df = df[df["strike"] >= S] if tipo == "call" else df[df["strike"] < S]
-            resultado[tipo] = df[["strike", "iv", "type"]].drop_duplicates("strike")
-        except Exception:
-            continue
-    return resultado["call"], resultado["put"]
+    return pc.fetch_otm_chain(
+        ticker, S, fecha_min, fecha_max, round(S * moneyness_lo, 2), round(S * moneyness_hi, 2),
+        target_dte, api_key=POLYGON_API_KEY, strike_fmt="{:.2f}")
 
 
 def bkm_iv_chain_to_prices(S, r, T, chain_df):
@@ -906,12 +887,15 @@ def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
     S = get_spot_safe(ticker)
     if pd.isna(S) or S <= 0:
         return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, spot=np.nan)
-    calls_df, puts_df = bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, bkm_moneyness_lo, bkm_moneyness_hi)
+    calls_df, puts_df, info_cadena = bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S,
+                                                         bkm_moneyness_lo, bkm_moneyness_hi)
     T = target_dte / 365
     calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df)
     puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df)
     mom = bkm_compute_moments(S, rf, T, calls_df, puts_df)
     mom["spot"] = S
+    mom["expiracion"] = info_cadena["expiracion"]
+    mom["transitorio"] = (not info_cadena["completo"]) and pc.es_transitorio(info_cadena["status"])
     return mom
 
 
@@ -925,7 +909,8 @@ def bkm_get_current_moments_cached(ticker):
         mom = dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, spot=np.nan)
     else:
         mom = bkm_get_current_moments(ticker, target_dte_iv, dte_tol_iv, risk_free_rate)
-    bkm_moments_cache[ticker] = mom
+    if not mom.get("transitorio"):
+        bkm_moments_cache[ticker] = mom
     return mom
 
 
@@ -1038,6 +1023,28 @@ log_returns_seasonal = log_returns.loc[log_returns.index.month.isin(execution_mo
 n_seasonal_weeks = len(log_returns_seasonal)
 print(f"  OK Semanas dentro de {execution_label} disponibles: {n_seasonal_weeks}")
 
+if tail_risk_hist_fallback:
+    print("  Fallback historico ACTIVO: los activos sin BKM valido usan momentos historicos estacionales")
+
+
+def momentos_cola_historicos(r_semanal):
+    """Vol, asimetria y exceso de curtosis al horizonte target_dte_iv desde retornos semanales.
+
+    Agregacion iid de h = target_dte_iv / 7 semanas: sigma_T = sigma_w * sqrt(h),
+    S_T = S_w / sqrt(h), ExK_T = ExK_w / h. Devuelve None si el par no es admisible.
+    """
+    r = pd.Series(r_semanal).dropna()
+    sd_w = r.std()
+    if len(r) < 6 or not np.isfinite(sd_w) or sd_w <= 0:
+        return None
+    h = target_dte_iv / 7
+    s_T = float(skew(r)) / math.sqrt(h)
+    exk_T = float(kurtosis(r)) / h
+    if not rk.higher_moments_admissible(s_T, exk_T + 3.0, bkm_mfik_max):
+        return None
+    return dict(sigma_T=sd_w * math.sqrt(h), skew=s_T, exkurt=exk_T)
+
+
 tail_risk_rows = []
 for ticker in selected_pre_seasonal:
     r_seasonal = log_returns_seasonal[ticker].dropna()
@@ -1046,19 +1053,25 @@ for ticker in selected_pre_seasonal:
 
     mom = bkm_get_current_moments_cached(ticker)
 
-    if n_obs < seasonal_min_weeks or not mom["ok"] or not np.isfinite(mom["mfis"]):
-        tail_risk_rows.append(dict(Symbol=ticker, MFIV=mom.get("mfiv", np.nan), MFIS=mom.get("mfis", np.nan),
-                                    MFIK=mom.get("mfik", np.nan), VaR_CF=np.nan,
-                                    Seasonal_SD=r_seasonal.std() if n_obs > 1 else np.nan, N_Obs=n_obs))
+    fila = dict(Symbol=ticker, MFIV=np.nan, MFIS=np.nan, MFIK=np.nan, VaR_CF=np.nan,
+                Seasonal_SD=r_seasonal.std() if n_obs > 1 else np.nan, N_Obs=n_obs, Fuente=None)
+    if n_obs < seasonal_min_weeks:
+        tail_risk_rows.append(fila)
+        continue
+    if mom["ok"] and np.isfinite(mom["mfis"]):
+        sigma_T, s_T, exk_T = math.sqrt(mom["mfiv"]), mom["mfis"], mom["mfik"] - 3.0
+        fila.update(MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"], Fuente="BKM")
+    elif tail_risk_hist_fallback and (hist := momentos_cola_historicos(r_seasonal)) is not None:
+        sigma_T, s_T, exk_T = hist["sigma_T"], hist["skew"], hist["exkurt"]
+        fila.update(Fuente="Historico")
+    else:
+        tail_risk_rows.append(fila)
         continue
 
     mu_T = mu_weekly_seasonal * (target_dte_iv / 7) if not pd.isna(mu_weekly_seasonal) else 0.0
-    sigma_T = math.sqrt(mom["mfiv"])
-    cola = rk.cornish_fisher_tail(1 - tail_risk_filter_confidence, mom["mfis"], mom["mfik"] - 3.0)
-    var_cf_i = -(mu_T + sigma_T * cola["q"])
-
-    tail_risk_rows.append(dict(Symbol=ticker, MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"],
-                                VaR_CF=var_cf_i, Seasonal_SD=r_seasonal.std(), N_Obs=n_obs))
+    cola = rk.cornish_fisher_tail(1 - tail_risk_filter_confidence, s_T, exk_T)
+    fila["VaR_CF"] = -(mu_T + sigma_T * cola["q"])
+    tail_risk_rows.append(fila)
 
 tail_risk_stats = pd.DataFrame(tail_risk_rows)
 tail_risk_stats = tail_risk_stats[
@@ -1067,14 +1080,28 @@ tail_risk_stats = tail_risk_stats[
 
 n_con_tail = len(tail_risk_stats)
 n_sin_tail = len(selected_pre_seasonal) - n_con_tail
+n_hist_tail = int((tail_risk_stats["Fuente"] == "Historico").sum())
 
 print(f"  OK Candidatos previos al filtro (post-Delta): {len(selected_pre_seasonal)}")
-print(f"  OK Con VaR_CF calculable (BKM + estacional, >={seasonal_min_weeks} sem): {n_con_tail}")
+print(f"  OK Con VaR_CF calculable (estacional, >={seasonal_min_weeks} sem): {n_con_tail} "
+      f"(BKM: {n_con_tail - n_hist_tail} | historico: {n_hist_tail})")
 print(f"  ADVERTENCIA Descartados (sin cobertura BKM, MFIS/MFIK inadmisibles o datos estacionales insuficientes): {n_sin_tail}")
 
 tail_risk_final = tail_risk_stats.head(n_divers_candidates)
 
 print(f"  OK Seleccionados (<={n_divers_candidates}, menor VaR_CF estacional): {len(tail_risk_final)}")
+
+if len(tail_risk_final) < tail_risk_min_survivors:
+    print("\n  Diagnostico de llamadas a Polygon:")
+    pc.print_diagnostics("    ")
+    raise RuntimeError(
+        f"Error: solo {len(tail_risk_final)} activos tienen VaR_CF estacional calculable "
+        f"(minimo tail_risk_min_survivors = {tail_risk_min_survivors}).\n"
+        f"   Consultas a Polygon fallidas por limite de tasa o red tras reintentos: "
+        f"{pc.n_fallos_transitorios()}.\n"
+        "   Revisa POLYGON_API_KEY y POLYGON_CALLS_PER_MIN, reduce seasonal_min_weeks "
+        "o activa tail_risk_hist_fallback = True."
+    )
 
 if len(tail_risk_final) < n_divers_candidates * 0.5:
     print(f"\n  ADVERTENCIA: solo {len(tail_risk_final)} tickers sobrevivieron el filtro de Tail Risk estacional.")
@@ -1086,13 +1113,13 @@ tail_risk_final = tail_risk_final.merge(asset_stats[["Symbol", "Volatility", "Sh
 print(f"\n  Candidatos finales ordenados por VaR_CF estacional (Tail Risk Score, {execution_label}):")
 seasonal_display = tail_risk_final.copy()
 seasonal_display["VaR_CF"] = seasonal_display["VaR_CF"].map(lambda x: f"{x * 100:.3f}%")
-seasonal_display["MFIV"] = seasonal_display["MFIV"].map(lambda x: f"{x:.5f}")
-seasonal_display["MFIS"] = seasonal_display["MFIS"].map(lambda x: f"{x:.3f}")
-seasonal_display["MFIK"] = seasonal_display["MFIK"].map(lambda x: f"{x:.3f}")
+seasonal_display["MFIV"] = seasonal_display["MFIV"].map(lambda x: f"{x:.5f}" if pd.notna(x) else "N/D")
+seasonal_display["MFIS"] = seasonal_display["MFIS"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "N/D")
+seasonal_display["MFIK"] = seasonal_display["MFIK"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "N/D")
 seasonal_display["SD_Estacional"] = seasonal_display["Seasonal_SD"].map(lambda x: f"{x:.4f}")
 seasonal_display["Sharpe_fmt"] = seasonal_display["Sharpe"].map(lambda x: f"{x:.3f}")
 print(seasonal_display.rename(columns={"N_Obs": "Semanas", "Sharpe_fmt": "Sharpe"})
-      [["Symbol", "VaR_CF", "MFIV", "MFIS", "MFIK", "SD_Estacional", "Semanas", "Sharpe"]]
+      [["Symbol", "Fuente", "VaR_CF", "MFIV", "MFIS", "MFIK", "SD_Estacional", "Semanas", "Sharpe"]]
       .to_string(index=False))
 
 selected_tickers = tail_risk_final["Symbol"].tolist()
@@ -2293,5 +2320,8 @@ print(f"   Volatilidad       : {metrics_minvar['Risk_Annual'] * 100:.2f}%")
 print(f"   Sharpe Ratio      : {metrics_minvar['Sharpe_Annual']:.3f}")
 print(f"   Sortino Ratio     : {metrics_minvar['Sortino_Annual']:.3f}")
 print("=" * 65)
+
+print("\nDiagnostico de llamadas a Polygon:")
+pc.print_diagnostics()
 
 print("\nScript completado con exito!")

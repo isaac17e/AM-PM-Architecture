@@ -12,7 +12,6 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
-import requests
 
 import yfinance as yf
 from scipy.optimize import minimize, linprog
@@ -25,6 +24,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 import risk_estimators as rk
+import polygon_client as pc
 
 try:
     import statsmodels.api as sm
@@ -324,28 +324,12 @@ if USAR_IV_POLYGON:
     print(f"Horizonte objetivo (tau): {tau_horizonte:.4f} anios\n")
 
     def polygon_fetch_chain(ticker, api_key, max_pages=40):
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?limit=250&apiKey={api_key}"
-        out = []
-        page = 0
-        while True:
-            try:
-                resp = requests.get(url, timeout=20)
-            except Exception:
-                break
-            if resp.status_code != 200:
-                print(f"HTTP {resp.status_code} para {ticker}")
-                break
-            data = resp.json()
-            results = data.get("results")
-            if results:
-                out.extend(results)
-            page += 1
-            next_url = data.get("next_url")
-            if next_url is None or page >= max_pages:
-                break
-            url = f"{next_url}&apiKey={api_key}"
-            time.sleep(0.05)
-        return out
+        """Cadena completa de opciones paginada; falla si queda incompleta."""
+        url = f"{pc.BASE_URL}/v3/snapshot/options/{ticker}?limit=250"
+        results, completo, status = pc.get_all(url, api_key=api_key, max_pages=max_pages)
+        if not completo:
+            raise ValueError(f"cadena incompleta (status {status})")
+        return results
 
     def parse_chain(chain_raw):
         filas = []
@@ -2516,3 +2500,7 @@ print(f"  CVaR{nc} historico:       {metricas_post.loc[f'CVaR{nc}_historico', _p
 print(f"  Sortino / Omega:        {metricas_post.loc['Sortino', _pf]:.3f} / "
       f"{metricas_post.loc['Omega', _pf]:.3f}")
 print(f"  MDD analizado desde:    {MDD_START_YEAR}")
+
+if USAR_IV_POLYGON:
+    print("\nDiagnostico de llamadas a Polygon:")
+    pc.print_diagnostics()

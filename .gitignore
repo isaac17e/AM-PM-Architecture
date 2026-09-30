@@ -7,3 +7,4 @@ entry_signal_history.csv
 entry_state.json
 portfolio_risk_history.csv
 portfolio_vix_report.html
+.cache/

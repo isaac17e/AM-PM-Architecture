@@ -25,11 +25,11 @@ import statsmodels.api as sm
 from scipy.stats import norm
 import quadprog
 
-import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 
 import risk_estimators as rk
+import polygon_client as pc
 
 # ==============================================================================
 # PARAMETROS CONFIGURABLES
@@ -48,6 +48,7 @@ if not POLYGON_API_KEY:
     print("             fallaran y cada activo caera a fallback historico (sin BKM real).")
 
 polygon_dte_tol = 10
+atm_strike_band = 0.10
 
 # ------------------------------------------------------------------------------
 # UNIVERSO DE ACTIVOS
@@ -123,6 +124,9 @@ bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
 bkm_lookback_months = 12
 bkm_hist_sample_freq = "2W"
+bkm_hist_anchor = "2020-01-05"
+bkm_hist_min_valid = 8
+bkm_hist_max_minutes = 60
 bkm_max_workers = 6
 bkm_z_threshold = 1.75
 bkm_min_survivors = 14
@@ -280,58 +284,6 @@ def polygon_format_ticker(ticker):
     return ticker.replace("-", ".")
 
 
-polygon_diag = {
-    "status_counts": {},
-    "sample_errors": [],
-    "total_attempts": 0,
-    "empty_match_count": 0,
-}
-polygon_diag_lock = threading.Lock()
-
-
-def polygon_log_status(status, body=None):
-    key = str(status)
-    with polygon_diag_lock:
-        polygon_diag["status_counts"][key] = polygon_diag["status_counts"].get(key, 0) + 1
-        if status != 200 and len(polygon_diag["sample_errors"]) < 5:
-            polygon_diag["sample_errors"].append({"status": status, "body": body})
-
-
-def polygon_api_request(url, max_retries=5, sleep_between=0.3):
-    with polygon_diag_lock:
-        polygon_diag["total_attempts"] += 1
-    for intento in range(1, max_retries + 1):
-        try:
-            resp = requests.get(url, timeout=20)
-        except Exception:
-            time.sleep(sleep_between * intento)
-            continue
-        status = resp.status_code
-        if status == 200:
-            polygon_log_status(status)
-            time.sleep(sleep_between)
-            return resp
-        if status == 429:
-            retry_after = resp.headers.get("retry-after")
-            try:
-                retry_after = float(retry_after)
-            except (TypeError, ValueError):
-                retry_after = None
-            espera = retry_after if (retry_after and retry_after > 0) else sleep_between * (2 ** intento)
-            time.sleep(espera)
-            continue
-        try:
-            body_txt = resp.text
-        except Exception:
-            body_txt = None
-        polygon_log_status(status, body_txt)
-        time.sleep(sleep_between)
-        return resp
-    polygon_log_status(429, "limite de reintentos agotado tras 429 repetido")
-    time.sleep(sleep_between)
-    return None
-
-
 def polygon_get_atm_option(ticker, target_dte, dte_tol=10, api_key=None, contract_type="call"):
     api_key = api_key or POLYGON_API_KEY
     vacio = dict(iv=np.nan, delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan,
@@ -341,32 +293,31 @@ def polygon_get_atm_option(ticker, target_dte, dte_tol=10, api_key=None, contrac
     fecha_min = (hoy + timedelta(days=max(target_dte - dte_tol, 1))).strftime("%Y-%m-%d")
     fecha_max = (hoy + timedelta(days=target_dte + dte_tol)).strftime("%Y-%m-%d")
 
+    S = get_spot_safe_bkm(ticker)
+    filtro_strike = ""
+    if np.isfinite(S) and S > 0:
+        filtro_strike = (f"strike_price.gte={S * (1 - atm_strike_band):.4f}&"
+                         f"strike_price.lte={S * (1 + atm_strike_band):.4f}&")
+
     url_chain = (
         f"https://api.polygon.io/v3/snapshot/options/{polygon_format_ticker(ticker)}?"
-        f"contract_type={contract_type}&"
+        f"contract_type={contract_type}&{filtro_strike}"
         f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
-        f"limit=250&apiKey={api_key}"
+        f"limit=250"
     )
 
     try:
-        resp = polygon_api_request(url_chain)
-        if resp is None or resp.status_code != 200:
-            return vacio
-        data = resp.json()
-        results = data.get("results")
-        if not results:
-            polygon_diag["empty_match_count"] += 1
+        results, completo, _ = pc.get_all(url_chain, api_key=api_key)
+        if not completo or not results:
             return vacio
         df = pd.json_normalize(results)
         if df.empty:
-            polygon_diag["empty_match_count"] += 1
             return vacio
 
         df["dte"] = (pd.to_datetime(df["details.expiration_date"]) - pd.Timestamp(hoy)).dt.days
         df = df[df.get("implied_volatility").notna() & (df.get("implied_volatility") > 0) &
                  df.get("greeks.delta").notna()].copy()
         if df.empty:
-            polygon_diag["empty_match_count"] += 1
             return vacio
 
         df["_score1"] = (df["greeks.delta"] - 0.50).abs()
@@ -402,67 +353,47 @@ def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
         return K * math.exp(-r * T_yrs) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 
-def polygon_find_contract_asof(ticker, contract_type, strike_target, expiration_target,
-                                as_of_date, strike_band=0.06, expiration_band_days=12,
-                                api_key=None):
-    api_key = api_key or POLYGON_API_KEY
-    strike_min = strike_target * (1 - strike_band)
-    strike_max = strike_target * (1 + strike_band)
-    exp_target_d = pd.Timestamp(expiration_target)
-    exp_min = (exp_target_d - timedelta(days=expiration_band_days)).strftime("%Y-%m-%d")
-    exp_max = (exp_target_d + timedelta(days=expiration_band_days)).strftime("%Y-%m-%d")
+def polygon_contracts_asof(ticker, strike_lo, strike_hi, exp_min, exp_max, as_of, api_key=None):
+    """Calls y puts vigentes en `as_of` dentro de la ventana de strike y vencimiento.
+
+    Una sola consulta paginada por fecha en lugar de una por punto de la rejilla.
+    Devuelve (df, definitivo); definitivo es False si fallo por limite o red.
+    """
     url_ref = (
         f"https://api.polygon.io/v3/reference/options/contracts?"
-        f"underlying_ticker={polygon_format_ticker(ticker)}&contract_type={contract_type}&"
-        f"strike_price.gte={strike_min:.4f}&strike_price.lte={strike_max:.4f}&"
+        f"underlying_ticker={polygon_format_ticker(ticker)}&"
+        f"strike_price.gte={strike_lo:.4f}&strike_price.lte={strike_hi:.4f}&"
         f"expiration_date.gte={exp_min}&expiration_date.lte={exp_max}&"
-        f"as_of={pd.Timestamp(as_of_date).strftime('%Y-%m-%d')}&limit=100&apiKey={api_key}"
+        f"as_of={as_of}&limit=1000"
     )
-    try:
-        resp = polygon_api_request(url_ref)
-        if resp is None or resp.status_code != 200:
-            return None
-        data = resp.json()
-        results = data.get("results")
-        if not results:
-            return None
-        df = pd.json_normalize(results)
-        if df.empty:
-            return None
-        df["d_strike"] = (df["strike_price"] - strike_target).abs()
-        df["d_exp"] = (pd.to_datetime(df["expiration_date"]) - exp_target_d).abs().dt.days
-        df = df.sort_values(["d_strike", "d_exp"])
-        return df.iloc[0]["ticker"]
-    except Exception:
-        return None
+    results, completo, status = pc.get_all(url_ref, api_key=api_key or POLYGON_API_KEY, permanente=True)
+    if not completo:
+        return pd.DataFrame(), not pc.es_transitorio(status)
+    if not results:
+        return pd.DataFrame(), True
+    return pd.json_normalize(results), True
 
 
-def polygon_get_contract_close_near(contract_ticker, target_date, window_days=5, api_key=None):
-    api_key = api_key or POLYGON_API_KEY
+def polygon_contract_close_near(contract_ticker, target_date, window_days=5, api_key=None):
+    """Cierre diario del contrato mas cercano a target_date. Devuelve (precio, definitivo)."""
     target_d = pd.Timestamp(target_date)
     from_d = (target_d - timedelta(days=window_days)).strftime("%Y-%m-%d")
     to_d = (target_d + timedelta(days=window_days)).strftime("%Y-%m-%d")
     url_aggs = (
         f"https://api.polygon.io/v2/aggs/ticker/{contract_ticker}/range/1/day/"
-        f"{from_d}/{to_d}?adjusted=true&sort=asc&limit=50&apiKey={api_key}"
+        f"{from_d}/{to_d}?adjusted=true&sort=asc&limit=50"
     )
-    try:
-        resp = polygon_api_request(url_aggs)
-        if resp is None or resp.status_code != 200:
-            return np.nan
-        data = resp.json()
-        results = data.get("results")
-        if not results:
-            return np.nan
-        df = pd.json_normalize(results)
-        if df.empty:
-            return np.nan
-        df["fecha"] = pd.to_datetime(df["t"], unit="ms").dt.date
-        df["d_dias"] = (pd.to_datetime(df["fecha"]) - target_d).abs().dt.days
-        df = df.sort_values("d_dias")
-        return df.iloc[0]["c"]
-    except Exception:
-        return np.nan
+    permanente = (target_d + timedelta(days=window_days)).date() < date.today()
+    data, status = pc.get_json(url_aggs, api_key=api_key or POLYGON_API_KEY, permanente=permanente)
+    if data is None:
+        return np.nan, not pc.es_transitorio(status)
+    results = data.get("results")
+    if not results:
+        return np.nan, True
+    df = pd.json_normalize(results)
+    df["fecha"] = pd.to_datetime(df["t"], unit="ms").dt.normalize()
+    df["d_dias"] = (df["fecha"] - target_d.normalize()).abs().dt.days
+    return df.sort_values("d_dias").iloc[0]["c"], True
 
 
 def get_spot_safe_bkm(ticker):
@@ -534,87 +465,126 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
 
 
 def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_hi, api_key=None):
-    api_key = api_key or POLYGON_API_KEY
+    """Cadena OTM paginada de un unico vencimiento (el mas cercano a target_dte)."""
     hoy = date.today()
     fecha_min = (hoy + timedelta(days=max(target_dte - dte_tol, 1))).strftime("%Y-%m-%d")
     fecha_max = (hoy + timedelta(days=target_dte + dte_tol)).strftime("%Y-%m-%d")
-    strike_min = S * moneyness_lo
-    strike_max = S * moneyness_hi
-
-    resultado = {"call": pd.DataFrame(columns=["strike", "iv", "type"]),
-                 "put": pd.DataFrame(columns=["strike", "iv", "type"])}
-    for tipo in ("call", "put"):
-        url = (
-            f"https://api.polygon.io/v3/snapshot/options/{polygon_format_ticker(ticker)}?"
-            f"contract_type={tipo}&"
-            f"strike_price.gte={strike_min:.4f}&strike_price.lte={strike_max:.4f}&"
-            f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
-            f"limit=250&apiKey={api_key}"
-        )
-        resp = polygon_api_request(url)
-        if resp is None or resp.status_code != 200:
-            continue
-        try:
-            results = resp.json().get("results")
-            if not results:
-                continue
-            df = pd.json_normalize(results)
-            df = df[df.get("implied_volatility").notna() & (df.get("implied_volatility") > 0)].copy()
-            if df.empty:
-                continue
-            df["strike"] = df["details.strike_price"]
-            df["iv"] = df["implied_volatility"]
-            df["type"] = tipo
-            df = df[df["strike"] >= S] if tipo == "call" else df[df["strike"] < S]
-            resultado[tipo] = df[["strike", "iv", "type"]].drop_duplicates("strike")
-        except Exception:
-            continue
-    return resultado["call"], resultado["put"]
-
+    return pc.fetch_otm_chain(
+        polygon_format_ticker(ticker), S, fecha_min, fecha_max, S * moneyness_lo, S * moneyness_hi,
+        target_dte, api_key=api_key or POLYGON_API_KEY, strike_fmt="{:.4f}")
 
 def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
     S = get_spot_safe_bkm(ticker)
     if pd.isna(S) or S <= 0:
         return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, spot=np.nan)
-    calls_df, puts_df = bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, bkm_moneyness_lo, bkm_moneyness_hi)
+    calls_df, puts_df, info_cadena = bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S,
+                                                         bkm_moneyness_lo, bkm_moneyness_hi)
     T = target_dte / 365
     calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df)
     puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df)
     mom = bkm_compute_moments(S, rf, T, calls_df, puts_df)
     mom["spot"] = S
+    mom["expiracion"] = info_cadena["expiracion"]
+    mom["transitorio"] = (not info_cadena["completo"]) and pc.es_transitorio(info_cadena["status"])
     return mom
 
 
-def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, moneyness_grid, rf):
-    mfis_hist = [np.nan] * len(sample_dates)
-    for i, fecha_i in enumerate(sample_dates):
-        fecha_i = pd.Timestamp(fecha_i)
-        spot_row = spot_series[spot_series["date"] <= fecha_i].sort_values("date", ascending=False)
-        if spot_row.empty:
+def bkm_clave_historia(ticker, fecha, target_dte, moneyness_grid):
+    """Clave de cache de los datos de la rejilla BKM de un ticker en una fecha historica."""
+    grid = ",".join(f"{m:.4f}" for m in moneyness_grid)
+    return (f"mfis_hist_v1|{ticker}|{pd.Timestamp(fecha):%Y-%m-%d}|dte={target_dte}|grid={grid}"
+            f"|band=0.06|exp=12|win=5")
+
+
+def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, moneyness_grid,
+                    strike_band=0.06, expiration_band_days=12):
+    """Strikes y precios de la rejilla en una fecha historica.
+
+    Devuelve (datos, definitivo) con datos = {"S", "calls": [[K, precio]], "puts": [...]},
+    o None si no hay spot. Para cada punto de la rejilla se elige el contrato con el
+    mismo criterio de antes: strike dentro de +/- strike_band del objetivo, menor
+    distancia de strike y luego de vencimiento. En cuanto un lado ya no puede reunir
+    bkm_min_options_per_side precios, la fecha no puede ser valida y se deja de consultar.
+    """
+    spot_row = spot_series[spot_series["date"] <= fecha_i].sort_values("date", ascending=False)
+    if spot_row.empty:
+        return None, True
+    S_i = float(spot_row.iloc[0]["adjusted"])
+    exp_target = fecha_i + timedelta(days=target_dte)
+    exp_min = (exp_target - timedelta(days=expiration_band_days)).strftime("%Y-%m-%d")
+    exp_max = (exp_target + timedelta(days=expiration_band_days)).strftime("%Y-%m-%d")
+
+    datos = {"S": S_i, "calls": [], "puts": []}
+    df_ct, definitivo = polygon_contracts_asof(
+        ticker, S_i * min(moneyness_grid) * (1 - strike_band), S_i * max(moneyness_grid) * (1 + strike_band),
+        exp_min, exp_max, fecha_i.strftime("%Y-%m-%d"))
+    if df_ct.empty:
+        return datos, definitivo
+    df_ct["d_exp"] = (pd.to_datetime(df_ct["expiration_date"]) - exp_target).abs().dt.days
+
+    puntos = []
+    for m in moneyness_grid:
+        tipo = "call" if m >= 1.0 else "put"
+        K = S_i * m
+        cand = df_ct[(df_ct["contract_type"] == tipo)
+                     & (df_ct["strike_price"] >= K * (1 - strike_band))
+                     & (df_ct["strike_price"] <= K * (1 + strike_band))]
+        if cand.empty:
+            puntos.append((K, tipo, None))
             continue
-        S_i = spot_row.iloc[0]["adjusted"]
-        exp_target = fecha_i + timedelta(days=target_dte)
-        T_i = target_dte / 365
+        cand = cand.assign(d_strike=(cand["strike_price"] - K).abs()).sort_values(["d_strike", "d_exp"])
+        puntos.append((K, tipo, cand.iloc[0]["ticker"]))
 
-        call_rows, put_rows = [], []
-        for m in moneyness_grid:
-            strike_target = S_i * m
-            tipo = "call" if m >= 1.0 else "put"
-            ct = polygon_find_contract_asof(ticker, tipo, strike_target, exp_target, fecha_i)
-            if ct is None:
-                continue
-            px = polygon_get_contract_close_near(ct, fecha_i)
-            if pd.isna(px) or px <= 0:
-                continue
-            (call_rows if tipo == "call" else put_rows).append(dict(strike=strike_target, price=px))
+    posibles = {t: sum(1 for _, tp, ct in puntos if tp == t and ct is not None) for t in ("call", "put")}
+    for K, tipo, ct in puntos:
+        if min(posibles.values()) < bkm_min_options_per_side:
+            break
+        if ct is None:
+            continue
+        px, ok_def = polygon_contract_close_near(ct, fecha_i)
+        definitivo = definitivo and ok_def
+        if pd.isna(px) or px <= 0:
+            posibles[tipo] -= 1
+            continue
+        datos["calls" if tipo == "call" else "puts"].append([K, float(px)])
+    return datos, definitivo
 
-        calls_df = pd.DataFrame(call_rows)
-        puts_df = pd.DataFrame(put_rows)
-        mom = bkm_compute_moments(S_i, rf, T_i, calls_df, puts_df)
+
+def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, moneyness_grid, rf,
+                                 min_validos=None):
+    """MFIS historico en cada fecha de muestreo.
+
+    Los datos de cada fecha se guardan en la cache de disco en cuanto son
+    definitivos, asi que las corridas siguientes solo consultan fechas nuevas.
+    Si con las fechas restantes ya no se alcanza min_validos, se detiene: el
+    resultado seria "muestra_insuficiente" de todas formas.
+    """
+    mfis_hist = [np.nan] * len(sample_dates)
+    T_i = target_dte / 365
+    validos = 0
+    for i, fecha_i in enumerate(sample_dates):
+        if min_validos is not None and validos + (len(sample_dates) - i) < min_validos:
+            break
+        fecha_i = pd.Timestamp(fecha_i)
+        clave = bkm_clave_historia(ticker, fecha_i, target_dte, moneyness_grid)
+        datos = pc.cache_get(clave)
+        if datos is None:
+            if spot_series is None:
+                continue
+            datos, definitivo = bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, moneyness_grid)
+            if datos is None:
+                continue
+            if definitivo:
+                pc.cache_set(clave, datos)
+
+        calls_df = pd.DataFrame(datos["calls"], columns=["strike", "price"])
+        puts_df = pd.DataFrame(datos["puts"], columns=["strike", "price"])
+        mom = bkm_compute_moments(datos["S"], rf, T_i, calls_df, puts_df)
         if mom["ok"]:
             mfis_hist[i] = mom["mfis"]
+            if np.isfinite(mom["mfis"]):
+                validos += 1
     return np.array(mfis_hist)
-
 
 sector_keywords = {
     "XLK": ["SEMICONDUCTOR", "COMPUTER", "SOFTWARE", "ELECTRONIC COMPONENTS", "COMPUTER PROGRAMMING", "COMPUTER PERIPHERAL"],
@@ -633,12 +603,11 @@ sector_keywords = {
 
 def polygon_get_sic_description(ticker, api_key=None):
     api_key = api_key or POLYGON_API_KEY
-    url_ref = f"https://api.polygon.io/v3/reference/tickers/{polygon_format_ticker(ticker)}?apiKey={api_key}"
+    url_ref = f"https://api.polygon.io/v3/reference/tickers/{polygon_format_ticker(ticker)}"
     try:
-        resp = polygon_api_request(url_ref)
-        if resp is None or resp.status_code != 200:
+        data, _ = pc.get_json(url_ref, api_key=api_key, permanente=True)
+        if data is None:
             return None
-        data = resp.json()
         results = data.get("results")
         if not results or not results.get("sic_description"):
             return None
@@ -984,15 +953,14 @@ if len(summary_stats) > 0:
     print(f"Tickers totales: {tickers_total} | Obs mediana: {obs_median:.0f} | "
           f"Ideal: {pct_ideal:.1f}% | Minimo: {pct_acceptable:.1f}%")
 
-    plt.figure(figsize=(8, 5))
-    plt.hist(summary_stats["n_obs"], bins=20, color="steelblue", alpha=0.7, edgecolor="white")
-    plt.axvline(ideal_observations, color="darkgreen", linestyle="--", linewidth=1.5)
-    plt.axvline(min_observations, color="orange", linestyle="--", linewidth=1.5)
-    plt.title("Distribucion de Observaciones por Ticker")
-    plt.xlabel("Numero de Observaciones")
-    plt.ylabel("Frecuencia")
-    plt.tight_layout()
-    plt.show()
+    fig = px.histogram(summary_stats, x="n_obs", nbins=20, color_discrete_sequence=["steelblue"],
+                       opacity=0.7, labels={"n_obs": "Numero de Observaciones"})
+    fig.add_vline(x=ideal_observations, line_dash="dash", line_color="darkgreen", line_width=1.5)
+    fig.add_vline(x=min_observations, line_dash="dash", line_color="orange", line_width=1.5)
+    fig.update_traces(marker_line_color="white", marker_line_width=1)
+    fig.update_layout(title="Distribucion de Observaciones por Ticker", yaxis_title="Frecuencia",
+                      template="plotly_white", bargap=0.02)
+    fig.show()
 else:
     raise RuntimeError("No hay tickers con datos suficientes. Ajusta los parametros.")
 
@@ -1334,16 +1302,8 @@ n_sector_intl_ok = sum(1 for t in stock_intl_candidates if sector_map.get(t) is 
 print(f"  Sector identificado (mapeo manual, internacionales): {n_sector_intl_ok} de {len(stock_intl_candidates)} acciones")
 
 
-print(f"  Llamadas HTTP intentadas en total: {polygon_diag['total_attempts']}")
-print("  Diagnostico de llamadas a Polygon (status HTTP acumulado):")
-for k, v in polygon_diag["status_counts"].items():
-    print(f"     {k}: {v}")
-print(f"  Respuestas 200 sin contrato dentro de la ventana strike/DTE: {polygon_diag['empty_match_count']}")
-if polygon_diag["sample_errors"]:
-    print("  Ejemplos de error (hasta 5, para identificar la causa real):")
-    for e in polygon_diag["sample_errors"]:
-        cuerpo = (e["body"] or "(sin cuerpo)")[:200] if e["body"] else "(sin cuerpo)"
-        print(f"     status={e['status']} | {cuerpo}")
+print("  Diagnostico de llamadas a Polygon:")
+pc.print_diagnostics("     ")
 
 # ==============================================================================
 # FILTRO DELTA
@@ -1484,10 +1444,10 @@ print(f"\nAplicando filtro MFIS (Bakshi-Kapadia-Madan) (z_threshold={bkm_z_thres
       f"lookback={bkm_lookback_months} meses)...")
 
 hoy_ts = pd.Timestamp(date.today())
-sample_dates_bkm = pd.date_range(
-    hoy_ts - relativedelta(months=bkm_lookback_months), hoy_ts - timedelta(days=7), freq=bkm_hist_sample_freq
-)
-print(f"   Fechas de muestreo historico: {len(sample_dates_bkm)} (freq={bkm_hist_sample_freq})")
+sample_dates_bkm = pd.date_range(start=bkm_hist_anchor, end=hoy_ts - timedelta(days=7), freq=bkm_hist_sample_freq)
+sample_dates_bkm = sample_dates_bkm[sample_dates_bkm >= hoy_ts - relativedelta(months=bkm_lookback_months)]
+print(f"   Fechas de muestreo historico: {len(sample_dates_bkm)} (freq={bkm_hist_sample_freq}, "
+      f"ancladas a {bkm_hist_anchor})")
 
 reponer_pool_bkm = (
     seasonal_ratio_stats[~seasonal_ratio_stats["symbol"].isin(ticker_candidates)]
@@ -1505,24 +1465,30 @@ def evaluar_bkm_activo(ticker):
     if not np.isfinite(mom_actual["mfis"]):
         return dict(symbol=ticker, decision="mantener", motivo="mfis_inadmisible", z=np.nan)
 
-    try:
-        start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
-        end_sk = hoy_ts.strftime("%Y-%m-%d")
-        hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=True)
-        if hist is None or hist.empty or len(hist) < 20:
+    if omitir_historia_bkm:
+        return dict(symbol=ticker, decision="mantener", motivo="historia_omitida_por_tiempo", z=np.nan)
+
+    spot_series_tk = None
+    if bkm_fechas_pendientes(ticker) > 0:
+        try:
+            start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
+            end_sk = hoy_ts.strftime("%Y-%m-%d")
+            hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=True)
+            if hist is None or hist.empty or len(hist) < 20:
+                return dict(symbol=ticker, decision="mantener", motivo="sin_precio_historico", z=np.nan)
+            spot_series_tk = hist[["Close"]].rename(columns={"Close": "adjusted"}).reset_index()
+            spot_series_tk = spot_series_tk.rename(columns={"Date": "date"})
+            spot_series_tk["date"] = pd.to_datetime(spot_series_tk["date"]).dt.tz_localize(None)
+        except Exception:
             return dict(symbol=ticker, decision="mantener", motivo="sin_precio_historico", z=np.nan)
-        spot_series_tk = hist[["Close"]].rename(columns={"Close": "adjusted"}).reset_index()
-        spot_series_tk = spot_series_tk.rename(columns={"Date": "date"})
-        spot_series_tk["date"] = pd.to_datetime(spot_series_tk["date"]).dt.tz_localize(None)
-    except Exception:
-        return dict(symbol=ticker, decision="mantener", motivo="sin_precio_historico", z=np.nan)
 
     hist_mfis = bkm_reconstruct_mfis_history(
-        ticker, spot_series_tk, sample_dates_bkm, target_dte_polygon, bkm_hist_moneyness_grid, rf_rate
+        ticker, spot_series_tk, sample_dates_bkm, target_dte_polygon, bkm_hist_moneyness_grid, rf_rate,
+        min_validos=bkm_hist_min_valid,
     )
     hist_mfis_validos = hist_mfis[~np.isnan(hist_mfis)]
 
-    if len(hist_mfis_validos) < 8:
+    if len(hist_mfis_validos) < bkm_hist_min_valid:
         return dict(symbol=ticker, decision="mantener", motivo="muestra_insuficiente", z=np.nan)
 
     media_hist = np.mean(hist_mfis_validos)
@@ -1537,6 +1503,25 @@ def evaluar_bkm_activo(ticker):
     else:
         return dict(symbol=ticker, decision="mantener", motivo="normal_o_especulativo", z=z)
 
+
+def bkm_fechas_pendientes(ticker):
+    """Fechas de muestreo cuyos datos aun no estan en la cache de disco."""
+    return sum(1 for f in sample_dates_bkm
+               if pc.cache_get(bkm_clave_historia(ticker, f, target_dte_polygon, bkm_hist_moneyness_grid)) is None)
+
+
+# Estimacion previa: 1 consulta de contratos + hasta 7 cierres por fecha pendiente,
+# mas la cadena actual (calls y puts). Solo aplica si hay tope de llamadas por minuto.
+n_fechas_pendientes = sum(bkm_fechas_pendientes(t) for t in ticker_candidates)
+llamadas_estimadas = 2 * len(ticker_candidates) + (1 + len(bkm_hist_moneyness_grid)) * n_fechas_pendientes
+minutos_estimados = pc.estimate_minutes(llamadas_estimadas)
+omitir_historia_bkm = minutos_estimados is not None and minutos_estimados > bkm_hist_max_minutes
+print(f"   Fechas pendientes (no cacheadas): {n_fechas_pendientes} de "
+      f"{len(sample_dates_bkm) * len(ticker_candidates)} | llamadas estimadas: ~{llamadas_estimadas}"
+      + (f" | tiempo minimo: ~{minutos_estimados:.0f} min" if minutos_estimados is not None else ""))
+if omitir_historia_bkm:
+    print(f"   ADVERTENCIA: la estimacion supera bkm_hist_max_minutes ({bkm_hist_max_minutes} min) - se omite")
+    print("   la comparacion historica del MFIS en esta corrida (los momentos BKM actuales si se calculan).")
 
 full_set = list(ticker_candidates)
 resultados_log = []
