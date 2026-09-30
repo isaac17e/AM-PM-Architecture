@@ -99,6 +99,15 @@ use_etf_constraint = True
 etf_min_weight = 0.30
 etf_max_weight = 0.55
 
+# === ETFs EN EL PORTAFOLIO RESULTANTE ===
+# True : el portafolio final puede incluir ETFs y, si use_etf_constraint = True,
+#        su participacion respeta la banda etf_min_weight - etf_max_weight.
+# False: el portafolio final solo contiene acciones y commodities (commodity_tickers).
+#        Los ETFs se siguen descargando y usando en todo el pipeline (factores de
+#        sector/pais, matrices de covarianza, filtros); solo se excluyen como
+#        candidatos del optimizador final, y la banda de % ETF deja de aplicarse.
+include_etfs_in_portfolio = True
+
 # === RESTRICCION DE EXPOSICION CAMBIARIA (tickers no denominados en USD) ===
 use_fx_factor = True
 max_fx_exposure = 0.45
@@ -1557,22 +1566,44 @@ print(f"  Rango beta_mercado: {beta_hist_arr.min():.3f} - {beta_hist_arr.max():.
       f"Rango beta_fx: {beta_fx_arr.min():.3f} - {beta_fx_arr.max():.3f}")
 
 # === OPTIMIZACION MINIMA VARIANZA (quadprog) =================================
-n_etf_en_pool = sum(1 for t in selected_tickers if t in etf_universe_tickers)
-if use_etf_constraint:
+# ETFs que no pueden entrar al portafolio resultante si include_etfs_in_portfolio = False.
+# Los commodities (commodity_tickers) siempre son elegibles, aunque coticen como ETF.
+etf_excluded_from_portfolio = set(etf_tickers) - set(commodity_tickers)
+use_etf_band = use_etf_constraint and include_etfs_in_portfolio
+
+if include_etfs_in_portfolio:
+    optimization_pool = list(selected_tickers)
+else:
+    etfs_removed = [t for t in selected_tickers if t in etf_excluded_from_portfolio]
+    optimization_pool = [t for t in selected_tickers if t not in etf_excluded_from_portfolio]
+    print("[INFO] include_etfs_in_portfolio = False: el portafolio resultante solo tendra acciones y commodities")
+    print(f"[INFO] ETFs excluidos como candidatos del optimizador ({len(etfs_removed)}): "
+          f"{', '.join(etfs_removed) if etfs_removed else 'ninguno'}")
+    print(f"[INFO] Activos elegibles para el portafolio: {len(optimization_pool)} de {len(selected_tickers)}")
+    if len(optimization_pool) * max_weight_per_asset < min_total_weight - 1e-9:
+        raise RuntimeError(
+            f"Error: con include_etfs_in_portfolio = False quedan {len(optimization_pool)} acciones/commodities "
+            f"elegibles y max_weight_per_asset = {max_weight_per_asset:.2f} no alcanza min_total_weight = "
+            f"{min_total_weight:.2f}.\n   Amplia el pool (n_pre_seasonal, volatility_percentile, "
+            "correlation_percentile) o sube max_weight_per_asset."
+        )
+
+n_etf_en_pool = sum(1 for t in optimization_pool if t in etf_universe_tickers)
+if use_etf_band:
     print(f"[INFO] Restriccion de participacion ETF activa: {etf_min_weight * 100:.0f}%-{etf_max_weight * 100:.0f}% "
           f"del capital invertido")
-    print(f"[INFO] ETFs/commodities en el pool tras filtros previos: {n_etf_en_pool} de {len(selected_tickers)} activos")
+    print(f"[INFO] ETFs/commodities en el pool tras filtros previos: {n_etf_en_pool} de {len(optimization_pool)} activos")
     if n_etf_en_pool == 0:
         print("  ADVERTENCIA Ningun ETF sobrevivio a los filtros de score/volatilidad/correlacion/")
         print("     estacionalidad/Delta - la restriccion de % ETF no tendra efecto.")
         print("     Revisa volatility_percentile, correlation_percentile o delta_min si")
         print("     quieres que mas ETFs lleguen a esta etapa.")
 
-n_fx_en_pool = sum(1 for t in selected_tickers if get_currency_for_ticker(t) != "USD")
+n_fx_en_pool = sum(1 for t in optimization_pool if get_currency_for_ticker(t) != "USD")
 if use_fx_factor:
     print(f"[INFO] Restriccion de exposicion cambiaria activa: maximo {max_fx_exposure * 100:.0f}% "
           f"del capital invertido en tickers no-USD")
-    print(f"[INFO] Tickers no-USD en el pool tras filtros previos: {n_fx_en_pool} de {len(selected_tickers)} activos")
+    print(f"[INFO] Tickers no-USD en el pool tras filtros previos: {n_fx_en_pool} de {len(optimization_pool)} activos")
     if n_fx_en_pool == 0:
         print("  ADVERTENCIA Ningun ticker no-USD sobrevivio a los filtros previos - la restriccion")
         print("     de exposicion cambiaria no tendra efecto.")
@@ -1587,7 +1618,7 @@ print("[INFO] Poda ETF/FX-aware activa (constraints_feasible)\n")
 def constraints_feasible(tickers_list):
     if len(tickers_list) == 0:
         return False
-    if use_etf_constraint:
+    if use_etf_band:
         n_etf = sum(1 for t in tickers_list if t in etf_universe_tickers)
         n_stock = len(tickers_list) - n_etf
         if n_stock * max_weight_per_asset < (1 - etf_max_weight) - 1e-9:
@@ -1633,7 +1664,7 @@ def run_minvar_qp(tickers_subset):
 
     extra_cols = []
     extra_b = []
-    if use_etf_constraint and has_etf:
+    if use_etf_band and has_etf:
         a_etf_min = is_etf_vec - etf_min_weight
         a_etf_max = etf_max_weight - is_etf_vec
         extra_cols += [a_etf_min, a_etf_max]
@@ -1721,7 +1752,7 @@ def compute_marginal_cvar_contrib(tickers_subset, w_vec, cm_sub):
     return pd.Series(w_vec * d_risk_dw, index=tickers_subset)
 
 
-current_tickers = list(selected_tickers)
+current_tickers = list(optimization_pool)
 iteration = 0
 w_last_valid = None
 tickers_last_valid = None
@@ -1780,7 +1811,7 @@ if w_last_valid is None:
         "Error: la optimizacion de minima varianza no encontro ninguna solucion factible.\n"
         "   Revisa: (1) que cov_mat sea PSD, (2) min_weight_per_asset * n_activos <= max_total_weight,\n"
         "   (3) max_weight_per_asset * n_activos >= min_total_weight, (4) la restriccion ETF\n"
-        "   (etf_min_weight/etf_max_weight) si use_etf_constraint = True, y (5) la restriccion\n"
+        "   (etf_min_weight/etf_max_weight) si use_etf_constraint e include_etfs_in_portfolio = True, y (5) la restriccion\n"
         "   de exposicion cambiaria (max_fx_exposure) si use_fx_factor = True."
     )
 

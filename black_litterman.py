@@ -95,6 +95,39 @@ if _cap_cardinalidad < 1.0:
           f"=> el optimizador quedaria infactible en sum(w)=1. "
           f"Se ajusta PESO_MAX_ACTIVO a {PESO_MAX_ACTIVO:.4f}.")
 
+# --- ETFs en el portafolio resultante ---------------------------------------
+# True : el portafolio final puede incluir ETFs; su participacion total (ETFs +
+#        commodities) queda acotada por PESO_MAX_ETFS.
+# False: el portafolio final solo contiene acciones y commodities. Los ETFs de
+#        TICKERS se siguen usando en todo el modelo (covarianza, prior de
+#        mercado, posterior BL, escenarios); solo se fija su peso en 0 en la
+#        optimizacion final (BL+BKM y el Markowitz de control).
+INCLUIR_ETFS = True
+PESO_MAX_ETFS = 1.00            # tope de ETFs + commodities con INCLUIR_ETFS = True (1.00 = sin tope)
+
+# Clasificacion de TICKERS: cualquier ticker de ETF_TICKERS se trata como ETF,
+# salvo los de COMMODITY_TICKERS, que siempre son elegibles.
+ETF_TICKERS = [
+    "SPY", "QQQ", "VOO", "VTI", "VYM", "IWM", "GLD", "SLV", "USO", "PDBC", "HYG", "VNQ",
+    "XLK", "XLV", "XLF", "XLE", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOX",
+    "SMH", "SOXX", "IGV", "CIBR", "HACK", "SKYY", "BOTZ", "ROBO", "BUG",
+    "XBI", "IBB", "PPH", "IHI", "IHF", "ARKG",
+    "KBE", "KRE", "KIE", "IAI", "FINX",
+    "XOP", "AMLP", "MLPX", "OIH", "ICLN", "TAN", "FAN",
+    "XRT", "XHB", "ITB", "PEJ", "ONLN", "CARZ",
+    "MOO",
+    "ITA", "PPA", "IYT", "PAVE",
+    "GDX", "GDXJ", "LIT", "SLX", "COPX",
+    "REM",
+    "ARKW", "ARKF",
+    "VWO", "EEM", "EFA", "VGK", "EZU", "AAXJ", "EWJ", "MCHI", "FXI", "INDA",
+    "ILF", "EWZ", "VXUS", "ACWX", "VT", "FM", "EWC", "EWG", "EWU", "EWQ", "EWP",
+]
+COMMODITY_TICKERS = ["SLV", "UNG"]
+
+if not (0.0 < PESO_MAX_ETFS <= 1.0):
+    raise ValueError("Error: PESO_MAX_ETFS debe estar en (0, 1] (ej. 0.30 = 30%)")
+
 # -----------------------------------------------------------------------------
 # 6. TASA LIBRE DE RIESGO - FALLBACK
 # -----------------------------------------------------------------------------
@@ -1938,6 +1971,27 @@ print("=" * 79)
 
 mu_opt = mu_post.copy()
 
+# --- Elegibilidad de ETFs en el portafolio resultante -----------------------
+_etfs_excluibles = set(ETF_TICKERS) - set(COMMODITY_TICKERS)
+es_etf_banda = np.array([t in set(ETF_TICKERS) | set(COMMODITY_TICKERS) for t in tickers])
+activos_elegibles = np.array([INCLUIR_ETFS or t not in _etfs_excluibles for t in tickers])
+usar_tope_etf = INCLUIR_ETFS and PESO_MAX_ETFS < 1.0 and bool(es_etf_banda.any())
+
+if not INCLUIR_ETFS:
+    _etfs_fuera = [t for t, ok in zip(tickers, activos_elegibles) if not ok]
+    print("\n  INCLUIR_ETFS = False: el portafolio resultante solo tendra acciones y commodities")
+    print(f"  ETFs con peso fijado en 0 ({len(_etfs_fuera)}): "
+          f"{', '.join(_etfs_fuera) if _etfs_fuera else 'ninguno'}")
+    n_elegibles = int(activos_elegibles.sum())
+    if n_elegibles == 0 or min(n_elegibles, MAX_TICKERS_FINAL) * PESO_MAX_ACTIVO < 1.0 - 1e-9:
+        raise RuntimeError(
+            f"Error: con INCLUIR_ETFS = False quedan {n_elegibles} acciones/commodities elegibles, "
+            f"insuficientes para sumar 100% con PESO_MAX_ACTIVO = {PESO_MAX_ACTIVO:.2f} y "
+            f"MAX_TICKERS_FINAL = {MAX_TICKERS_FINAL}. Agrega acciones a TICKERS o sube PESO_MAX_ACTIVO.")
+elif usar_tope_etf:
+    print(f"\n  Tope de ETFs + commodities: {PESO_MAX_ETFS:.0%} del portafolio "
+          f"({int(es_etf_banda.sum())} en el universo)")
+
 
 def utilidad_mvsk_negativa(w, X, p, gamma, lam3, lam4):
     """-U(w) con U = E[r] - (g/2)m2 + (l3/3)m3 - (l4/4)m4."""
@@ -1948,13 +2002,16 @@ def utilidad_mvsk_negativa(w, X, p, gamma, lam3, lam4):
 def optimizar_mvsk(X, p, gamma, lam3, lam4, activos_permitidos=None, w_ini=None):
     n_ = X.shape[1]
     if activos_permitidos is None:
-        activos_permitidos = np.ones(n_, dtype=bool)
+        activos_permitidos = activos_elegibles
+    activos_permitidos = activos_permitidos & activos_elegibles
     bounds = [(0.0, PESO_MAX_ACTIVO) if activos_permitidos[i] else (0.0, 0.0)
               for i in range(n_)]
     if w_ini is None:
         w_ini = activos_permitidos.astype(float)
         w_ini = w_ini / w_ini.sum()
     cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    if usar_tope_etf:
+        cons.append({"type": "ineq", "fun": lambda w: PESO_MAX_ETFS - np.sum(w[es_etf_banda])})
     res = minimize(utilidad_mvsk_negativa, w_ini, args=(X, p, gamma, lam3, lam4),
                    method="SLSQP", bounds=bounds, constraints=cons,
                    options=dict(maxiter=600, ftol=1e-11))
@@ -1984,7 +2041,8 @@ def optimizar_min_cvar(X, p, alpha, retorno_min, mu_vec,
     rng = rng_global if rng is None else rng
     J_, n_ = X.shape
     if activos_permitidos is None:
-        activos_permitidos = np.ones(n_, dtype=bool)
+        activos_permitidos = activos_elegibles
+    activos_permitidos = activos_permitidos & activos_elegibles
 
     if J_ > max_escenarios:
         idx = rng.choice(J_, size=max_escenarios, replace=True, p=p)
@@ -2013,6 +2071,13 @@ def optimizar_min_cvar(X, p, alpha, retorno_min, mu_vec,
 
     A_ub = sparse.vstack([A1, A2], format="csr")
     b_ub = np.concatenate([b1, b2])
+
+    # sum_{i ETF} w_i <= PESO_MAX_ETFS
+    if usar_tope_etf:
+        A3 = sparse.csr_matrix(
+            np.concatenate([es_etf_banda.astype(float), [0.0], np.zeros(M)]).reshape(1, -1))
+        A_ub = sparse.vstack([A_ub, A3], format="csr")
+        b_ub = np.concatenate([b_ub, [PESO_MAX_ETFS]])
 
     A_eq = sparse.csr_matrix(
         np.concatenate([np.ones(n_), [0.0], np.zeros(M)]).reshape(1, -1))
@@ -2067,6 +2132,7 @@ def _retorno_min_factible(retorno_deseado, mu_vec, activos_permitidos=None, etiq
 retorno_min_deseado = (float(w_mkt @ mu_opt) if RETORNO_MIN_CVAR is None
                        else float(RETORNO_MIN_CVAR))
 retorno_min_efectivo = _retorno_min_factible(retorno_min_deseado, mu_opt,
+                                             activos_permitidos=activos_elegibles,
                                              etiqueta=" en el universo completo")
 
 # --- Primera pasada ---------------------------------------------------------
@@ -2093,7 +2159,7 @@ else:
 # --- Segunda pasada: re-optimizacion sobre el soporte final -----------------
 # Truncar y renormalizar destruiria la optimalidad: se fija el soporte y se
 # resuelve otra vez el mismo problema restringido a el.
-mask_final = aplicar_limites_cartera(w_bruto)
+mask_final = aplicar_limites_cartera(w_bruto) & activos_elegibles
 print(f"  Soporte final: {int(mask_final.sum())} activos "
       f"(umbral {UMBRAL_PESO_MIN:.1%}, maximo {MAX_TICKERS_FINAL})")
 
@@ -2140,7 +2206,7 @@ print("BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL (CONTROL)")
 print("=" * 79)
 
 
-def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO):
+def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO, mask_etf=None):
     """QP de media-varianza long-only con el MISMO tope por activo que el
     optimizador del Bloque 8B, para que la comparacion sea justa.
 
@@ -2151,32 +2217,45 @@ def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO):
     """
     n_ = len(mu_vec)
     w_max = min(max(w_max, 1.0 / n_), 1.0)   # el tope debe permitir sum w = 1
+    tope_etf = usar_tope_etf and mask_etf is not None and bool(mask_etf.any())
     try:
         G = gamma * (Sigma_arr + Sigma_arr.T) / 2.0 + np.eye(n_) * 1e-8
         # Restricciones: sum w = 1 (igualdad), w >= 0, -w >= -w_max
         Amat = np.column_stack([np.ones(n_), np.eye(n_), -np.eye(n_)])
         bvec = np.concatenate([[1.0], np.zeros(n_), np.full(n_, -w_max)])
+        if tope_etf:
+            # -sum_{i ETF} w_i >= -PESO_MAX_ETFS
+            Amat = np.column_stack([Amat, -mask_etf.astype(float)])
+            bvec = np.concatenate([bvec, [-PESO_MAX_ETFS]])
         w = quadprog.solve_qp(G, mu_vec, Amat, bvec, meq=1)[0]
         w = np.clip(w, 0.0, None)
         return w / w.sum()
     except Exception as e:
         print(f"  quadprog fallo ({e}); se usa SLSQP")
         obj = lambda w: -(w @ mu_vec - (gamma / 2.0) * w @ Sigma_arr @ w)
+        cons = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
+        if tope_etf:
+            cons.append({"type": "ineq", "fun": lambda w: PESO_MAX_ETFS - w[mask_etf].sum()})
         res = minimize(obj, np.full(n_, 1.0 / n_), method="SLSQP",
-                       bounds=[(0.0, w_max)] * n_,
-                       constraints=[{"type": "eq", "fun": lambda w: w.sum() - 1.0}])
+                       bounds=[(0.0, w_max)] * n_, constraints=cons)
         w = np.clip(res.x, 0.0, None)
         return w / w.sum()
 
 
-w_mkw_bruto = markowitz_clasico(mu_historico, Sigma_hist, gamma_ra)
-mask_mkw = aplicar_limites_cartera(w_mkw_bruto)
+# Mismo universo elegible que BL+BKM (sin ETFs si INCLUIR_ETFS = False).
+idx_eleg = np.where(activos_elegibles)[0]
+w_mkw_bruto = np.zeros(n)
+w_mkw_bruto[idx_eleg] = markowitz_clasico(mu_historico[idx_eleg],
+                                          Sigma_hist[np.ix_(idx_eleg, idx_eleg)], gamma_ra,
+                                          mask_etf=es_etf_banda[idx_eleg])
+mask_mkw = aplicar_limites_cartera(w_mkw_bruto) & activos_elegibles
 
 # Re-optimizacion sobre el subespacio seleccionado (mismo criterio que en 8B:
 # se resuelve el QP restringido, no se trunca y renormaliza).
 idx_mkw = np.where(mask_mkw)[0]
 w_sub = markowitz_clasico(mu_historico[idx_mkw],
-                          Sigma_hist[np.ix_(idx_mkw, idx_mkw)], gamma_ra)
+                          Sigma_hist[np.ix_(idx_mkw, idx_mkw)], gamma_ra,
+                          mask_etf=es_etf_banda[idx_mkw])
 w_mkw = np.zeros(n)
 w_mkw[idx_mkw] = w_sub
 w_markowitz = pd.Series(w_mkw, index=tickers)

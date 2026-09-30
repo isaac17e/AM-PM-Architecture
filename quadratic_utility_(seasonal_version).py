@@ -151,6 +151,15 @@ max_region_weight = 0.80
 pct_etf_deseado = 0.10     # ej. 15% ETFs / 85% acciones individuales
 pct_etf_tolerancia = 0.10  # banda +/- alrededor del porcentaje deseado
 
+# === ETFs EN EL PORTAFOLIO RESULTANTE ===
+# True : el portafolio final puede incluir ETFs y su participacion respeta la banda
+#        pct_etf_deseado +/- pct_etf_tolerancia.
+# False: el portafolio final solo contiene acciones y commodities (commodity_tickers).
+#        Los ETFs se siguen usando en todo el pipeline (seleccion, factores de sector,
+#        matrices de covarianza); solo se fija su peso en 0 en la optimizacion final,
+#        y la banda de % ETF deja de aplicarse.
+include_etfs_in_portfolio = True
+
 # === VALIDACION DE PARAMETROS ===
 if not (1 <= len(rebalance_months) <= 3):
     raise ValueError("Error: rebalance_months debe contener 1, 2 o 3 meses")
@@ -1917,6 +1926,25 @@ print(f"\nEjecutando optimizacion cuadratica (quadprog) con lambda={lambda_:.2f}
 etf_commodity_assets = [i for i, a in enumerate(assets) if a in (etf_tickers + commodity_tickers)]
 stock_assets = [i for i, a in enumerate(assets) if a not in (etf_tickers + commodity_tickers)]
 
+# ETFs que no pueden entrar al portafolio resultante si include_etfs_in_portfolio = False.
+# Los commodities (commodity_tickers) siempre son elegibles, aunque coticen como ETF.
+etf_excluded_from_portfolio = set(etf_tickers) - set(commodity_tickers)
+excluded_etf_assets = [] if include_etfs_in_portfolio else [
+    i for i, a in enumerate(assets) if a in etf_excluded_from_portfolio]
+excluded_etf_set = set(excluded_etf_assets)
+if not include_etfs_in_portfolio:
+    n_eligible = n_assets - len(excluded_etf_assets)
+    print("   include_etfs_in_portfolio = False: el portafolio resultante solo tendra acciones y commodities")
+    print(f"   ETFs con peso fijado en 0 ({len(excluded_etf_assets)}): "
+          f"{', '.join(assets[i] for i in excluded_etf_assets) if excluded_etf_assets else 'ninguno'}")
+    print(f"   Activos elegibles para el portafolio: {n_eligible} de {n_assets}")
+    if n_eligible * max_weight < 1 - 1e-9:
+        raise RuntimeError(
+            f"Error: con include_etfs_in_portfolio = False quedan {n_eligible} acciones/commodities "
+            f"elegibles y max_weight = {max_weight:.2f} no alcanza el 100% del portafolio.\n"
+            "   Amplia el pool de candidatos (n_pre_filter, n_filter_candidates) o sube max_weight."
+        )
+
 canada_assets = [i for i, a in enumerate(assets) if a.endswith(".TO")]
 europe_assets = [i for i, a in enumerate(assets) if re.search(r"\.(DE|L|PA|MC)$", a)]
 japan_assets = [i for i, a in enumerate(assets) if a.endswith(".T")]
@@ -2000,9 +2028,9 @@ for i in range(n):
     v = np.zeros(n)
     v[i] = -1
     A_cols.append(v)
-    b_vals.append(-max_weight)
+    b_vals.append(0.0 if i in excluded_etf_set else -max_weight)
 
-if len(etf_commodity_assets) > 0 and len(stock_assets) > 0:
+if include_etfs_in_portfolio and len(etf_commodity_assets) > 0 and len(stock_assets) > 0:
     etf_lo = max(0, pct_etf_deseado - pct_etf_tolerancia)
     etf_hi = min(1, pct_etf_deseado + pct_etf_tolerancia)
     stk_lo = 1 - etf_hi
@@ -2040,6 +2068,7 @@ except Exception as e:
 
 weights_opt = sol[0]
 weights_opt = np.maximum(weights_opt, 0)
+weights_opt[excluded_etf_assets] = 0.0
 weights_opt = weights_opt / weights_opt.sum()
 weights_opt = pd.Series(weights_opt, index=assets)
 
@@ -2243,6 +2272,7 @@ def solve_qp_portfolio(lambda_val):
     try:
         s = quadprog.solve_qp(Dm, dv, Amat, bvec, meq)
         w = np.maximum(s[0], 0)
+        w[excluded_etf_assets] = 0.0
         w = w / w.sum()
         return pd.Series(w, index=assets)
     except Exception:
@@ -2267,6 +2297,7 @@ while valid_count < n_sim and attempt < n_sim * 10:
         w_raw = rng.uniform(size=n)
         w_raw = w_raw / w_raw.sum()
 
+    w_raw[excluded_etf_assets] = 0.0
     w_raw = np.minimum(w_raw, max_weight)
     if w_raw.sum() == 0:
         continue

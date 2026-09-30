@@ -106,6 +106,21 @@ Every script loads it via `load_dotenv()`. If the key is missing, the optimizers
 
 **Parameters are edited directly in the configuration block at the top of each file.** There is no CLI and no external config file: each script runs with `python script_name.py` and opens its Plotly charts in the browser.
 
+### ETFs in the resulting portfolio
+
+Every optimizer has a `True`/`False` switch that decides whether ETFs may appear in the **final portfolio**:
+
+| Script | Switch | ETF limit applied when `True` |
+|---|---|---|
+| `minimum_variance.py`, `minimum_variance_(seasonal_version).py` | `include_etfs_in_portfolio` | `etf_min_weight` – `etf_max_weight` (if `use_etf_constraint = True`) |
+| `quadratic_utility.py`, `quadratic_utility_(seasonal_version).py` | `include_etfs_in_portfolio` | `pct_etf_deseado` ± `pct_etf_tolerancia` |
+| `black_litterman.py` | `INCLUIR_ETFS` | `PESO_MAX_ETFS` (defaults to `1.00`, no cap) |
+
+- `True`: ETFs can be held, and their share stays within the limit shown above.
+- `False`: the final portfolio holds only stocks and commodities (`commodity_tickers` / `COMMODITY_TICKERS`, e.g. `SLV`, `UNG`, which stay eligible even though they trade as ETFs). The ETF limit no longer applies.
+
+The switch only affects the final optimization. ETFs are still downloaded and used everywhere else: sector and country factors, covariance matrices, candidate filters and, in Black-Litterman, the market prior and the posterior. With `False` their weight is simply set to 0. Because this makes the eligible pool smaller, the scripts stop with a clear error if too few stocks/commodities remain to add up to 100% under the per-asset cap.
+
 ---
 
 ## Scripts
