@@ -212,6 +212,40 @@ def test_fit_ssvi_rejects_a_surface_the_residual_cannot_explain():
     assert ajuste["metodo"] == "ssvi_rechazado"
 
 
+def test_integration_three_sigma_is_wider_than_the_fit_window():
+    # 40% anual, horizonte de 4 meses: +/-3 sigma pasa de |k|=0.5.
+    ala = 3.0 * 0.40 * np.sqrt(4 / 12)
+    lo, hi = bm.integration_strike_bounds(100.0, 0.40, 4 / 12, n_std=3)
+    assert np.log(hi / 100.0) == pytest.approx(ala)
+    assert np.log(lo / 100.0) == pytest.approx(-ala)
+    assert ala > 0.5
+    lo_fit, hi_fit = bm.integration_strike_bounds(
+        100.0, 0.40, 4 / 12, n_std=3, k_min=-0.5, k_max=0.5)
+    assert np.log(hi_fit / 100.0) == pytest.approx(0.5)
+    assert hi_fit < hi
+
+
+def test_ssvi_rho_at_the_bound_falls_back_to_atm():
+    ajuste = {"aceptado": True, "rho": 0.999, "k_min": -0.50, "k_max": 0.33,
+              "metodo": "ssvi_conjunto"}
+    decision = bm.ssvi_surface_decision(ajuste, 0.30, n_put=8, n_call=4)
+    assert decision["fuente"] == "atm" and not decision["usar_alas"]
+    assert "rho_en_cota" in decision["motivos"]
+    assert decision["sigma_atm_annual"] == pytest.approx(0.30)
+
+
+def test_ssvi_one_sided_coverage_falls_back_to_atm():
+    ajuste = {"aceptado": True, "rho": -0.40, "k_min": -0.50, "k_max": 0.02}
+    decision = bm.ssvi_surface_decision(ajuste, 0.25, n_put=10, n_call=1)
+    assert decision["fuente"] == "atm"
+    assert "sin_ala_call" in decision["motivos"]
+    assert "pocas_calls" in decision["motivos"]
+    sana = bm.ssvi_surface_decision(
+        {"aceptado": True, "rho": -0.40, "k_min": -0.45, "k_max": 0.40},
+        0.25, n_put=8, n_call=8)
+    assert sana["fuente"] == "ssvi" and sana["usar_alas"]
+
+
 def test_integration_stays_inside_three_sigma_and_the_observed_wing():
     lo6, hi6 = bm.integration_strike_bounds(100.0, 0.40, 4 / 12, n_std=6)
     lo3, hi3 = bm.integration_strike_bounds(100.0, 0.40, 4 / 12, n_std=3)

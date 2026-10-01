@@ -26,6 +26,7 @@ __all__ = [
     "align_prices_to_calendar",
     "drop_partial_last_week",
     "resolve_execution_months",
+    "dedupe_share_classes",
 ]
 
 # Codigos que yfinance usa para unidades menores (peniques, centimos de rand).
@@ -189,3 +190,25 @@ def resolve_execution_months(months, as_of=None, n_months=1):
             f"pasa None para usar el mes de la corrida."
         )
     return out, aviso
+
+
+def dedupe_share_classes(tickers, groups=(("GOOGL", "GOOG"),)):
+    """Deja una sola clase cuando el grupo esta repetido.
+
+    Cada grupo es una tupla: el primer ticker presente es el que se queda
+    (GOOGL antes que GOOG). El orden del resto de la lista no cambia.
+    Devuelve (lista, notas). Cada nota es (se_queda, [se_van]).
+    """
+    presentes = set(tickers)
+    drop = set()
+    notas = []
+    for group in groups:
+        encontrados = [t for t in group if t in presentes]
+        if len(encontrados) <= 1:
+            continue
+        se_queda = encontrados[0]
+        se_van = encontrados[1:]
+        drop.update(se_van)
+        notas.append((se_queda, se_van))
+    kept = [t for t in tickers if t not in drop]
+    return kept, notas

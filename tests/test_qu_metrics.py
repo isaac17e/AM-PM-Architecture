@@ -319,6 +319,27 @@ def test_dispersion_cap_share_is_the_basket_over_known_spy_caps():
     assert qm.dispersion_usable(info)
 
 
+def test_scale_option_deltas_direct_does_not_stretch_a_tight_range():
+    delta = np.array([0.48, 0.51, 0.56, np.nan])
+    directo = qm.scale_option_deltas(delta, mode="direct", delta_min=0.30)
+    assert directo[:3] == pytest.approx([0.48, 0.51, 0.56])
+    assert directo[3] == pytest.approx(1.0)
+    estirado = qm.scale_option_deltas(delta, mode="minmax", delta_min=0.30)
+    assert estirado[0] == pytest.approx(0.30)
+    assert estirado[2] == pytest.approx(1.0)
+    assert estirado[2] - estirado[0] == pytest.approx(0.70)
+    fijo = qm.scale_option_deltas(np.array([0.45, 0.50, 0.55]), mode="fixed",
+                                  delta_min=0.30, fixed_lo=0.45, fixed_hi=0.55)
+    assert fijo[0] == pytest.approx(0.30)
+    assert fijo[2] == pytest.approx(1.0)
+    assert fijo[1] == pytest.approx(0.65)
+
+
+def test_sector_implied_ready_rejects_two_names():
+    assert not qm.sector_implied_ready(2, min_names=4)
+    assert qm.sector_implied_ready(4, min_names=4)
+
+
 def test_clip_implied_correlation_floors_at_zero():
     assert qm.clip_implied_correlation(-0.133) == 0.0
     assert qm.clip_implied_correlation(-0.080) == 0.0

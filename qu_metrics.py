@@ -35,6 +35,8 @@ __all__ = [
     "dispersion_weights",
     "dispersion_usable",
     "clip_implied_correlation",
+    "scale_option_deltas",
+    "sector_implied_ready",
     "align_daily_panel",
     "stitch_covariance",
     "select_historical_otm",
@@ -264,6 +266,49 @@ def dispersion_usable(info, min_cap_share=0.40, min_known_caps=50):
         return False
     share = info.get("cap_share")
     return bool(share is not None and np.isfinite(share) and float(share) >= float(min_cap_share))
+
+
+def scale_option_deltas(delta, mode="direct", delta_min=0.30,
+                        fixed_lo=0.45, fixed_hi=0.55):
+    """Multiplicador de mu a partir de la delta de la call.
+
+    `direct` usa la delta, recortada a [delta_min, 1]. Una delta ausente
+    queda en 1 (no hay informacion, no se recorta el retorno).
+    `fixed` mapea el rango absoluto [fixed_lo, fixed_hi] a [delta_min, 1],
+    sin mirar el minimo y el maximo de la corrida.
+    `minmax` estira el rango observado de la corrida a [delta_min, 1].
+    Con deltas 0.48-0.56 eso convierte 0.03 de delta en decenas de puntos
+    del multiplicador.
+    """
+    d = np.asarray(delta, dtype=float)
+    modo = str(mode)
+    piso = float(delta_min)
+    if modo == "minmax":
+        valid = d[np.isfinite(d)]
+        if len(valid) >= 2 and float(valid.max()) > float(valid.min()):
+            span = float(valid.max()) - float(valid.min())
+            scaled = (d - float(valid.min())) / span * (1.0 - piso) + piso
+        else:
+            scaled = np.ones(np.shape(d), dtype=float)
+    elif modo == "fixed":
+        span = float(fixed_hi) - float(fixed_lo)
+        if span <= 0:
+            raise ValueError("fixed_hi debe ser mayor que fixed_lo")
+        scaled = (d - float(fixed_lo)) / span * (1.0 - piso) + piso
+        scaled = np.clip(scaled, piso, 1.0)
+    elif modo == "direct":
+        scaled = np.clip(d, piso, 1.0)
+    else:
+        raise ValueError(f"modo de delta desconocido: {mode}")
+    return np.where(np.isfinite(d), scaled, 1.0)
+
+
+def sector_implied_ready(n_names, min_names=4):
+    """True si el sector tiene bastantes acciones para una correlacion implicita.
+
+    Con dos nombres la dispersion del ETF se clava en el techo (rho_Q 0.999).
+    """
+    return int(n_names) >= int(min_names)
 
 
 def clip_implied_correlation(rho, floor=0.0, ceiling=0.999):

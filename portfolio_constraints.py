@@ -17,6 +17,7 @@
 import math
 
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "with_return_target",
     "bs_call_delta",
     "relax_group_band",
+    "prune_order",
 ]
 
 
@@ -160,3 +162,25 @@ def bs_call_delta(spot, strike, years, rate, vol):
         return float("nan")
     d1 = (math.log(spot / strike) + (rate + vol ** 2 / 2.0) * years) / (vol * math.sqrt(years))
     return float(norm.cdf(d1))
+
+
+def prune_order(weights, contributions=None, rule="min_weight"):
+    """Orden en el que intentar sacar activos del portafolio de cola.
+
+    `min_weight` saca primero el peso mas chico. Un activo en la cota del
+    12% aporta mucho riesgo marginal solo por el peso, y la regla vieja
+    `max_mtr` lo poda antes que un nombre chico y concentrado.
+    `min_weight_x_mtr` ordena por peso * contribucion, de menor a mayor.
+    `max_mtr` es la regla anterior: mayor contribucion marginal primero.
+    """
+    w = pd.Series(weights, dtype=float)
+    active = w[w > 0]
+    if rule == "max_mtr":
+        c = pd.Series(contributions, dtype=float).reindex(active.index)
+        return list(c.sort_values(ascending=False).index)
+    if rule == "min_weight_x_mtr":
+        c = pd.Series(contributions, dtype=float).reindex(active.index)
+        return list((active * c).sort_values(ascending=True).index)
+    if rule == "min_weight":
+        return list(active.sort_values(ascending=True).index)
+    raise ValueError(f"regla de poda desconocida: {rule}")

@@ -212,6 +212,15 @@ def test_resolve_execution_months_none_follows_the_run_date():
     assert meses == [11, 12, 1] and aviso is None
 
 
+def test_dedupe_share_classes_keeps_the_configured_class():
+    kept, notas = md.dedupe_share_classes(
+        ["GOOG", "AAPL", "GOOGL", "MSFT"], (("GOOGL", "GOOG"),))
+    assert kept == ["AAPL", "GOOGL", "MSFT"]
+    assert notas == [("GOOGL", ["GOOG"])]
+    solo, vacias = md.dedupe_share_classes(["GOOG", "AAPL"], (("GOOGL", "GOOG"),))
+    assert solo == ["GOOG", "AAPL"] and vacias == []
+
+
 def test_resolve_execution_months_keeps_an_explicit_list_and_warns():
     meses, aviso = md.resolve_execution_months([9], as_of="2026-10-01")
     assert meses == [9]

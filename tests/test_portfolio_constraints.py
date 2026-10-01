@@ -145,3 +145,12 @@ def test_relax_group_band_lowers_an_unreachable_etf_floor():
     assert pq.relax_group_band(0, 10, 0.12, 0.30, 0.55)[2].startswith("sin activos")
     mismo = pq.relax_group_band(4, 20, 0.12, 0.30, 0.55)
     assert mismo[0] == pytest.approx(0.30) and mismo[1] == pytest.approx(0.55) and mismo[2] == ""
+
+
+def test_prune_order_drops_the_small_weight_not_the_capped_defensive():
+    weights = {"XLP": 0.12, "GLD": 0.12, "MLPX": 0.04, "VZ": 0.11}
+    mtr = {"XLP": 0.050, "GLD": 0.040, "MLPX": 0.008, "VZ": 0.030}
+    assert pq.prune_order(weights, mtr, "max_mtr")[0] == "XLP"
+    assert pq.prune_order(weights, mtr, "min_weight")[0] == "MLPX"
+    assert pq.prune_order(weights, mtr, "min_weight_x_mtr")[0] == "MLPX"
+    assert "XLP" not in pq.prune_order({"XLP": 0.0, "MLPX": 0.04}, None, "min_weight")

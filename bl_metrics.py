@@ -32,6 +32,7 @@ __all__ = [
     "fit_ssvi",
     "ssvi_weights",
     "ssvi_row_mask",
+    "ssvi_degeneracy",
     "ssvi_surface_decision",
     "apply_vol_q_to_p",
     "clip_negligible_weights",
@@ -325,19 +326,54 @@ def ssvi_row_mask(precio=None, open_interest=None, n=None):
     return mask
 
 
-def ssvi_surface_decision(ajuste, sigma_atm_annual):
+def ssvi_degeneracy(ajuste, rho_abs_max=0.95, k_side_min=0.10, min_per_side=2,
+                    n_put=None, n_call=None):
+    """True si la sonrisa no debe alimentar las alas de BKM.
+
+    `|rho|` cerca de 1 es el borde de tanh (el optimizador se clava en la
+    cota). Una sola ala, o menos de `min_per_side` strikes de ese lado,
+    tampoco identifica rho. `ok` es False y `motivos` dice por que.
+    """
+    motivos = []
+    ajuste = ajuste or {}
+    rho = ajuste.get("rho", np.nan)
+    if rho is not None and np.isfinite(rho) and abs(float(rho)) >= float(rho_abs_max):
+        motivos.append("rho_en_cota")
+    k_min = ajuste.get("k_min", np.nan)
+    k_max = ajuste.get("k_max", np.nan)
+    if k_min is not None and np.isfinite(k_min) and float(k_min) > -float(k_side_min):
+        motivos.append("sin_ala_put")
+    if k_max is not None and np.isfinite(k_max) and float(k_max) < float(k_side_min):
+        motivos.append("sin_ala_call")
+    if n_put is not None and int(n_put) < int(min_per_side):
+        motivos.append("pocos_puts")
+    if n_call is not None and int(n_call) < int(min_per_side):
+        motivos.append("pocas_calls")
+    return {"ok": len(motivos) == 0, "motivos": motivos}
+
+
+def ssvi_surface_decision(ajuste, sigma_atm_annual, n_put=None, n_call=None,
+                          rho_abs_max=0.95, k_side_min=0.10, min_per_side=2):
     """La vol ATM de theta se conserva aunque la sonrisa se rechace.
 
     `fuente` es ssvi (alas usables), atm (theta sin alas) o historica.
+    Una sonrisa aceptada por RMSE pero degenerada (rho en la cota o una
+    sola ala) cae a atm: la vol se queda y BKM no integra esas alas.
     """
     atm = float(sigma_atm_annual) if sigma_atm_annual is not None else np.nan
     atm_ok = bool(np.isfinite(atm) and atm > 0)
     aceptado = bool(ajuste is not None and ajuste.get("aceptado"))
-    if aceptado and atm_ok:
-        return {"usar_alas": True, "sigma_atm_annual": atm, "fuente": "ssvi"}
+    degen = ssvi_degeneracy(
+        ajuste, rho_abs_max=rho_abs_max, k_side_min=k_side_min,
+        min_per_side=min_per_side, n_put=n_put, n_call=n_call)
+    if aceptado and atm_ok and degen["ok"]:
+        return {"usar_alas": True, "sigma_atm_annual": atm, "fuente": "ssvi",
+                "motivos": []}
     if atm_ok:
-        return {"usar_alas": False, "sigma_atm_annual": atm, "fuente": "atm"}
-    return {"usar_alas": False, "sigma_atm_annual": np.nan, "fuente": "historica"}
+        return {"usar_alas": False, "sigma_atm_annual": atm, "fuente": "atm",
+                "motivos": degen["motivos"]}
+    return {"usar_alas": False, "sigma_atm_annual": np.nan, "fuente": "historica",
+            "motivos": degen["motivos"]}
 
 
 def apply_vol_q_to_p(var_p, mfiv, is_implied, bounds=(0.70, 1.00)):
@@ -376,10 +412,13 @@ def clip_negligible_weights(w, tol=1e-6):
 
 def integration_strike_bounds(forward, sigma_atm, horizon_years, n_std=3.0,
                               k_min=None, k_max=None):
-    """Strikes de la integral BKM: +/- n_std y, si hay cadena, el k observado.
+    """Strikes de la integral BKM: +/- n_std * sigma * sqrt(T).
 
-    Integrar las alas SSVI hasta +/-6 sigma mete varianza que el mercado no
-    cotiza. El cruce con [k_min, k_max] se queda dentro de los strikes vistos.
+    El ajuste SSVI vive en |k|<=0.5. La integral no usa esa ventana: las alas
+    del modelo, ya chequeadas por arbitraje de calendario (GJ), cubren
+    +/- n_std al plazo del horizonte. Pasar k_min/k_max recorta a esos
+    strikes; Black-Litterman no los pasa, porque recortar al ajuste deja
+    MFIK por debajo de 3.
     """
     forward = float(forward)
     wing = float(n_std) * float(sigma_atm) * math.sqrt(float(horizon_years))
