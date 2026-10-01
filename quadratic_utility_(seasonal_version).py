@@ -7,6 +7,7 @@ warnings.filterwarnings("ignore")
 
 import time
 import math
+import re
 import itertools
 import io
 import threading
@@ -30,6 +31,8 @@ import plotly.graph_objects as go
 
 import risk_estimators as rk
 import polygon_client as pc
+import market_data as md
+import qu_metrics as qm
 
 # ==============================================================================
 # PARAMETROS CONFIGURABLES
@@ -66,9 +69,13 @@ rebalance_months = [9]
 # ------------------------------------------------------------------------------
 # PARAMETROS GENERALES
 # ------------------------------------------------------------------------------
-target_years = list(range(2016, 2026))
-mdd_start_year = 2016
-rf_rate = 0.046
+# Hasta el ultimo mes completo (M-6). El arranque 2016 se conserva: no es el
+# mismo objeto que el 2014 del script base. La tasa si se alinea (B-9).
+as_of_date = date.today()
+history_start_year = 2016
+target_years, history_start, history_end = qm.history_window(as_of_date, history_start_year)
+mdd_start_year = history_start_year
+rf_rate = 0.047
 seed = 123
 max_weight = 0.30
 n_sim = 5000
@@ -83,6 +90,9 @@ lookback_months = None
 # AVERSION AL RIESGO Y PONDERADORES DE SELECCION
 # ------------------------------------------------------------------------------
 lambda_ = 0.8
+# Opt-in (M-8). None conserva lambda_ tal cual, en unidades mensuales.
+# Si se fija, lambda_ = lambda_annual * 12. Ver qu_metrics.lambda_monthly_from_annual.
+lambda_annual = None
 weight_sharpe = 0.55
 weight_low_vol = 0.15
 weight_decorr = 0.30
@@ -119,7 +129,11 @@ seasonal_min_survivors = 18
 # ------------------------------------------------------------------------------
 bkm_moneyness_lo = 0.70
 bkm_moneyness_hi = 1.40
-bkm_hist_moneyness_grid = np.array([0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15])
+# La historia de MFIS usa la cadena OTM completa de un vencimiento (A-5), no
+# una rejilla de 7 puntos. El presupuesto cuenta ~estos contratos con precio
+# por fecha y polygon_client lo pasa a minutos con POLYGON_CALLS_PER_MIN
+# (default 300). Por encima de bkm_hist_max_minutes se omite la historia.
+bkm_hist_contracts_estimate = 40
 bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
 bkm_lookback_months = 12
@@ -129,6 +143,10 @@ bkm_hist_min_valid = 8
 bkm_hist_max_minutes = 60
 bkm_max_workers = 6
 bkm_z_threshold = 1.75
+# Cola del z de MFIS (M-9). "upper" conserva el comportamiento: descarta
+# z > umbral (demanda de calls; antes etiquetado cobertura_anomala).
+# "lower" descarta z < -umbral (demanda de puts). "both" usa las dos colas.
+bkm_tail_mode = "upper"
 bkm_min_survivors = 14
 cornish_fisher_confidence = 0.95
 
@@ -221,6 +239,12 @@ print("ENTRENAMIENTO: todo el historico mensual disponible" + lb_txt)
 print("=" * 60 + "\n")
 
 rf_rate_monthly = rf_rate / 12
+returns_per_year = 12
+periodo_label = "mensual"
+if lambda_annual is not None:
+    lambda_ = qm.lambda_monthly_from_annual(lambda_annual, periods_per_year=returns_per_year)
+    print(f"lambda_annual={lambda_annual:g} -> lambda mensual={lambda_:g} "
+          f"(x{returns_per_year}; ver M-8 en qu_metrics)")
 
 
 # ==============================================================================
@@ -273,15 +297,12 @@ def clean_symbol_table(tbl):
 # ==============================================================================
 # FUNCIONES AUXILIARES: Polygon.io
 # ==============================================================================
-import re
-
-
 def is_us_ticker(ticker):
     return not re.search(r"\.(TO|DE|L|PA|MC|T)$", ticker)
 
 
 def polygon_format_ticker(ticker):
-    return ticker.replace("-", ".")
+    return pc.polygon_format_ticker(ticker)
 
 
 def polygon_get_atm_option(ticker, target_dte, dte_tol=10, api_key=None, contract_type="call"):
@@ -426,9 +447,10 @@ def bkm_iv_chain_to_prices(S, r, T, chain_df):
 
 
 def bkm_compute_moments(S, r, T, calls_df, puts_df):
+    vacio = dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, motivo="pocas_opciones_otm")
     if calls_df is None or puts_df is None or len(calls_df) < bkm_min_options_per_side \
             or len(puts_df) < bkm_min_options_per_side or T <= 0 or S <= 0:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+        return vacio
 
     calls_df = calls_df.sort_values("strike")
     puts_df = puts_df.sort_values("strike")
@@ -443,25 +465,31 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     fP_X = (12 * np.log(S / Kp) ** 2 + 4 * np.log(S / Kp) ** 3) / Kp ** 2 * Pp
 
     try:
-        V = np.trapezoid(fC_V, Kc) + np.trapezoid(fP_V, Kp)
-        W = np.trapezoid(fC_W, Kc) - np.trapezoid(fP_W, Kp)
-        X = np.trapezoid(fC_X, Kc) + np.trapezoid(fP_X, Kp)
-    except Exception:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+        # rk.trapezoid cubre numpy 1.x y 2.x. Un AttributeError de np.trapezoid
+        # caia en este except y mandaba a TODOS los tickers al fallback (A-1).
+        V = rk.trapezoid(fC_V, Kc) + rk.trapezoid(fP_V, Kp)
+        W = rk.trapezoid(fC_W, Kc) - rk.trapezoid(fP_W, Kp)
+        X = rk.trapezoid(fC_X, Kc) + rk.trapezoid(fP_X, Kp)
+    except Exception as exc:
+        vacio["motivo"] = f"integracion_fallida ({type(exc).__name__})"
+        return vacio
 
     erT = math.exp(r * T)
     mu = erT - 1 - erT / 2 * V - erT / 6 * W - erT / 24 * X
     mfiv = erT * V - mu ** 2
     if not np.isfinite(mfiv) or mfiv <= 0:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+        vacio["motivo"] = "mfiv_no_positiva"
+        return vacio
 
     mfis = (erT * W - 3 * mu * erT * V + 2 * mu ** 3) / mfiv ** 1.5
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
+    motivo = None
     if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
         mfis, mfik = np.nan, np.nan
+        motivo = "momentos_inadmisibles (MFIV se conserva)"
 
-    return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True)
+    return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True, motivo=motivo)
 
 
 def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_hi, api_key=None):
@@ -474,117 +502,115 @@ def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_
         target_dte, api_key=api_key or POLYGON_API_KEY, strike_fmt="{:.4f}")
 
 def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
+    vacio = dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False,
+                 spot=np.nan, dte=np.nan, motivo="sin_spot")
     S = get_spot_safe_bkm(ticker)
     if pd.isna(S) or S <= 0:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, spot=np.nan)
+        return vacio
     calls_df, puts_df, info_cadena = bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S,
                                                          bkm_moneyness_lo, bkm_moneyness_hi)
-    T = target_dte / 365
+    if not info_cadena["completo"]:
+        vacio.update(spot=S, motivo=f"cadena_incompleta ({info_cadena['status']})",
+                     transitorio=pc.es_transitorio(info_cadena["status"]))
+        return vacio
+    dte = info_cadena.get("dte")
+    if dte is None or not np.isfinite(dte) or dte <= 0:
+        if calls_df is None or len(calls_df) == 0:
+            vacio.update(spot=S, motivo="sin_cadena_en_ventana_dte", transitorio=False)
+            return vacio
+        dte = target_dte
+    T = rk.to_years(dte=float(dte))
     calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df)
     puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df)
     mom = bkm_compute_moments(S, rf, T, calls_df, puts_df)
     mom["spot"] = S
+    mom["dte"] = int(dte)
     mom["expiracion"] = info_cadena["expiracion"]
-    mom["transitorio"] = (not info_cadena["completo"]) and pc.es_transitorio(info_cadena["status"])
+    mom["transitorio"] = False
     return mom
 
 
-def bkm_clave_historia(ticker, fecha, target_dte, moneyness_grid):
-    """Clave de cache de los datos de la rejilla BKM de un ticker en una fecha historica."""
-    grid = ",".join(f"{m:.4f}" for m in moneyness_grid)
-    return (f"mfis_hist_v1|{ticker}|{pd.Timestamp(fecha):%Y-%m-%d}|dte={target_dte}|grid={grid}"
-            f"|band=0.06|exp=12|win=5")
+def bkm_clave_historia(ticker, fecha, target_dte, dte_tol, moneyness_lo, moneyness_hi):
+    """Cache v2: banda de moneyness de la cadena en vivo, spot sin ajustar, DTE real."""
+    return (f"mfis_hist_v2|{ticker}|{pd.Timestamp(fecha):%Y-%m-%d}|dte={target_dte}|tol={dte_tol}"
+            f"|m={float(moneyness_lo):.2f}-{float(moneyness_hi):.2f}|spot=unadj")
 
 
-def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, moneyness_grid,
-                    strike_band=0.06, expiration_band_days=12):
-    """Strikes y precios de la rejilla en una fecha historica.
+def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi):
+    """Strikes y precios OTM reales en una fecha historica (A-5).
 
-    Devuelve (datos, definitivo) con datos = {"S", "calls": [[K, precio]], "puts": [...]},
-    o None si no hay spot. Para cada punto de la rejilla se elige el contrato con el
-    mismo criterio de antes: strike dentro de +/- strike_band del objetivo, menor
-    distancia de strike y luego de vencimiento. En cuanto un lado ya no puede reunir
-    bkm_min_options_per_side precios, la fecha no puede ser valida y se deja de consultar.
+    Misma seleccion que la cadena en vivo (qm.select_historical_otm): un
+    vencimiento, calls K>=S y puts K<S, moneyness en [lo, hi]. El spot es el
+    cierre sin ajustar, en las mismas unidades que el strike. Devuelve
+    (datos, definitivo) con datos = {"S", "dte", "calls": [[K, precio]], "puts"}.
     """
     spot_row = spot_series[spot_series["date"] <= fecha_i].sort_values("date", ascending=False)
     if spot_row.empty:
         return None, True
-    S_i = float(spot_row.iloc[0]["adjusted"])
-    exp_target = fecha_i + timedelta(days=target_dte)
-    exp_min = (exp_target - timedelta(days=expiration_band_days)).strftime("%Y-%m-%d")
-    exp_max = (exp_target + timedelta(days=expiration_band_days)).strftime("%Y-%m-%d")
+    S_i = float(spot_row.iloc[0]["close"])
+    exp_target = fecha_i + timedelta(days=int(target_dte))
+    exp_min = (exp_target - timedelta(days=int(dte_tol))).strftime("%Y-%m-%d")
+    exp_max = (exp_target + timedelta(days=int(dte_tol))).strftime("%Y-%m-%d")
 
-    datos = {"S": S_i, "calls": [], "puts": []}
     df_ct, definitivo = polygon_contracts_asof(
-        ticker, S_i * min(moneyness_grid) * (1 - strike_band), S_i * max(moneyness_grid) * (1 + strike_band),
+        ticker, S_i * moneyness_lo, S_i * moneyness_hi,
         exp_min, exp_max, fecha_i.strftime("%Y-%m-%d"))
+    vacio = {"S": S_i, "dte": None, "calls": [], "puts": []}
     if df_ct.empty:
+        return vacio, definitivo
+    elegido = qm.select_historical_otm(
+        df_ct, S_i, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi)
+    datos = {"S": S_i, "dte": elegido["dte"], "calls": [], "puts": []}
+    if elegido["dte"] is None:
         return datos, definitivo
-    df_ct["d_exp"] = (pd.to_datetime(df_ct["expiration_date"]) - exp_target).abs().dt.days
+    if (len(elegido["calls"]) < bkm_min_options_per_side
+            or len(elegido["puts"]) < bkm_min_options_per_side):
+        return datos, definitivo
 
-    puntos = []
-    for m in moneyness_grid:
-        tipo = "call" if m >= 1.0 else "put"
-        K = S_i * m
-        cand = df_ct[(df_ct["contract_type"] == tipo)
-                     & (df_ct["strike_price"] >= K * (1 - strike_band))
-                     & (df_ct["strike_price"] <= K * (1 + strike_band))]
-        if cand.empty:
-            puntos.append((K, tipo, None))
-            continue
-        cand = cand.assign(d_strike=(cand["strike_price"] - K).abs()).sort_values(["d_strike", "d_exp"])
-        puntos.append((K, tipo, cand.iloc[0]["ticker"]))
-
-    posibles = {t: sum(1 for _, tp, ct in puntos if tp == t and ct is not None) for t in ("call", "put")}
-    for K, tipo, ct in puntos:
-        if min(posibles.values()) < bkm_min_options_per_side:
-            break
-        if ct is None:
-            continue
-        px, ok_def = polygon_contract_close_near(ct, fecha_i)
-        definitivo = definitivo and ok_def
-        if pd.isna(px) or px <= 0:
-            posibles[tipo] -= 1
-            continue
-        datos["calls" if tipo == "call" else "puts"].append([K, float(px)])
+    for lado in ("calls", "puts"):
+        for contrato in elegido[lado]:
+            px, ok_def = polygon_contract_close_near(contrato["ticker"], fecha_i)
+            definitivo = definitivo and ok_def
+            if pd.isna(px) or px <= 0:
+                continue
+            datos[lado].append([float(contrato["strike"]), float(px)])
     return datos, definitivo
 
 
-def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, moneyness_grid, rf,
-                                 min_validos=None):
-    """MFIS historico en cada fecha de muestreo.
-
-    Los datos de cada fecha se guardan en la cache de disco en cuanto son
-    definitivos, asi que las corridas siguientes solo consultan fechas nuevas.
-    Si con las fechas restantes ya no se alcanza min_validos, se detiene: el
-    resultado seria "muestra_insuficiente" de todas formas.
-    """
+def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, dte_tol,
+                                 moneyness_lo, moneyness_hi, rf, min_validos=None):
+    """MFIS historico. Cada fecha usa el DTE real de su vencimiento, no target_dte/365."""
     mfis_hist = [np.nan] * len(sample_dates)
-    T_i = target_dte / 365
     validos = 0
     for i, fecha_i in enumerate(sample_dates):
         if min_validos is not None and validos + (len(sample_dates) - i) < min_validos:
             break
         fecha_i = pd.Timestamp(fecha_i)
-        clave = bkm_clave_historia(ticker, fecha_i, target_dte, moneyness_grid)
+        clave = bkm_clave_historia(ticker, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi)
         datos = pc.cache_get(clave)
         if datos is None:
             if spot_series is None:
                 continue
-            datos, definitivo = bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, moneyness_grid)
+            datos, definitivo = bkm_datos_fecha(
+                ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi)
             if datos is None:
                 continue
             if definitivo:
                 pc.cache_set(clave, datos)
 
+        dte_i = datos.get("dte")
+        if dte_i is None or not np.isfinite(dte_i) or dte_i <= 0:
+            continue
         calls_df = pd.DataFrame(datos["calls"], columns=["strike", "price"])
         puts_df = pd.DataFrame(datos["puts"], columns=["strike", "price"])
-        mom = bkm_compute_moments(datos["S"], rf, T_i, calls_df, puts_df)
+        mom = bkm_compute_moments(datos["S"], rf, rk.to_years(dte=float(dte_i)), calls_df, puts_df)
         if mom["ok"]:
             mfis_hist[i] = mom["mfis"]
             if np.isfinite(mom["mfis"]):
                 validos += 1
     return np.array(mfis_hist)
+
+
 
 sector_keywords = {
     "XLK": ["SEMICONDUCTOR", "COMPUTER", "SOFTWARE", "ELECTRONIC COMPONENTS", "COMPUTER PROGRAMMING", "COMPUTER PERIPHERAL"],
@@ -636,15 +662,24 @@ if sp500_tbl is None:
     print("Reintentando con slickcharts.com como fuente alterna...")
     sp500_tbl = safe_scrape_table("https://www.slickcharts.com/sp500")
 
+sp500_caps = {}
 if sp500_tbl is not None:
     sp500_tbl_clean = clean_symbol_table(sp500_tbl)
+    sp500_components = set(sp500_tbl_clean["symbol"].astype(str).str.upper())
+    if "market_cap" in sp500_tbl_clean.columns:
+        for sym, cap in zip(sp500_tbl_clean["symbol"], sp500_tbl_clean["market_cap"]):
+            cap_num = _parse_market_cap(cap)
+            if pd.notna(cap_num) and cap_num > 0:
+                sp500_caps[str(sym).upper()] = float(cap_num)
     sp500_tickers = sp500_tbl_clean["symbol"].iloc[: min(n_top_sp500, len(sp500_tbl_clean))].unique().tolist()
     print(f"S&P 500: {n_top_sp500} tickers objetivo, {len(sp500_tickers)} unicos obtenidos "
-          f"(ordenados por market cap real, stockanalysis.com)")
+          f"(ordenados por market cap real, stockanalysis.com); "
+          f"constituyentes conocidos {len(sp500_components)}, con cap {len(sp500_caps)}")
 else:
     sp500_tickers = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "BRK-B", "LLY", "AVGO",
                       "TSLA", "JPM", "UNH", "V", "XOM", "MA", "JNJ", "PG", "COST", "HD"]
-    print("ADVERTENCIA: Scraping fallo en ambas fuentes - usando fallback S&P 500 (20 tickers hardcodeados)")
+    sp500_components = set(sp500_tickers)
+    print("ADVERTENCIA: Scraping fallo en ambas fuentes - usando fallback S&P 500 (20 tickers hardcodeados, sin caps)")
 
 # ==============================================================================
 # OBTENER TICKERS: NASDAQ
@@ -747,15 +782,20 @@ ticker_currency_by_suffix = {
     ".L": "GBP",
     ".T": "JPY",
 }
-ticker_currency_override = {
-    "HSBC": "GBP",
-    "BP": "GBP",
-}
+# Vacio a proposito (A-2). HSBC y BP son ADRs en USD; un override que
+# contradiga al proveedor se registra y no se aplica. Sirve para forzar una
+# moneda solo cuando yfinance no informa ninguna.
+ticker_currency_override = {}
+provider_currency = {}
+ticker_currency = {}
 
 
 def get_currency_for_ticker(ticker):
-    if ticker in ticker_currency_override:
-        return ticker_currency_override[ticker]
+    if ticker in ticker_currency:
+        return ticker_currency[ticker]
+    manual = ticker_currency_override.get(ticker)
+    if manual is not None:
+        return md.normalize_currency(manual)
     for suf, cur in ticker_currency_by_suffix.items():
         if ticker.endswith(suf):
             return cur
@@ -841,13 +881,30 @@ def download_period_returns(tickers, start, end, period="1mo", fx_prices=None):
     n_convertidos = 0
     for i, tk in enumerate(tickers, start=1):
         try:
-            hist = yf.Ticker(tk).history(start=start, end=end, interval=period, auto_adjust=True)
+            yf_tk = yf.Ticker(tk)
+            hist = yf_tk.history(start=start, end=end, interval=period, auto_adjust=True)
             if hist is None or hist.empty:
                 continue
             hist = hist[["Close"]].rename(columns={"Close": "adjusted"})
             hist.index = pd.to_datetime(hist.index).tz_localize(None)
 
-            cur = get_currency_for_ticker(tk)
+            # Moneda del proveedor (A-2). GBp/ZAc se pasan a libras/rand antes
+            # del FX; el factor es constante y no cambia el retorno.
+            meta = getattr(yf_tk, "history_metadata", None) or {}
+            cur_prov = meta.get("currency")
+            if cur_prov:
+                provider_currency[tk] = cur_prov
+            hist["adjusted"] = hist["adjusted"] * md.price_scale_factor(cur_prov)
+            cur_map, conflictos = md.resolve_currencies(
+                [tk], ticker_currency_by_suffix,
+                overrides=ticker_currency_override,
+                provider={tk: cur_prov} if cur_prov else {},
+            )
+            ticker_currency[tk] = cur_map[tk]
+            for c in conflictos:
+                print(f"   ADVERTENCIA moneda {c['ticker']}: {c['fuente']} {c['manual']} "
+                      f"contradice al proveedor {c['proveedor']}; se usa {c['proveedor']}")
+            cur = ticker_currency[tk]
             if cur != "USD" and fx_prices is not None and cur in fx_prices:
                 fx_aligned = fx_prices[cur].reindex(
                     fx_prices[cur].index.union(hist.index)
@@ -872,8 +929,8 @@ def download_period_returns(tickers, start, end, period="1mo", fx_prices=None):
     return pd.concat(all_rows, ignore_index=True)
 
 
-start_date = f"{min(target_years)}-01-01"
-end_date = f"{max(target_years) + 1}-12-31"
+start_date = history_start
+end_date = history_end
 
 print("Descargando pares FX (mensual) para conversion a USD...")
 fx_prices_monthly = download_fx_prices(start_date, end_date, period="1mo")
@@ -970,15 +1027,10 @@ else:
 returns_wide = df_prices.pivot_table(index="date", columns="symbol", values="monthly_return")
 cor_matrix_full = returns_wide.corr(min_periods=1)
 
-cor_matrix_stack = cor_matrix_full.rename_axis(index="Var1", columns="Var2")
-corr_pairs = cor_matrix_stack.stack().reset_index()
-corr_pairs.columns = ["Var1", "Var2", "Freq"]
-corr_pairs = corr_pairs[corr_pairs["Var1"].astype(str) < corr_pairs["Var2"].astype(str)]
-
+# Fila completa, diagonal fuera (M-5). El agrupado Var1 < Var2 dejaba al
+# ultimo ticker alfabetico sin pares.
 avg_cor_by_ticker = (
-    corr_pairs.assign(abs_freq=corr_pairs["Freq"].abs())
-    .groupby("Var1")["abs_freq"].mean().reset_index()
-    .rename(columns={"Var1": "symbol", "abs_freq": "avg_cor"})
+    qm.average_abs_correlation(cor_matrix_full).rename("avg_cor").rename_axis("symbol").reset_index()
 )
 
 # ==============================================================================
@@ -987,8 +1039,7 @@ avg_cor_by_ticker = (
 print("Descargando datos Fama-French...")
 try:
     ff_raw = pdr.DataReader("F-F_Research_Data_Factors", "famafrench",
-                             start=f"{min(target_years)}-01-01",
-                             end=f"{max(target_years)}-12-31")[0]
+                             start=history_start, end=history_end)[0]
     ff_raw = ff_raw.copy()
     ff_raw.index = ff_raw.index.to_timestamp()
     ff_raw = ff_raw.rename(columns={"Mkt-RF": "Mkt-RF", "SMB": "SMB", "HML": "HML"})
@@ -997,7 +1048,7 @@ try:
         cutoff_date = ff_raw.index.max() - relativedelta(months=lookback_months - 1)
         ff_raw = ff_raw[ff_raw.index >= cutoff_date]
     ff_raw = ff_raw / 100.0
-    ff_data = ff_raw[["Mkt-RF", "SMB", "HML"]]
+    ff_data = ff_raw[["Mkt-RF", "SMB", "HML", "RF"]]
 except Exception as e:
     print(f"Error con Fama-French ({e}). Continuando sin ellos.")
     ff_data = None
@@ -1013,9 +1064,6 @@ if ff_data is not None:
 
     df_prices_m = df_prices.copy()
     df_prices_m["period"] = df_prices_m["date"].dt.to_period("M")
-    df_prices_m = df_prices_m.merge(benchmark_prices.assign(period=benchmark_prices["date"].dt.to_period("M")),
-                                     on="period", how="left", suffixes=("", "_bench"))
-    df_prices_m["excess_return"] = df_prices_m["monthly_return"] - rf_rate_period
     df_prices_m = df_prices_m[df_prices_m["period"].isin(ff_data_m_reset["period"])]
 
     rows = []
@@ -1027,6 +1075,8 @@ if ff_data is not None:
             if len(merged) < 3:
                 continue
             try:
+                # Exceso contra la RF del propio mes de Fama-French (B-8), no una tasa constante.
+                merged["excess_return"] = merged["monthly_return"] - merged["RF"]
                 X = sm.add_constant(merged[["Mkt-RF", "SMB", "HML"]])
                 y = merged["excess_return"]
                 model = sm.OLS(y, X, missing="drop").fit()
@@ -1060,11 +1110,9 @@ combined_stats = combined_stats.merge(
 )
 combined_stats["avg_cor"] = combined_stats["avg_cor"].fillna(combined_stats["avg_cor"].median())
 combined_stats["ff_expected_return"] = combined_stats["ff_expected_return"].fillna(combined_stats["mean_return"])
-combined_stats["adjusted_return"] = np.where(
-    combined_stats["ff_expected_return"].notna(),
-    (combined_stats["mean_return"] + combined_stats["ff_expected_return"]) / 2,
-    combined_stats["mean_return"],
-)
+combined_stats["adjusted_return"] = (
+    combined_stats["mean_return"] + combined_stats["ff_expected_return"]
+) / 2
 combined_stats["sharpe_ratio_adjusted"] = (
     (combined_stats["adjusted_return"] - rf_rate_period) / combined_stats["sd_return"]
 )
@@ -1200,34 +1248,8 @@ def select_optimal_candidates(df, n_candidates):
     return selected
 
 
-ticker_candidates = select_optimal_candidates(combined_stats, n_pre_seasonal)
-print(f"\nPool pre-filtro estacional: {len(ticker_candidates)} candidatos\n")
-
-# ==============================================================================
-# FILTRO ESTACIONAL (primera pasada, informativa)
-# ==============================================================================
-print(f"Aplicando filtro estacional ({horizon_label})...")
-
-seasonal_candidates = (
-    seasonal_sd_stats[seasonal_sd_stats["symbol"].isin(ticker_candidates)]
-    .sort_values("seasonal_sd").head(n_divers_candidates)
-)
-
-n_con_seasonal = len(seasonal_candidates)
-print(f"Candidatos previos: {len(ticker_candidates)} | Con SD estacional: {n_con_seasonal} | "
-      f"Seleccionados: {n_con_seasonal}")
-
-if n_con_seasonal < n_divers_candidates * 0.5:
-    print(f"Advertencia: solo {n_con_seasonal} tickers sobrevivieron el filtro estacional.")
-
-seasonal_display = seasonal_candidates.merge(
-    combined_stats[["symbol", "sharpe_ratio_adjusted", "sd_return", "n_obs"]], on="symbol", how="left"
-)
-print(seasonal_display.to_string(index=False))
-
-ticker_candidates = seasonal_candidates["symbol"].tolist()
-print(f"\nConjunto FINAL para optimizacion: {len(ticker_candidates)} tickers\n")
-
+# Una sola pasada QUBO (M-13). La primera llamada y el filtro estacional que
+# la seguia se sobreescribian de inmediato con esta misma seleccion.
 ticker_candidates = select_optimal_candidates(combined_stats, n_pre_seasonal)
 print(f"\nPool pre-filtro estacional: {len(ticker_candidates)} candidatos\n")
 
@@ -1461,9 +1483,11 @@ def evaluar_bkm_activo(ticker):
     mom_actual = bkm_get_current_moments(ticker, target_dte_polygon, polygon_dte_tol, rf_rate)
     bkm_current_moments[ticker] = mom_actual
     if not mom_actual["ok"]:
-        return dict(symbol=ticker, decision="mantener", motivo="sin_mfis_actual", z=np.nan)
+        return dict(symbol=ticker, decision="mantener",
+                    motivo=mom_actual.get("motivo") or "sin_mfis_actual", z=np.nan)
     if not np.isfinite(mom_actual["mfis"]):
-        return dict(symbol=ticker, decision="mantener", motivo="mfis_inadmisible", z=np.nan)
+        return dict(symbol=ticker, decision="mantener",
+                    motivo=mom_actual.get("motivo") or "mfis_inadmisible", z=np.nan)
 
     if omitir_historia_bkm:
         return dict(symbol=ticker, decision="mantener", motivo="historia_omitida_por_tiempo", z=np.nan)
@@ -1473,17 +1497,19 @@ def evaluar_bkm_activo(ticker):
         try:
             start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
             end_sk = hoy_ts.strftime("%Y-%m-%d")
-            hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=True)
+            # Cierre sin ajustar: el strike de la opcion no esta ajustado por dividendos (A-5).
+            hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=False)
             if hist is None or hist.empty or len(hist) < 20:
                 return dict(symbol=ticker, decision="mantener", motivo="sin_precio_historico", z=np.nan)
-            spot_series_tk = hist[["Close"]].rename(columns={"Close": "adjusted"}).reset_index()
+            spot_series_tk = hist[["Close"]].rename(columns={"Close": "close"}).reset_index()
             spot_series_tk = spot_series_tk.rename(columns={"Date": "date"})
             spot_series_tk["date"] = pd.to_datetime(spot_series_tk["date"]).dt.tz_localize(None)
         except Exception:
             return dict(symbol=ticker, decision="mantener", motivo="sin_precio_historico", z=np.nan)
 
     hist_mfis = bkm_reconstruct_mfis_history(
-        ticker, spot_series_tk, sample_dates_bkm, target_dte_polygon, bkm_hist_moneyness_grid, rf_rate,
+        ticker, spot_series_tk, sample_dates_bkm, target_dte_polygon, polygon_dte_tol,
+        bkm_moneyness_lo, bkm_moneyness_hi, rf_rate,
         min_validos=bkm_hist_min_valid,
     )
     hist_mfis_validos = hist_mfis[~np.isnan(hist_mfis)]
@@ -1497,31 +1523,42 @@ def evaluar_bkm_activo(ticker):
         return dict(symbol=ticker, decision="mantener", motivo="sd_hist_invalida", z=np.nan)
 
     z = (mom_actual["mfis"] - media_hist) / sd_hist
-
-    if np.isfinite(z) and z > bkm_z_threshold:
-        return dict(symbol=ticker, decision="descartar", motivo="cobertura_anomala", z=z)
-    else:
-        return dict(symbol=ticker, decision="mantener", motivo="normal_o_especulativo", z=z)
+    decision, motivo = qm.mfis_tail_decision(z, bkm_z_threshold, bkm_tail_mode)
+    return dict(symbol=ticker, decision=decision, motivo=motivo, z=z)
 
 
 def bkm_fechas_pendientes(ticker):
-    """Fechas de muestreo cuyos datos aun no estan en la cache de disco."""
-    return sum(1 for f in sample_dates_bkm
-               if pc.cache_get(bkm_clave_historia(ticker, f, target_dte_polygon, bkm_hist_moneyness_grid)) is None)
+    """Fechas de muestreo cuyos datos aun no estan en la cache de disco (clave v2)."""
+    return sum(
+        1 for f in sample_dates_bkm
+        if pc.cache_get(bkm_clave_historia(
+            ticker, f, target_dte_polygon, polygon_dte_tol, bkm_moneyness_lo, bkm_moneyness_hi)) is None
+    )
 
 
-# Estimacion previa: 1 consulta de contratos + hasta 7 cierres por fecha pendiente,
-# mas la cadena actual (calls y puts). Solo aplica si hay tope de llamadas por minuto.
+# Presupuesto (A-5): 2 llamadas de cadena actual por ticker, mas 1 lista de
+# contratos y ~bkm_hist_contracts_estimate cierres por fecha pendiente.
+# pc.estimate_minutes usa POLYGON_CALLS_PER_MIN. La rejilla de 7 puntos
+# subestimaba este costo; con la cadena completa una cache fria puede superar
+# bkm_hist_max_minutes y omitir el z-score (el momento actual se calcula igual).
 n_fechas_pendientes = sum(bkm_fechas_pendientes(t) for t in ticker_candidates)
-llamadas_estimadas = 2 * len(ticker_candidates) + (1 + len(bkm_hist_moneyness_grid)) * n_fechas_pendientes
+llamadas_estimadas = qm.estimate_bkm_history_calls(
+    len(ticker_candidates), n_fechas_pendientes, bkm_hist_contracts_estimate)
 minutos_estimados = pc.estimate_minutes(llamadas_estimadas)
 omitir_historia_bkm = minutos_estimados is not None and minutos_estimados > bkm_hist_max_minutes
-print(f"   Fechas pendientes (no cacheadas): {n_fechas_pendientes} de "
+print(f"   Cola MFIS: {bkm_tail_mode} | umbral |z|={bkm_z_threshold:.2f} "
+      f"(upper=demanda de calls, lower=demanda de puts)")
+print(f"   Fechas pendientes (no cacheadas, clave v2): {n_fechas_pendientes} de "
       f"{len(sample_dates_bkm) * len(ticker_candidates)} | llamadas estimadas: ~{llamadas_estimadas}"
-      + (f" | tiempo minimo: ~{minutos_estimados:.0f} min" if minutos_estimados is not None else ""))
+      f" (~{bkm_hist_contracts_estimate} contratos/fecha)"
+      + (f" | tiempo minimo: ~{minutos_estimados:.0f} min a {pc.CALLS_PER_MIN:g}/min"
+         if minutos_estimados is not None and pc.CALLS_PER_MIN
+         else " | sin tope de llamadas, no se convierte a minutos"))
 if omitir_historia_bkm:
     print(f"   ADVERTENCIA: la estimacion supera bkm_hist_max_minutes ({bkm_hist_max_minutes} min) - se omite")
     print("   la comparacion historica del MFIS en esta corrida (los momentos BKM actuales si se calculan).")
+    print("   Sube POLYGON_CALLS_PER_MIN si el plan lo permite, o bkm_hist_max_minutes; la cache v2")
+    print("   hace que la corrida siguiente solo pague las fechas nuevas.")
 
 full_set = list(ticker_candidates)
 resultados_log = []
@@ -1566,6 +1603,13 @@ while True:
 bkm_log_df = pd.DataFrame(resultados_log)
 n_descartados_bkm = (bkm_log_df["decision"] == "descartar").sum() if len(bkm_log_df) else 0
 print(f"\n   Evaluados: {len(bkm_log_df)} | Descartados por MFIS: {n_descartados_bkm} | Repuestos: {i_reponer}")
+if len(bkm_log_df):
+    print("\n   COBERTURA BKM POR TICKER (A-1)")
+    conteo = bkm_log_df["motivo"].fillna("(sin motivo)").value_counts()
+    for motivo, n in conteo.items():
+        print(f"      {n:4d}  {motivo}")
+    cols_bkm = [c for c in ("symbol", "decision", "motivo", "z") if c in bkm_log_df.columns]
+    print(bkm_log_df[cols_bkm].to_string(index=False))
 
 if len(full_set) < bkm_min_survivors:
     print(f"   Advertencia: solo {len(full_set)} tickers tras filtro BKM "
@@ -1585,14 +1629,21 @@ df_wide = (
     df_prices[df_prices["symbol"].isin(ticker_candidates)]
     .pivot_table(index="date", columns="symbol", values="monthly_return")
     .sort_index()
-    .dropna()
 )
+# Longitud minima por ticker (M-1). dropna() recortaba todo el panel al que
+# tenia la historia mas corta y esa ventana comun entraba en la media.
+df_wide, dropped_short = qm.columns_with_min_obs(df_wide, min_observations)
+if dropped_short:
+    print(f"   Activos fuera del panel por menos de {min_observations} meses: {', '.join(map(str, dropped_short))}")
 
 dates = df_wide.index
 ticker_candidates = list(df_wide.columns)
 df_xts = df_wide.copy()
-
-print(f"Matriz de retornos: {df_xts.shape[0]} observaciones x {df_xts.shape[1]} activos")
+n_por_ticker = df_xts.notna().sum()
+print(f"Matriz de retornos: {df_xts.shape[0]} fechas x {df_xts.shape[1]} activos | "
+      f"historia por ticker {int(n_por_ticker.min()) if len(n_por_ticker) else 0}-"
+      f"{int(n_por_ticker.max()) if len(n_por_ticker) else 0} meses | "
+      f"interseccion {len(df_xts.dropna())} meses (no se usa para la media)")
 
 # ==============================================================================
 # MEDIA
@@ -1614,6 +1665,8 @@ iv_cap_multiplier = iv_outlier_multiplier
 print("\nEstimando covarianza robusta: Shrinkage MFIV (BKM) + Historica...")
 print(f"   Tenor objetivo: {target_dte_polygon} dias (consistente con horizonte de rebalanceo) | "
       f"Cap IV: {iv_cap_multiplier:.1f}x vol historica")
+print("   La vol anual de MFIV usa el DTE real del vencimiento elegido, no target_dte/365. "
+      "T_bkm queda solo para el camino SVIX.")
 
 T_bkm = target_dte_polygon / 365
 
@@ -1622,7 +1675,7 @@ for a in assets:
     mom_a = bkm_current_moments.get(a)
     if mom_a is not None and mom_a.get("ok") and mom_a.get("mfiv", np.nan) > 0:
         vol_hist_a = df_prices.loc[df_prices["symbol"] == a, "monthly_return"].std() * math.sqrt(12)
-        vol_mfiv_annual_a = math.sqrt(mom_a["mfiv"] / T_bkm)
+        vol_mfiv_annual_a = qm.mfiv_annual_vol(mom_a["mfiv"], mom_a.get("dte", target_dte_polygon))
         iv_cap_a = vol_hist_a * iv_cap_multiplier
         if np.isfinite(iv_cap_a) and vol_mfiv_annual_a <= iv_cap_a:
             iv_assets_implied[a] = vol_mfiv_annual_a
@@ -1658,7 +1711,7 @@ print(f"   IV final - Min: {iv_final.min() * 100:.1f}% | Mediana: {np.median(iv_
 
 mom_spy = bkm_get_current_moments("SPY", target_dte_polygon, polygon_dte_tol, rf_rate)
 if mom_spy["ok"] and mom_spy["mfiv"] > 0:
-    iv_spy_implied = math.sqrt(mom_spy["mfiv"] / T_bkm)
+    iv_spy_implied = qm.mfiv_annual_vol(mom_spy["mfiv"], mom_spy.get("dte", target_dte_polygon))
 else:
     print("   Sin MFIV de mercado para SPY - usando vol historica mensual")
     iv_spy_implied = benchmark_prices["benchmark_return"].std() * math.sqrt(12)
@@ -1722,9 +1775,16 @@ if use_daily_cov:
         fx_prices_daily = download_fx_prices(start_date, end_date, period="1d")
         df_daily = download_period_returns(assets, start_date, end_date,
                                            period="1d", fx_prices=fx_prices_daily)
-        daily_wide = (df_daily.pivot_table(index="date", columns="symbol", values="return")
-                      .sort_index())
-        daily_wide = daily_wide.reindex(columns=assets).dropna()
+        price_wide = (df_daily.pivot_table(index="date", columns="symbol", values="adjusted")
+                      .sort_index().reindex(columns=assets))
+        ref = price_wide.notna().sum().idxmax() if price_wide.shape[1] else None
+        calendar = price_wide.index[price_wide[ref].notna()] if ref is not None else price_wide.index[:0]
+        aligned_px, align_info = md.align_prices_to_calendar(
+            price_wide, calendar, max_ffill=2, min_coverage=0.80)
+        print(f"   Alineacion diaria (ffill<=2, calendario={ref}): "
+              f"{align_info['n_rows']} dias, rellenos={int(align_info['n_filled'].sum())}, "
+              f"baja cobertura={align_info['dropped_low_coverage'] or 'ninguno'}")
+        daily_wide = aligned_px.pct_change().iloc[1:].dropna(how="any")
         print(f"   Retornos diarios alineados: {daily_wide.shape[0]} dias x {daily_wide.shape[1]} activos")
 
         if daily_wide.shape[1] == len(assets) and len(daily_wide) >= 120:
@@ -1746,13 +1806,26 @@ if use_daily_cov:
         print(f"   ADVERTENCIA Fallo la descarga diaria ({e})")
 
 if Sigma_hist is None:
-    Sigma_hist = df_xts[assets].cov().values * 12
-    print("   COVARIANZA: muestral mensual anualizada (fallback)")
+    Sigma_pair, _ = qm.covariance_min_history(df_xts[assets], min_observations)
+    Sigma_hist = np.asarray(rk.nearest_psd(Sigma_pair, eps_rel=1e-8), dtype=float) * returns_per_year
+    print("   COVARIANZA: muestral mensual por pares, anualizada (fallback; cada serie usa su historia)")
 
 # ==============================================================================
 # CORRELACION IMPLICITA GLOBAL VIA DISPERSION DE SPY
 # ==============================================================================
-w_disp = np.repeat(1 / n_assets, n_assets)
+has_iv_disp = {a for a, v in iv_assets_implied.items() if v is not None and np.isfinite(v)}
+w_disp_s, disp_info = qm.dispersion_weights(assets, has_iv_disp, sp500_components, sp500_caps)
+w_disp = w_disp_s.to_numpy(dtype=float)
+print(f"   Cesta de dispersion (M-10): {disp_info['mode']} | {disp_info['n']} componentes de SPY con MFIV")
+if disp_info["mode"] == "equal":
+    print("   Falta capitalizacion para "
+          + ", ".join(map(str, disp_info["missing_caps"][:8]))
+          + ": la cesta queda equiponderada.")
+elif disp_info["mode"] == "insuficiente":
+    print("   Cesta con menos de 2 nombres: se usara la correlacion realizada.")
+elif disp_info["n"] < n_assets:
+    print(f"   Quedan fuera ETFs, internacionales y nombres sin MFIV "
+          f"({n_assets - disp_info['n']} de {n_assets}).")
 sigma_i = iv_final
 sigma_i_q = iv_final_q
 
@@ -1798,7 +1871,7 @@ sector_etf_iv = {etf: np.nan for etf in etf_sectoriales}
 for etf in etf_sectoriales:
     mom_etf = bkm_get_current_moments(etf, target_dte_polygon, polygon_dte_tol, rf_rate)
     if mom_etf["ok"] and mom_etf["mfiv"] > 0:
-        sector_etf_iv[etf] = math.sqrt(mom_etf["mfiv"] / T_bkm)
+        sector_etf_iv[etf] = qm.mfiv_annual_vol(mom_etf["mfiv"], mom_etf.get("dte", target_dte_polygon))
 
 for etf in etf_sectoriales:
     stocks_sector = [t for t in assets if sector_map.get(t) == etf]
@@ -2079,11 +2152,18 @@ ret_opt = float(np.sum(w_vec * mu))
 sd_opt = float(np.sqrt(w_vec @ cov_mat @ w_vec))
 sharpe_opt = (ret_opt - rf_rate_period) / sd_opt
 utility_opt = ret_opt - (lambda_ / 2) * (sd_opt ** 2)
+_terms = qm.utility_terms(float(np.sum(w_vec * mu_final)), float(w_vec @ cov_mat @ w_vec), lambda_)
+_ratio_pen = _terms["risk_term"] / _terms["mu_term"] if _terms["mu_term"] else np.nan
+print("  Terminos en el optimo (mu que ve el optimizador, no el mu crudo del reporte):")
+print(f"    mu'w = {_terms['mu_term']:.6f} | lambda/2 w'Sigma w = {_terms['risk_term']:.6f} "
+      f"| penalizacion/retorno = {_ratio_pen:.3f}")
+if lambda_annual is None and np.isfinite(_ratio_pen) and _ratio_pen < 0.05:
+    print("    La penalizacion es pequena frente al retorno. lambda_annual (opt-in) la escala x12;")
+    print("    el default no cambia. Ver el comentario de lambda_annual.")
 
 
 def portfolio_returns_series(returns_df, weights_series):
-    aligned = returns_df[weights_series.index].dropna()
-    return aligned.dot(weights_series)
+    return qm.portfolio_returns_skipna(returns_df, weights_series)
 
 
 portfolio_returns_full = portfolio_returns_series(df_xts[ticker_candidates], weights_opt)
@@ -2099,6 +2179,10 @@ mfis_w = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in a
 mfik_w = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])
 
 panel_source_qu = df_xts[assets].dropna()
+_obs_por_ticker = df_xts[assets].notna().sum()
+print(f"   Panel conjunto de co-momentos: {len(panel_source_qu)} meses (interseccion). "
+      f"Historia por ticker: min {_obs_por_ticker.min()} / mediana {_obs_por_ticker.median():.0f}. "
+      "La media y la covarianza no usan esta interseccion.")
 
 if len(panel_source_qu) >= panel_min_obs:
     Z_qu, _ = rk.standardized_panel(panel_source_qu)
@@ -2137,13 +2221,16 @@ else:
           "para el panel - VaR/CVaR Cornish-Fisher = NaN")
 
 benchmark_series = benchmark_prices.set_index("date")["benchmark_return"]
-df_with_bench = df_xts[ticker_candidates].join(benchmark_series.rename("benchmark"), how="inner").dropna()
-ticker_cols_in_bench = [c for c in df_with_bench.columns if c != "benchmark"]
-benchmark_aligned = df_with_bench["benchmark"]
-portfolio_returns_aligned = df_with_bench[ticker_cols_in_bench].dot(weights_opt[ticker_cols_in_bench])
+portfolio_returns_aligned = portfolio_returns_series(
+    df_xts[ticker_candidates], weights_opt
+).reindex(benchmark_series.index).dropna()
+benchmark_aligned = benchmark_series.reindex(portfolio_returns_aligned.index)
 tracking_error = (portfolio_returns_aligned - benchmark_aligned).std()
 relative_returns = portfolio_returns_aligned - benchmark_aligned
 relative_var = relative_returns.mean() - norm.ppf(0.95) * relative_returns.std()
+_n_inter = int(df_xts[ticker_candidates].dropna().shape[0])
+print(f"  Tracking error: {len(portfolio_returns_aligned)} meses alineados al benchmark "
+      f"(interseccion completa de tickers: {_n_inter}; un faltante ya no borra el mes).")
 
 pesos = (
     pd.DataFrame({"symbol": weights_opt.index, "weight": weights_opt.values})
@@ -2152,7 +2239,7 @@ pesos = (
     .reset_index(drop=True)
 )
 
-annualization_factor = 12
+_ann_opt = qm.annualize_monthly(mu=ret_opt, sd=sd_opt)
 
 downside_returns = portfolio_returns_full.values - rf_rate_monthly
 downside_neg = downside_returns[downside_returns < 0]
@@ -2195,9 +2282,9 @@ print(f"  CVaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%): {cvar_cf
 print(f"  Tracking Error:           {tracking_error * 100:.4f}%")
 print(f"  Relative VaR (95%):      {relative_var * 100:.4f}%")
 
-print("\n=== METRICAS ANUALIZADAS (x12) ===")
-print(f"  Retorno anual:     {ret_opt * annualization_factor * 100:.2f}%")
-print(f"  Volatilidad anual: {sd_opt * math.sqrt(annualization_factor) * 100:.2f}%")
+print(f"\n=== METRICAS ANUALIZADAS (retorno x{returns_per_year}, vol x sqrt({returns_per_year}); base {periodo_label}) ===")
+print(f"  Retorno anual:     {_ann_opt['mu'] * 100:.2f}%")
+print(f"  Volatilidad anual: {_ann_opt['sd'] * 100:.2f}%")
 
 # ==============================================================================
 # ATRIBUCION DE RIESGO POR GRIEGAS
@@ -2307,7 +2394,7 @@ y_max = max(returns_vals.max(), ret_opt) * 1.10
 fig = px.scatter(
     frontier_df, x="risk", y="ret", color="utility", opacity=0.35,
     color_continuous_scale="RdYlGn",
-    labels={"risk": f"Riesgo ({horizon_months} meses)", "ret": f"Retorno Esperado ({horizon_months} meses)",
+    labels={"risk": f"Riesgo ({periodo_label})", "ret": f"Retorno Esperado ({periodo_label})",
             "utility": f"Utilidad<br>(lambda={lambda_:.1f})"},
 )
 fig.update_traces(marker=dict(size=6), hovertemplate="Riesgo: %{x:.4f}<br>Retorno: %{y:.4f}<br>Utilidad: %{marker.color:.4f}<extra></extra>")
@@ -2396,8 +2483,9 @@ if len(results_comparison) > 0:
     print("RECOMENDACION BASADA EN UTILIDAD MAXIMA")
     print("=" * 70 + "\n")
     print(f"  lambda optimo para estos datos: {best_row['lambda_']:.1f}")
-    print(f"  - Retorno esperado: {best_row['retorno']:.2f}% ({best_row['retorno'] * (12 / horizon_months):.1f}% anual)")
-    print(f"  - Volatilidad: {best_row['volatilidad']:.2f}% ({best_row['volatilidad'] * math.sqrt(12 / horizon_months):.1f}% anual)")
+    _ann_best = qm.annualize_monthly(mu=best_row["retorno"] / 100.0, sd=best_row["volatilidad"] / 100.0)
+    print(f"  - Retorno esperado ({periodo_label}): {best_row['retorno']:.2f}% ({_ann_best['mu'] * 100:.1f}% anual)")
+    print(f"  - Volatilidad ({periodo_label}): {best_row['volatilidad']:.2f}% ({_ann_best['sd'] * 100:.1f}% anual)")
     print(f"  - Sharpe Ratio: {best_row['sharpe']:.3f}")
     print(f"  - Utilidad: {best_row['utilidad']:.4f} (maxima)")
     print(f"  - Activos en portafolio: {int(best_row['n_activos'])}")
@@ -2483,6 +2571,7 @@ yearly_mdd["has_data"] = yearly_mdd["mdd"].notna()
 yearly_mdd["n_obs"] = yearly_mdd["n_obs"].fillna(0)
 
 yearly_mdd_valid = yearly_mdd[yearly_mdd["has_data"] & np.isfinite(yearly_mdd["mdd"])]
+median_mdd = np.nan
 
 if len(yearly_mdd_valid) >= 1:
     print("\n=== ESTADISTICAS DE MDD ===")
@@ -2572,14 +2661,14 @@ print(f"   Periodo de entrenamiento: {min(target_years)}-{max(target_years)}")
 print(f"   Mes de ejecucion: {horizon_label}")
 print(f"   Activos en portafolio: {len(tickers_portfolio)}")
 print(f"   Retorno esperado mensual: {ret_opt * 100:.2f}%")
-print(f"   Retorno anualizado:       {ret_opt * annualization_factor * 100:.2f}%")
+print(f"   Retorno anualizado:       {_ann_opt['mu'] * 100:.2f}%")
 print(f"   Volatilidad mensual:      {sd_opt * 100:.2f}%")
-print(f"   Volatilidad anualizada:   {sd_opt * math.sqrt(annualization_factor) * 100:.2f}%")
+print(f"   Volatilidad anualizada:   {_ann_opt['sd'] * 100:.2f}%")
 print(f"   Sharpe Ratio:             {sharpe_opt:.4f}")
 print(f"   Sortino Ratio:            {sortino_opt:.4f}")
 print(f"   VaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%): {var_cf * 100:.4f}%")
 print(f"   CVaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%): {cvar_cf * 100:.4f}%")
-if "median_mdd" in dir():
+if np.isfinite(median_mdd):
     print(f"   MDD tipico historico:     {median_mdd * 100:.2f}%")
 
 print(f"\n--- PORTAFOLIO A EJECUTAR EN {MONTH_NAME[max(rebalance_months)].upper()} ---\n")
