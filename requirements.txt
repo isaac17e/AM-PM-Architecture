@@ -1,8 +1,7 @@
 # Dependencias que realmente importan los scripts del repositorio.
-# numpy >= 2.0: los optimizadores aun llaman np.trapezoid directamente
-# (risk_estimators.trapezoid ofrece el compat para numpy 1.x; la cota se
-# podra relajar cuando todos los scripts lo usen).
-numpy>=2.0
+# La integral BKM pasa por risk_estimators.trapezoid (np.trapezoid en
+# numpy >= 2, np.trapz en 1.x). Ningun script llama np.trapezoid directo.
+numpy>=1.24
 pandas>=2.0
 scipy>=1.10
 requests>=2.28

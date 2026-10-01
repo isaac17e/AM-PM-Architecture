@@ -25,6 +25,8 @@ from plotly.subplots import make_subplots
 
 import risk_estimators as rk
 import polygon_client as pc
+import market_data as md
+import bl_metrics as bm
 
 try:
     import statsmodels.api as sm
@@ -128,6 +130,20 @@ if not (0.0 < PESO_MAX_ETFS <= 1.0):
 Rf = 0.046
 
 # ------------------------------------------------------------------------------
+# DELTA DE MERCADO (M-12). Independiente del perfil.
+# "historical" es el comportamiento de siempre: exceso de ~2 anos / varianza,
+# ambos al horizonte. La media corta puede ser negativa y pi hereda el signo.
+# "fixed" usa DELTA_MKT_FIJO (rango habitual de aversion 2-4).
+# "implied" = var_Q de la cartera de mercado / var_P. La prima implicita es
+# la varianza neutral (Martin: el exceso del mercado es SVIX^2 = MFIV de
+# esa cartera) ya disponible en la cadena Q -> P. No es el default: ese
+# cociente suele quedar cerca de 1, no en 2.5, porque la prima ya esta en
+# unidades de varianza.
+# ------------------------------------------------------------------------------
+DELTA_MKT_MODO = "historical"
+DELTA_MKT_FIJO = 2.5
+
+# ------------------------------------------------------------------------------
 # 7. ANALISIS DE MAXIMUM DRAWDOWN (MDD)
 # ------------------------------------------------------------------------------
 MDD_START_YEAR = date.today().year - 2
@@ -158,7 +174,10 @@ MAX_PRIMA_HM_SIGMA = 0.35
 
 COTA_SKEW_P = (-2.5, 1.5)
 COTA_KURT_P = (1.8, 12.0)
-COTA_RATIO_VOL_P = (0.55, 1.25)
+# Misma cota que vrp_ratio_bounds de MV/QU y que rk.q_to_p_vol (B-9).
+# hi = 1.0 impone el signo del VRP: la vol fisica no supera a la implicita.
+# Antes (0.55, 1.25) dejaba sigma_P > sigma_Q, al reves que el resto del repo.
+COTA_RATIO_VOL_P = (0.70, 1.00)
 
 # ------------------------------------------------------------------------------
 # COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF
@@ -187,6 +206,10 @@ NIVELES_CVAR = (0.95, 0.99)
 UMBRAL_OMEGA_RATIO = 0.0
 
 MODO_OPTIMIZACION = "mvsk"
+# NOTA DE DISENO (B-10), no se recalibra: LAMBDA3 y LAMBDA4 ponderan momentos
+# centrales crudos (skew * sigma^3, exceso de curtosis * sigma^4). Frente a
+# mu del horizonte y a (gamma/2) w'Sigma w esos terminos quedan en ordenes
+# menores, asi que el objetivo MVSK se comporta casi como media-varianza.
 LAMBDA3 = 1.0
 LAMBDA4 = 1.0
 ALPHA_CVAR_OBJETIVO = 0.95
@@ -202,6 +225,11 @@ if USAR_IV_POLYGON and not POLYGON_API_KEY:
         "Configura el secreto 'PolygonAPI' en Colab, o pon USAR_IV_POLYGON = False "
         "para usar el metodo historico."
     )
+
+if DELTA_MKT_MODO not in ("historical", "fixed", "implied"):
+    raise ValueError("DELTA_MKT_MODO debe ser 'historical', 'fixed' o 'implied'")
+if not np.isfinite(DELTA_MKT_FIJO) or DELTA_MKT_FIJO <= 0:
+    raise ValueError("DELTA_MKT_FIJO debe ser positivo")
 
 rng_global = np.random.default_rng(SEMILLA)
 
@@ -262,6 +290,10 @@ print(f"Tickers descargados: {len(tickers_ok)} / {len(TICKERS)}")
 
 precios_diarios = pd.DataFrame(precios_dict)[tickers_ok]
 precios_semanales = precios_diarios.resample("W").last()
+precios_semanales, _semana_parcial = md.drop_partial_last_week(
+    precios_semanales, precios_diarios.index.max())
+if _semana_parcial:
+    print("  Semana en curso incompleta descartada del resample semanal.")
 
 retornos_sem = np.log(precios_semanales / precios_semanales.shift(1)).dropna(how="all")
 
@@ -303,6 +335,7 @@ if USAR_COV_DIARIA:
 if Sigma_sem is None:
     Sigma_sem = retornos_sem.cov().values
 
+# Al horizonte (semanal x factor de semanas), no anual (M-11). mu_historico igual.
 Sigma_hist = Sigma_sem * factor_anualizacion
 D_hist_inv = np.diag(1 / np.sqrt(np.diag(Sigma_hist)))
 Corr_hist = D_hist_inv @ Sigma_hist @ D_hist_inv
@@ -325,7 +358,8 @@ if USAR_IV_POLYGON:
 
     def polygon_fetch_chain(ticker, api_key, max_pages=40):
         """Cadena completa de opciones paginada; falla si queda incompleta."""
-        url = f"{pc.BASE_URL}/v3/snapshot/options/{ticker}?limit=250"
+        url = (f"{pc.BASE_URL}/v3/snapshot/options/"
+               f"{pc.polygon_format_ticker(ticker)}?limit=250")
         results, completo, status = pc.get_all(url, api_key=api_key, max_pages=max_pages)
         if not completo:
             raise ValueError(f"cadena incompleta (status {status})")
@@ -502,13 +536,15 @@ if USAR_IV_POLYGON:
         ssvi_confiable = opt.success and sin_arbitraje
         metodo = "ssvi_conjunto" if ssvi_confiable else "ssvi_no_convergio"
 
-        sigma_atm = math.sqrt(theta_tau / tau_obj)
+        # sqrt(w/T) es la vol ANUAL. Sigma y el fallback de MFIV viven al horizonte.
+        sigma_atm_annual = math.sqrt(theta_tau / tau_obj)
 
-        return dict(sigma_atm=sigma_atm, theta_j=theta_fijo, t_years=t_years,
+        return dict(sigma_atm_annual=sigma_atm_annual, theta_j=theta_fijo, t_years=t_years,
                     rho=rho, eta=eta, gamma=gamma, n_vencimientos=m,
                     metodo=metodo, gj_max=gj_max)
 
-    sigma_iv = {t: np.nan for t in tickers}
+    sigma_iv_horizon = {t: np.nan for t in tickers}
+    sigma_iv_annual = {t: np.nan for t in tickers}
     detalle_ssvi = {}
 
     for tk in tickers:
@@ -520,26 +556,32 @@ if USAR_IV_POLYGON:
             resultado = None
 
         if resultado is not None:
-            sigma_iv[tk] = resultado["sigma_atm"]
+            anual = resultado["sigma_atm_annual"]
+            sigma_iv_annual[tk] = anual
+            sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
+                anual, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
             detalle_ssvi[tk] = resultado
-            print(f"OK ({resultado['metodo']}) - sigma_ATM = {resultado['sigma_atm']:.4f} "
+            print(f"OK ({resultado['metodo']}) - sigma_ATM anual = {anual:.4f} "
+                  f"| al horizonte = {sigma_iv_horizon[tk]:.4f} "
                   f"| vencimientos: {resultado['n_vencimientos']} | rho = {resultado['rho']:.3f} "
                   f"| GJ_max = {resultado['gj_max']:.3f} (<=4 sin arbitraje)")
         else:
-            sigma_iv[tk] = math.sqrt(Sigma_hist_df.loc[tk, tk])
-            print(f"-> vol historica = {sigma_iv[tk]:.4f}")
+            sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
+                np.nan, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
+            print(f"-> vol historica al horizonte = {sigma_iv_horizon[tk]:.4f}")
 
-    print(f"\n=== Volatilidades ATM implicitas (SSVI, horizonte {MESES_HORIZONTE} meses) ===")
-    print(pd.Series({t: round(sigma_iv[t], 4) for t in tickers}))
+    print(f"\n=== Volatilidades ATM al horizonte de {MESES_HORIZONTE} meses "
+          f"(SSVI anualizada y luego escalada; M-11) ===")
+    print(pd.Series({t: round(sigma_iv_horizon[t], 4) for t in tickers}))
 
-    sigma_iv_vec = np.array([sigma_iv[t] for t in tickers])
-    D_IV = np.diag(sigma_iv_vec)
-    Sigma = D_IV @ Corr_hist @ D_IV
-    Sigma = pd.DataFrame(Sigma, index=tickers, columns=tickers)
+    sigma_iv_horizon_vec = np.array([sigma_iv_horizon[t] for t in tickers])
+    D_IV_horizon = np.diag(sigma_iv_horizon_vec)
+    Sigma_horizon = D_IV_horizon @ Corr_hist @ D_IV_horizon
+    Sigma_horizon = pd.DataFrame(Sigma_horizon, index=tickers, columns=tickers)
 
 else:
-    print("\n=== USAR_IV_POLYGON = False - usando Sigma 100% historica ===")
-    Sigma = Sigma_hist_df.copy()
+    print("\n=== USAR_IV_POLYGON = False - usando Sigma 100% historica al horizonte ===")
+    Sigma_horizon = Sigma_hist_df.copy()
     tau_horizonte = MESES_HORIZONTE / 12
     detalle_ssvi = {}
 
@@ -577,9 +619,6 @@ def otm_price_ssvi(K, S, F, T, r, rho, eta, gamma, theta_tau):
     return bs_price(S, K, T, r, sigma_k, tipo=tipo)
 
 
-_trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-
-
 def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
                           n_std=6, n_puntos=400):
     sigma_atm = sigma_desde_ssvi(F, F, T, rho, eta, gamma, theta_tau)
@@ -598,9 +637,9 @@ def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
     peso_W = (6.0 * lnKS - 3.0 * lnKS ** 2) / strikes ** 2
     peso_X = (12.0 * lnKS ** 2 - 4.0 * lnKS ** 3) / strikes ** 2
 
-    V_T = _trapz(peso_V * precios, strikes)
-    W_T = _trapz(peso_W * precios, strikes)
-    X_T = _trapz(peso_X * precios, strikes)
+    V_T = rk.trapezoid(peso_V * precios, strikes)
+    W_T = rk.trapezoid(peso_W * precios, strikes)
+    X_T = rk.trapezoid(peso_X * precios, strikes)
 
     mu_T = (np.exp(r * T) - 1
             - np.exp(r * T) / 2 * V_T
@@ -634,7 +673,7 @@ for tk in tickers:
     try:
         S_tk = precios_diarios[tk].iloc[-1]
         F_tk = S_tk * np.exp(r_bkm * tau_horizonte)
-        theta_tau_tk = det["sigma_atm"] ** 2 * tau_horizonte
+        theta_tau_tk = det["sigma_atm_annual"] ** 2 * tau_horizonte
         resultado_bkm = calcular_bkm_moments(
             S=S_tk, F=F_tk, T=tau_horizonte, r=r_bkm,
             rho=det["rho"], eta=det["eta"], gamma=det["gamma"],
@@ -875,9 +914,16 @@ print("  (las columnas *_iid_roll son el estimador de ventanas rodantes bajo "
 # ==============================================================================
 
 MFIV_vec = np.array([bkm_moments[t]["MFIV"] for t in tickers], dtype=float)
+n_mfiv_fallback = 0
 for i, tk in enumerate(tickers):
-    if not np.isfinite(MFIV_vec[i]) or MFIV_vec[i] <= 0:
-        MFIV_vec[i] = float(Sigma.iloc[i, i])
+    # La diagonal de Sigma_horizon ya es varianza al horizonte. Antes, con
+    # SSVI bien y BKM mal, aqui entraba sigma_atm^2 anual (~1/tau veces mayor).
+    previo = MFIV_vec[i]
+    MFIV_vec[i] = bm.mfiv_or_horizon_variance(previo, float(Sigma_horizon.iloc[i, i]))
+    if not (np.isfinite(previo) and previo > 0):
+        n_mfiv_fallback += 1
+if n_mfiv_fallback:
+    print(f"  MFIV de respaldo (varianza al horizonte, no anual) en {n_mfiv_fallback} tickers")
 
 
 def mincer_zarnowitz(y, x, se_y, nombre, dominio=None, piso=None):
@@ -1013,6 +1059,8 @@ print(pd.DataFrame([
 ]).to_string(index=False))
 print("  (b < 1 => el momento implicito sobre-reacciona respecto del fisico, "
       "que es el patron documentado)")
+print(f"  NOTA (B-10): Mincer-Zarnowitz es transversal con n = {n}. Con ~19 nombres "
+      "la potencia es baja y a, b salen ruidosos. No se cambia el estimador.")
 
 # ==============================================================================
 # PRONOSTICOS FISICOS Y PRIMAS DE RIESGO
@@ -1154,17 +1202,36 @@ desc_perfiles = dict(
 )
 
 # ==============================================================================
-# DELTA DE MERCADO (FIJO, NO DEPENDE DEL PERFIL)
+# DELTA DE MERCADO (NO DEPENDE DEL PERFIL). Modo: DELTA_MKT_MODO (M-12)
 # ==============================================================================
 Rf_h = Rf * (MESES_HORIZONTE / 12)
 ret_mkt_hist = float(w_mkt @ mu_historico)
 var_mkt_hist = float(w_mkt @ Sigma_hist @ w_mkt)
-delta_mkt = (ret_mkt_hist - Rf_h) / var_mkt_hist
+D_Q_horizon = np.diag(np.sqrt(np.maximum(MFIV_vec, 0.0)))
+var_mkt_q = float(w_mkt @ (D_Q_horizon @ Corr_hist @ D_Q_horizon) @ w_mkt)
+var_mkt_p = float(w_mkt @ Sigma_P.values @ w_mkt)
+delta_mkt, delta_info = bm.market_delta(
+    DELTA_MKT_MODO,
+    excess_hist=ret_mkt_hist - Rf_h,
+    var_hist=var_mkt_hist,
+    delta_fixed=DELTA_MKT_FIJO,
+    var_q=var_mkt_q,
+    var_p=var_mkt_p,
+)
 
 print(f"\n=== PERFIL: {PERFIL_RIESGO.upper()} ===")
 print(f"Descripcion: {desc_perfiles[PERFIL_RIESGO]}")
-print(f"Delta de mercado (fijo): {delta_mkt:.4f} | Tau (t): {tau} | "
-      f"Omega scale: {perfil['omega_scale']} | Gamma_RA: {gamma_ra}")
+_impl = delta_info["implied"]
+_impl_txt = f"{_impl:.4f}" if np.isfinite(_impl) else "n/a"
+print(f"Delta de mercado (modo {delta_info['mode']}): {delta_mkt:.4f} | "
+      f"historico={delta_info['historical']:.4f} | fijo={delta_info['fixed']:.2f} | "
+      f"implicito={_impl_txt}")
+if delta_info["fallback"]:
+    print(f"  {delta_info['fallback']}")
+if delta_info["mode"] == "historical" and np.isfinite(delta_mkt) and delta_mkt < 0:
+    print("  La media de ~2 anos dio exceso negativo: pi hereda ese signo. "
+          "DELTA_MKT_MODO = 'fixed' o 'implied' no usa esa muestra.")
+print(f"Tau (t): {tau} | Omega scale: {perfil['omega_scale']} | Gamma_RA: {gamma_ra}")
 
 # ==============================================================================
 # BLOQUE 4: RETORNOS DE EQUILIBRIO pi - CAPM INVERTIDO
@@ -2148,6 +2215,10 @@ ret_hist_horizonte = (retornos_dia[tickers]
                       .dropna())
 print(f"\nPanel historico: {len(ret_hist_horizonte)} ventanas solapadas de "
       f"{horizonte_dias} dias | Panel posterior: {N_ESCENARIOS} escenarios")
+_n_indep = max(1, int(np.floor(len(retornos_dia) / max(horizonte_dias, 1))))
+print(f"  NOTA (B-10): las ventanas se solapan. Observaciones aproximadamente "
+      f"independientes en 2 anos: ~{_n_indep}, no el conteo de ventanas. "
+      "Se dejan solapadas a proposito.")
 
 portafolios = {
     "Mercado (w_mkt)": pd.Series(w_mkt, index=tickers),
@@ -2349,15 +2420,8 @@ print(f"Periodo de analisis MDD: desde {MDD_START_YEAR}")
 
 
 def calc_mdd(r):
-    r = pd.Series(r).dropna()
-    if len(r) < 2:
-        return np.nan
-    cv = (1 + r).cumprod()
-    dd = (cv - cv.cummax()) / cv.cummax()
-    mdd = dd.min()
-    if not np.isfinite(mdd):
-        return np.nan
-    return mdd
+    """MDD de log-retornos: riqueza = exp(cumsum) (B-1)."""
+    return bm.mdd_from_log_returns(r)
 
 
 tickers_bl = w_mvsk[w_mvsk > 0].index.tolist()
@@ -2392,11 +2456,8 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
     retornos_diarios_mdd = np.log(precios_mdd / precios_mdd.shift(1)).dropna(how="all")
 
     def port_ret_row(fila):
-        validos = fila.notna()
-        if validos.sum() == 0:
-            return np.nan
-        w_norm = weights_bl[validos.index[validos]] / weights_bl[validos.index[validos]].sum()
-        return float((fila[validos] * w_norm).sum())
+        # Log exacto del portafolio. La suma de logs solo coincide a primer orden.
+        return bm.log_portfolio_return(fila, weights_bl)
 
     retornos_diarios_mdd = retornos_diarios_mdd[tickers_bl]
     port_ret = retornos_diarios_mdd.apply(port_ret_row, axis=1)

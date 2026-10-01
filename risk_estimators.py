@@ -69,10 +69,8 @@ __all__ = [
 # 0. COMPATIBILIDAD NUMERICA
 # ==============================================================================
 # numpy 2.0 renombro np.trapz a np.trapezoid (y numpy 2.x emite aviso de
-# obsolescencia por np.trapz). Los scripts que llaman np.trapezoid dentro de
-# un `except Exception` fallaban en silencio con numpy 1.x y caian al
-# estimador historico para TODOS los activos. Importar `trapezoid` desde aqui
-# elimina esa dependencia de version.
+# obsolescencia por np.trapz). Los optimizadores integran BKM con esta
+# funcion; ninguno llama np.trapezoid directo, asi que numpy 1.24+ basta.
 # ==============================================================================
 
 trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz  # noqa: NPY201
