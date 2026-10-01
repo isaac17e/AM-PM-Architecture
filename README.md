@@ -158,7 +158,7 @@ Pipeline:
 2. Computes descriptive statistics and **Fama-French 3-factor betas**. Excess return is the stock's monthly return minus that month's French RF column.
 3. **Joint candidate selection via QUBO/Ising**: brute force when the search space is small, simulated annealing otherwise.
 4. Filters: recent volatility, IV vs. realized volatility, and a **BKM MFIS** z-score. The historical MFIS series uses the same OTM rule and moneyness bounds as the live chain (real strikes, real DTE, unadjusted prices).
-5. Covariance is a **shrinkage between implied (BKM) and historical covariance**. The historical leg uses daily returns, bounded calendar alignment, EWMA, and Ledoit-Wolf. Implied vols use each chain's real DTE, then Q→P.
+5. Covariance is a **shrinkage between implied (BKM) and historical covariance**. The historical leg uses daily returns, bounded calendar alignment, EWMA, and Ledoit-Wolf. Implied vols use each chain's real DTE, then Q→P. A sector implied correlation needs at least `sector_implied_min_names` names (default 4); a two-name sector keeps the global correlation. Call deltas scale expected returns with `delta_scale_mode = "direct"` (the delta itself, clipped to `[delta_min, 1]`). `"minmax"` restores the old cross-sectional stretch. The script prints delta and multiplier per name.
 6. Optimizes with `quadprog`. Output: efficient frontier, lambda comparison, Greeks, maximum drawdown, and an executive summary. Annualization is return ×12 and vol ×√12 from the monthly figures (`qu_metrics.annualize_monthly`).
 
 Key parameters: `lambda_`, `lambda_annual`, `max_weight`, `horizon_months`, `target_total_tickers`, `bkm_z_threshold`, `bkm_tail_mode`, `bkm_hist_max_minutes`, `cornish_fisher_confidence`, `cov_halflife_days`, `use_q_to_p_vol`, `use_q_to_p_correlation`.
@@ -167,6 +167,7 @@ Key parameters: `lambda_`, `lambda_annual`, `max_weight`, `horizon_months`, `tar
 Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 
 - Ranks names by a **Cornish-Fisher VaR** built from risk-neutral moments, scaled with the chain's real DTE.
+- The tail-risk portfolio is pruned down to `max_assets_in_portfolio` by **smallest weight** (`tail_prune_rule = "min_weight"`). `"max_mtr"` keeps the previous rule (drop the largest marginal tail contribution). Duplicate share classes are removed (`share_class_groups`, default keep `GOOGL` and drop `GOOG`).
 - **Implied correlation by factors**: market + sector + country + FX, with the same Q→P correction on the factors as on the assets.
 - Blends that covariance with a historical one from daily returns (EWMA + Ledoit-Wolf), after a bounded forward-fill so one market's holiday does not delete the row.
 - Portfolio tail risk uses co-moments of a scenario panel. Skewness and kurtosis are scaled to the horizon with the same function as the per-asset filter.
@@ -177,7 +178,7 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 **Black-Litterman** on a fixed ticker list (19 names).
 
 - Equilibrium returns `π = δ Σ w` from reverse CAPM. Market-cap weights are the reference. δ defaults to the historical estimate; see the methodology table.
-- Implied volatility from Polygon with an **SSVI** fit on `|k| <= 0.5` (`SSVI_K_ABS_MAX`), weighted by relative vega and open interest. The ATM vol is annual (`sqrt(total variance / T)`) and is **kept when the smile is rejected**; only an accepted smile feeds BKM wings. Σ and the MFIV fallback are the horizon quantities (`bl_metrics`). The Q→P vol ratio is applied only when the vol source is implied (`ssvi` or `atm`). A historical vol is left as the horizon variance.
+- Implied volatility from Polygon with an **SSVI** fit on `|k| <= 0.5` (`SSVI_K_ABS_MAX`), weighted by relative vega and open interest. The ATM vol is annual (`sqrt(total variance / T)`) and is **kept when the smile is rejected**. A fit with `|rho| >= 0.95` or without both wings (`SSVI_K_SIDE_MIN`, `SSVI_MIN_PER_SIDE`) is logged as degenerate and falls back to the ATM source: the wings are not integrated. An accepted smile feeds BKM over **±3 sigma** of the SSVI wings (`BKM_N_STD`), not over the `|k| <= 0.5` calibration window. Σ and the MFIV fallback are the horizon quantities (`bl_metrics`). The Q→P vol ratio is applied only when the vol source is implied (`ssvi` or `atm`). A historical vol is left as the horizon variance. MFIV-vs-ATM and the MFIK cap still apply.
 - **BKM** on the SSVI surface builds `Q` and `Ω`. Integration uses `risk_estimators.trapezoid`.
 - Q→P is a cross-sectional Mincer-Zarnowitz regression (n is the universe, about 19: low power; left as designed) plus an Esscher transform. `COTA_RATIO_VOL_P = (0.70, 1.00)` matches minimum variance and quadratic utility, so physical vol is not allowed above implied vol.
 - Correlation for `Σ_P` comes from daily returns with EWMA and Ledoit-Wolf.

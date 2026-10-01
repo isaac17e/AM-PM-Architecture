@@ -218,6 +218,14 @@ ideal_observations = 60
 # ------------------------------------------------------------------------------
 use_delta_filter = True
 delta_min = 0.30
+# direct: el multiplicador es la delta, recortada a [delta_min, 1].
+# fixed: mapea [delta_scale_lo, delta_scale_hi] a [delta_min, 1].
+# minmax: estira el rango observado de la corrida (la regla anterior).
+delta_scale_mode = "direct"
+delta_scale_lo = 0.45
+delta_scale_hi = 0.55
+# Menos acciones que esto: la correlacion implicita del sector no se usa.
+sector_implied_min_names = 4
 delta_strike_mode = "atm"
 iv_outlier_multiplier = 6.0
 
@@ -2022,7 +2030,11 @@ for etf in etf_sectoriales:
 
 for etf in etf_sectoriales:
     stocks_sector = [t for t in assets if sector_map.get(t) == etf]
-    if len(stocks_sector) < 2 or pd.isna(sector_etf_iv.get(etf)):
+    if pd.isna(sector_etf_iv.get(etf)):
+        continue
+    if not qm.sector_implied_ready(len(stocks_sector), sector_implied_min_names):
+        print(f"      {etf:<5}: {len(stocks_sector)} acciones, bajo el minimo "
+              f"{sector_implied_min_names}; se usa la correlacion global")
         continue
 
     idxs = [assets.index(s) for s in stocks_sector]
@@ -2162,18 +2174,12 @@ Dmat = cov_mat + np.eye(n) * 1e-8
 # DELTA COMO PONDERADOR DE RETORNO ESPERADO EN EL VECTOR dvec
 # ==============================================================================
 delta_aligned = np.array([delta_named.get(a, np.nan) for a in assets])
-
-delta_valid = delta_aligned[~pd.isna(delta_aligned)]
-if len(delta_valid) >= 2:
-    d_min_obs = delta_valid.min()
-    d_max_obs = delta_valid.max()
-    if d_max_obs > d_min_obs:
-        delta_scaled = (delta_aligned - d_min_obs) / (d_max_obs - d_min_obs) * (1 - delta_min) + delta_min
-    else:
-        delta_scaled = np.repeat(1.0, len(delta_aligned))
-else:
-    delta_scaled = np.repeat(1.0, len(delta_aligned))
-delta_scaled = np.where(np.isnan(delta_scaled), 1.0, delta_scaled)
+delta_scaled = qm.scale_option_deltas(
+    delta_aligned, mode=delta_scale_mode, delta_min=delta_min,
+    fixed_lo=delta_scale_lo, fixed_hi=delta_scale_hi)
+print(f"   Delta -> multiplicador de mu (modo {delta_scale_mode}):")
+print(pd.DataFrame({"delta": delta_aligned, "multiplicador": delta_scaled}, index=assets).to_string(
+    float_format=lambda x: f"{x:.3f}"))
 
 mu_delta_adjusted = mu * delta_scaled
 

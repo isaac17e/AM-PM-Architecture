@@ -118,6 +118,13 @@ n_divers_candidates = 35
 volatility_percentile = 0.55
 correlation_percentile = 0.60
 max_assets_in_portfolio = 15
+# Poda hasta max_assets. min_weight saca el peso chico. max_mtr es la regla
+# anterior (mayor contribucion marginal: poda defensivos en la cota del 12%).
+# min_weight_x_mtr ordena por peso * contribucion, de menor a mayor.
+tail_prune_rule = "min_weight"
+# Clases duplicadas. El primer ticker de cada grupo se queda.
+dedupe_share_classes = True
+share_class_groups = (("GOOGL", "GOOG"),)
 
 # ------------------------------------------------------------------------------
 # RESTRICCIONES DE PONDERACION
@@ -426,6 +433,10 @@ if target_total_tickers > 0 and len(all_tickers) < target_total_tickers:
         print(f"  ADVERTENCIA: No se pudo alcanzar target_total_tickers; faltan {shortage}")
 
 all_tickers = list(dict.fromkeys(all_tickers))
+if dedupe_share_classes:
+    all_tickers, _clases = md.dedupe_share_classes(all_tickers, share_class_groups)
+    for se_queda, se_van in _clases:
+        print(f"[INFO] Clase duplicada: se queda {se_queda}, sale {', '.join(se_van)}")
 print(f"[INFO] Total de tickers FINAL (unicos): {len(all_tickers)}\n")
 
 # ==============================================================================
@@ -1863,10 +1874,10 @@ while True:
         break
 
     mtr = compute_marginal_cvar_contrib(current_tickers, w_vec, cm_iter)
-    mtr_active = mtr.loc[active.index].sort_values(ascending=False)
+    orden_poda = pq.prune_order(w_iter, mtr, tail_prune_rule)
 
     drop_ticker = None
-    for candidate in mtr_active.index:
+    for candidate in orden_poda:
         remaining = [t for t in current_tickers if t != candidate]
         if constraints_feasible(remaining):
             drop_ticker = candidate
@@ -1876,12 +1887,13 @@ while True:
                   f"dejaria la banda ETF/FX estructuralmente infactible)")
 
     if drop_ticker is None:
-        drop_ticker = mtr_active.index[0]
+        drop_ticker = orden_poda[0]
         print("    ADVERTENCIA: ninguna eliminacion preserva la banda ETF/FX factible - "
-              "eliminando por mayor MTR de todas formas")
+              f"eliminando igual ({tail_prune_rule})")
 
     current_tickers = [t for t in current_tickers if t != drop_ticker]
-    print(f"    -> Eliminando '{drop_ticker}' (MTR={mtr_active[drop_ticker]:.6f}, peso {active[drop_ticker] * 100:.3f}%)")
+    print(f"    -> Eliminando '{drop_ticker}' ({tail_prune_rule}, "
+          f"MTR={mtr[drop_ticker]:.6f}, peso {active[drop_ticker] * 100:.3f}%)")
 
     if len(current_tickers) < 3:
         print("  ADVERTENCIA Quedan menos de 3 activos - deteniendo iteracion")

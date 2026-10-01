@@ -155,6 +155,12 @@ USAR_IV_POLYGON = True
 MIN_STRIKES_SLICE = 5
 MIN_DIAS_VENCIMIENTO = 5
 SSVI_K_ABS_MAX = 0.5
+# |rho| cerca de tanh(3.8) ~ 0.999 es la cota del optimizador, no una sonrisa.
+# Sin strikes de los dos lados rho tampoco se identifica. Esas alas no entran
+# a BKM; se conserva la vol ATM.
+SSVI_RHO_ABS_MAX = 0.95
+SSVI_K_SIDE_MIN = 0.10
+SSVI_MIN_PER_SIDE = 2
 
 # ------------------------------------------------------------------------------
 # 9. MODULO ECONOMETRICO Q -> P (BLOQUE 1D)
@@ -207,8 +213,9 @@ BKM_MFIK_MAX = 20.0
 # strikes OTM observados (no los puntos de la rejilla sintetica). Un indice
 # liquido supera 20 sin que el momento sea inadmisible.
 BKM_MFIK_MAX_HARD = 80.0
-# Alas de la integral BKM. +/-6 sigma sobre SSVI inflaba el MFIV frente a la
-# cadena OTM de mercado (META ~4x). Se corta en +/- BKM_N_STD y en el k visto.
+# Alas de la integral BKM. El ajuste es |k|<=0.5; la integral usa las alas
+# SSVI (GJ ya chequeado) en +/- BKM_N_STD * sigma * sqrt(T). Recortar al
+# k del ajuste dejaba MFIK < 3. +/-6 sigma inflaba el MFIV (META ~4x).
 BKM_N_STD = 3.0
 BKM_MFIV_RATIO = (0.80, 2.0)
 NIVELES_CVAR = (0.95, 0.99)
@@ -551,7 +558,12 @@ if USAR_IV_POLYGON:
         # sqrt(w/T) es la vol ANUAL y no depende de las alas. Se conserva
         # aunque el RMSE de la sonrisa supere el umbral.
         sigma_atm_annual = math.sqrt(theta_tau / tau_obj) if theta_tau > 0 else np.nan
-        decision = bm.ssvi_surface_decision(ajuste, sigma_atm_annual)
+        n_put = int(np.sum(datos["k"].to_numpy(dtype=float) < 0))
+        n_call = int(np.sum(datos["k"].to_numpy(dtype=float) >= 0))
+        decision = bm.ssvi_surface_decision(
+            ajuste, sigma_atm_annual, n_put=n_put, n_call=n_call,
+            rho_abs_max=SSVI_RHO_ABS_MAX, k_side_min=SSVI_K_SIDE_MIN,
+            min_per_side=SSVI_MIN_PER_SIDE)
         if decision["fuente"] == "historica":
             raise ValueError(
                 f"SSVI sin vol ATM (rmse_rel={ajuste['rmse_rel']:.3f}, "
@@ -562,7 +574,8 @@ if USAR_IV_POLYGON:
                     t_years=t_years, rho=ajuste["rho"], eta=ajuste["eta"], gamma=ajuste["gamma"],
                     n_vencimientos=m, metodo=ajuste["metodo"], gj_max=ajuste["gj_max"],
                     rmse_rel=ajuste["rmse_rel"], usar_alas=decision["usar_alas"],
-                    fuente=decision["fuente"], n_strikes=ajuste["n_strikes"],
+                    fuente=decision["fuente"], motivos=decision.get("motivos") or [],
+                    n_put=n_put, n_call=n_call, n_strikes=ajuste["n_strikes"],
                     k_min=ajuste["k_min"], k_max=ajuste["k_max"])
 
     sigma_iv_horizon = {t: np.nan for t in tickers}
@@ -594,7 +607,16 @@ if USAR_IV_POLYGON:
             sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
                 anual, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
             fuente_vol[tk] = "atm"
-            print(f"ATM (sonrisa {resultado['metodo']}, rmse_rel={resultado['rmse_rel']:.3f}) "
+            motivos = resultado.get("motivos") or []
+            if resultado.get("metodo") == "ssvi_conjunto" and motivos:
+                detalle = f"degenerada: {', '.join(motivos)}"
+            else:
+                extra = f", {', '.join(motivos)}" if motivos else ""
+                detalle = (f"sonrisa {resultado['metodo']}, "
+                           f"rmse_rel={resultado['rmse_rel']:.3f}{extra}")
+            print(f"ATM ({detalle}, rho={resultado['rho']:.3f}, "
+                  f"k=[{resultado['k_min']:.2f}, {resultado['k_max']:.2f}], "
+                  f"puts={resultado.get('n_put')}, calls={resultado.get('n_call')}) "
                   f"- sigma_ATM anual = {anual:.4f} "
                   f"| al horizonte = {sigma_iv_horizon[tk]:.4f} "
                   f"| alas no usadas en BKM")
@@ -708,12 +730,14 @@ for tk in tickers:
         S_tk = precios_diarios[tk].iloc[-1]
         F_tk = S_tk * np.exp(r_bkm * tau_horizonte)
         theta_tau_tk = det["sigma_atm_annual"] ** 2 * tau_horizonte
+        # Sin k_min/k_max: la integral es +/- BKM_N_STD sigma al horizonte,
+        # sobre las alas SSVI. El k del ajuste (|k|<=0.5) no recorta.
         resultado_bkm = calcular_bkm_moments(
             S=S_tk, F=F_tk, T=tau_horizonte, r=r_bkm,
             rho=det["rho"], eta=det["eta"], gamma=det["gamma"],
             theta_tau=theta_tau_tk, n_std=BKM_N_STD,
-            k_min=det.get("k_min"), k_max=det.get("k_max"),
         )
+        ala = BKM_N_STD * det["sigma_atm_annual"] * math.sqrt(tau_horizonte)
         banda = bm.mfiv_vs_atm(resultado_bkm["MFIV"], theta_tau_tk, *BKM_MFIV_RATIO)
         if not banda["ok"]:
             print(f"  {tk}: MFIV/varianza ATM = {banda['ratio']} fuera de "
@@ -730,7 +754,8 @@ for tk in tickers:
                 resultado_bkm = {**resultado_bkm, "MFIS": 0.0, "MFIK": 3.0}
         bkm_moments[tk] = resultado_bkm
         print(f"  {tk}: MFIV={resultado_bkm['MFIV']:.4f} | MFIS={resultado_bkm['MFIS']:.3f} "
-              f"| MFIK={resultado_bkm['MFIK']:.3f}")
+              f"| MFIK={resultado_bkm['MFIK']:.3f} | integral k=+/-{ala:.2f} "
+              f"({BKM_N_STD:.0f} sigma; ajuste |k|<={SSVI_K_ABS_MAX})")
     except Exception as e:
         print(f"  {tk}: fallback neutro ({e})")
         bkm_moments[tk] = dict(MFIV=np.nan, MFIS=0.0, MFIK=3.0, V_T=np.nan, W_T=np.nan, X_T=np.nan)
