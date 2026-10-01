@@ -15,6 +15,9 @@
 #   4. Admisibilidad de momentos (K >= 1 + S^2) y Cornish-Fisher con
 #      momentos reales (Maillard, 2012): monotono en S y K por construccion.
 #   5. Retorno esperado via SVIX (Martin-Wagner) - EXPERIMENTAL, ver aviso.
+#   6. Escalado temporal unico (anualizar, llevar al horizonte, escalado iid
+#      de asimetria y curtosis) con el DTE real de la cadena de opciones.
+#   0. Compatibilidad numerica (trapezoid para numpy < 2.0).
 #
 # Todo es forma cerrada salvo la inversion momentos -> parametros de
 # Cornish-Fisher, un ajuste 2x2 con scipy.optimize.least_squares.
@@ -25,6 +28,7 @@ import pandas as pd
 from scipy.stats import norm
 
 __all__ = [
+    "trapezoid",
     "ewma_weights",
     "effective_sample_size",
     "ewma_cov",
@@ -48,7 +52,28 @@ __all__ = [
     "cornish_fisher_es_gradient",
     "var_cvar_cornish_fisher",
     "martin_wagner_excess_return",
+    "DAYS_PER_YEAR",
+    "TRADING_DAYS_PER_YEAR",
+    "WEEKS_PER_YEAR",
+    "MONTHS_PER_YEAR",
+    "to_years",
+    "scale_moments",
+    "annualize",
+    "implied_variance_to_horizon",
 ]
+
+
+# ==============================================================================
+# 0. COMPATIBILIDAD NUMERICA
+# ==============================================================================
+# numpy 2.0 renombro np.trapz a np.trapezoid (y numpy 2.x emite aviso de
+# obsolescencia por np.trapz). Los scripts que llaman np.trapezoid dentro de
+# un `except Exception` fallaban en silencio con numpy 1.x y caian al
+# estimador historico para TODOS los activos. Importar `trapezoid` desde aqui
+# elimina esa dependencia de version.
+# ==============================================================================
+
+trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz  # noqa: NPY201
 
 
 # ==============================================================================
@@ -140,6 +165,16 @@ def ledoit_wolf_constant_correlation(returns, S=None, t_eff=None):
     t_eff : tamano de muestra a usar en delta. Si se encogio una matriz EWMA,
         pasar effective_sample_size(w); si es None se usa T.
 
+    Consistencia entre S y S_sample cuando S es la EWMA:
+      - El objetivo F (varianzas y correlacion promedio) y gamma = ||F - S||^2
+        se construyen con la MISMA matriz S que se encoge. gamma mide la
+        distancia entre el objetivo y el estimador que se va a mezclar; usar
+        S_sample aqui mezclaba dos estimadores distintos.
+      - pi y rho son los momentos de orden 4 de la MUESTRA (sin pesos): son
+        la varianza asintotica de la covarianza bajo iid, que la formula de
+        Ledoit-Wolf supone; el efecto de los pesos EWMA entra via t_eff.
+    Con S=None (caso clasico) ambas convenciones coinciden exactamente.
+
     Devuelve (S_shrunk, delta, F).
     """
     X = np.asarray(returns, dtype=float)
@@ -180,7 +215,7 @@ def ledoit_wolf_constant_correlation(returns, S=None, t_eff=None):
     np.fill_diagonal(rho_off, 0.0)
     rho_hat = float(np.trace(pi_mat) + rho_off.sum())
 
-    gamma_hat = float(np.sum((F - S_sample) ** 2))
+    gamma_hat = float(np.sum((F - S) ** 2))
 
     if gamma_hat <= 0 or not np.isfinite(gamma_hat):
         return S, 0.0, F
@@ -670,3 +705,160 @@ def martin_wagner_excess_return(svix2_i, svix2_mkt, w_mkt=None, lam=0.5):
                     "svix2_avg": avg, "lam": lam,
                     "n_valid": int(ok.sum()), "n_total": n,
                     "warning": "formula sin verificar contra el paper"}
+
+
+# ==============================================================================
+# 6. ESCALADO TEMPORAL
+# ==============================================================================
+# Un unico punto para pasar momentos de un plazo a otro. Los optimizadores
+# mezclaban convenciones: MFIV integrada sobre ~30 DTE dividida por el
+# horizonte del portafolio, asimetria semanal combinada con sigma al horizonte
+# sin escalar, retornos mensuales anualizados con 12/horizonte, volatilidad
+# anual en una matriz que debia estar al horizonte. Todas esas operaciones
+# son la misma regla con plazos de entrada y salida distintos:
+#
+#   h = to_years / from_years          (ratio de plazos)
+#   mu_h   = mu  * h                   (log-retornos iid; aprox. para simples)
+#   var_h  = var * h
+#   sd_h   = sd  * sqrt(h)
+#   S_h    = S   / sqrt(h)             (asimetria estandarizada, iid)
+#   K_h    = K   / h                   (EXCESO de curtosis, iid)
+#
+# Los plazos se expresan en ANOS y se construyen con `to_years`, que acepta
+# el DTE real de la cadena (dias de calendario), semanas, meses o periodos
+# de una frecuencia dada. Asi el plazo de una MFIV es el de sus contratos
+# (info["dte"] de polygon_client.fetch_otm_chain), no el del portafolio.
+#
+# El escalado iid de S y K es un supuesto (sin dependencia temporal ni
+# clustering de volatilidad). Es el mismo que ya usaba
+# `momentos_cola_historicos`; aqui se centraliza para que todos los bloques
+# lo apliquen igual.
+# ==============================================================================
+
+DAYS_PER_YEAR = 365.0            # calendario: vencimientos de opciones (DTE)
+TRADING_DAYS_PER_YEAR = 252.0    # retornos diarios bursatiles
+WEEKS_PER_YEAR = 52.0
+MONTHS_PER_YEAR = 12.0
+
+
+def to_years(periods=None, periods_per_year=None, *, dte=None, trading_days=None,
+             weeks=None, months=None, days_per_year=DAYS_PER_YEAR):
+    """Convierte un plazo a anos. Exactamente UNA forma de expresarlo:
+
+    to_years(dte=30)                       -> 30 / 365    (dias de calendario)
+    to_years(trading_days=21)              -> 21 / 252
+    to_years(weeks=4.33)                   -> 4.33 / 52
+    to_years(months=3)                     -> 3 / 12
+    to_years(periods=5, periods_per_year=52) -> 5 / 52     (frecuencia arbitraria)
+
+    Acepta escalares o arrays (p. ej. un DTE distinto por ticker). Lanza
+    ValueError si se da mas de una forma, ninguna, o un plazo no positivo.
+    """
+    formas = {"periods": periods, "dte": dte, "trading_days": trading_days,
+              "weeks": weeks, "months": months}
+    dadas = [k for k, v in formas.items() if v is not None]
+    if len(dadas) != 1:
+        raise ValueError(f"to_years: indicar exactamente un plazo, se dieron {dadas or 'ninguno'}")
+    nombre = dadas[0]
+    valor = np.asarray(formas[nombre], dtype=float)
+
+    if nombre == "periods":
+        if periods_per_year is None or periods_per_year <= 0:
+            raise ValueError("to_years: `periods` requiere periods_per_year > 0")
+        divisor = float(periods_per_year)
+    elif nombre == "dte":
+        divisor = float(days_per_year)
+    elif nombre == "trading_days":
+        divisor = TRADING_DAYS_PER_YEAR
+    elif nombre == "weeks":
+        divisor = WEEKS_PER_YEAR
+    else:
+        divisor = MONTHS_PER_YEAR
+
+    if np.any(~np.isfinite(valor)) or np.any(valor <= 0):
+        raise ValueError(f"to_years: plazo no positivo o no finito en `{nombre}`: {formas[nombre]}")
+    anos = valor / divisor
+    return float(anos) if anos.ndim == 0 else anos
+
+
+def scale_moments(from_years, to_years, mu=None, var=None, sd=None, skew=None, exkurt=None):
+    """Escala momentos de un plazo `from_years` a otro `to_years` bajo iid.
+
+    Solo se escalan los momentos que se pasan; el resto no aparece en la
+    salida. Todos aceptan escalares o arrays (broadcast con los plazos).
+
+    Devuelve dict con "h" (= to_years/from_years) y las claves pedidas entre
+    mu, var, sd, skew, exkurt. `exkurt` es EXCESO de curtosis; la curtosis
+    total no escala como K/h (hay que restar 3 antes y sumarlo despues).
+
+    Ejemplos
+    --------
+    MFIV integrada sobre 30 DTE -> varianza anual:
+        scale_moments(to_years(dte=30), 1.0, var=mfiv)["var"]
+    Asimetria y exceso de curtosis semanales -> horizonte de 1 mes:
+        scale_moments(to_years(weeks=1), to_years(months=1), skew=S, exkurt=K)
+    """
+    f = np.asarray(from_years, dtype=float)
+    t = np.asarray(to_years, dtype=float)
+    if np.any(~np.isfinite(f)) or np.any(f <= 0) or np.any(~np.isfinite(t)) or np.any(t <= 0):
+        raise ValueError("scale_moments: los plazos deben ser positivos y finitos")
+    h = t / f
+    out = {"h": float(h) if h.ndim == 0 else h}
+
+    def _f(x, fn):
+        x_arr = np.asarray(x, dtype=float)
+        y = fn(x_arr)
+        return float(y) if y.ndim == 0 else y
+
+    if mu is not None:
+        out["mu"] = _f(mu, lambda x: x * h)
+    if var is not None:
+        out["var"] = _f(var, lambda x: x * h)
+    if sd is not None:
+        out["sd"] = _f(sd, lambda x: x * np.sqrt(h))
+    if skew is not None:
+        out["skew"] = _f(skew, lambda x: x / np.sqrt(h))
+    if exkurt is not None:
+        out["exkurt"] = _f(exkurt, lambda x: x / h)
+    return out
+
+
+def annualize(from_years, **moments):
+    """Atajo: scale_moments(from_years, 1.0, **moments)."""
+    return scale_moments(from_years, 1.0, **moments)
+
+
+def implied_variance_to_horizon(total_var_q, dte, horizon_years, days_per_year=DAYS_PER_YEAR):
+    """Lleva una varianza implicita INTEGRADA (BKM MFIV sobre `dte` dias) al horizonte.
+
+    MFIV, tal como la devuelve la integracion BKM de estos scripts, es la
+    varianza neutral al riesgo acumulada entre hoy y el vencimiento, no una
+    varianza anual. Anualizarla dividiendo por el horizonte del portafolio
+    en lugar de por el plazo de los contratos (A-3 de la revision) la
+    subestima en un factor dte/horizonte.
+
+    Devuelve dict con:
+      annual_var, annual_vol   : varianza y vol anualizadas con el DTE real
+      horizon_var, horizon_vol : varianza y vol al horizonte pedido
+      years_chain              : plazo de los contratos en anos
+      h                        : horizon_years / years_chain
+    Acepta arrays (un DTE por ticker). Donde dte o total_var_q no sean
+    validos devuelve NaN en vez de lanzar.
+    """
+    v = np.asarray(total_var_q, dtype=float)
+    d = np.asarray(dte, dtype=float)
+    hz = np.asarray(horizon_years, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        years_chain = np.where((d > 0) & np.isfinite(d), d / float(days_per_year), np.nan)
+        ok = np.isfinite(v) & (v >= 0) & np.isfinite(years_chain) & np.isfinite(hz) & (hz > 0)
+        annual_var = np.where(ok, v / years_chain, np.nan)
+        h = np.where(ok, hz / years_chain, np.nan)
+        horizon_var = np.where(ok, v * h, np.nan)
+
+    def _s(x):
+        x = np.asarray(x, dtype=float)
+        return float(x) if x.ndim == 0 else x
+
+    return {"annual_var": _s(annual_var), "annual_vol": _s(np.sqrt(annual_var)),
+            "horizon_var": _s(horizon_var), "horizon_vol": _s(np.sqrt(horizon_var)),
+            "years_chain": _s(years_chain), "h": _s(h)}
