@@ -211,14 +211,16 @@ The seasonal quadratic-utility script keeps a single QUBO pass. Its `rf_rate` is
 python -m pytest
 ```
 
-Tests cover the shared modules and the extracted optimizer logic (FX and calendar alignment, quadprog constraints, time scaling, Cornish-Fisher, Polygon client behavior with recorded responses, quadratic-utility metrics, Black-Litterman units, delta modes, and log-return drawdown). They do not call Polygon and they do not run the full optimizers.
+Tests cover the shared modules and the extracted optimizer logic (FX and calendar alignment, quadprog constraints, time scaling, Cornish-Fisher, Polygon client behavior with recorded responses, quadratic-utility metrics, Black-Litterman units, delta modes, and log-return drawdown). `tests/test_script_smoke.py` parses every optimizer for a module-level name that shadows an import (`rk = ...` used to hide `risk_estimators`) and runs `black_litterman.py` under `AMPM_SMOKE=1` with mocked prices. They do not call Polygon and they do not run a full universe.
 
 ---
 
 ## Key concepts
 
 - **BKM (Bakshi, Kapadia, and Madan, 2003)**: risk-neutral variance, skewness, and kurtosis (MFIV, MFIS, MFIK) from OTM option prices. MFIV is the variance integrated over the life of the contracts, not an annual variance. Annualize with the chain's real DTE, then scale to the portfolio horizon.
-- **Cornish-Fisher**: adjusts a normal quantile for skewness and kurtosis. The S and K in the expansion are parameters, not the moments of the resulting distribution. The scripts solve for the parameters that reproduce the observed moments (Maillard, 2012). Pairs that violate K ≥ 1 + S² or exceed `bkm_mfik_max` are rejected rather than clipped: MFIV is kept, and MFIS/MFIK become NaN (or the neutral 0/3 in Black-Litterman).
+- **Cornish-Fisher**: adjusts a normal quantile for skewness and kurtosis. The S and K in the expansion are parameters, not the moments of the resulting distribution. The scripts solve for the parameters that reproduce the observed moments (Maillard, 2012). Pairs that violate K ≥ 1 + S² or exceed the MFIK cap are rejected rather than clipped: MFIV is kept, and MFIS/MFIK become NaN (or the neutral 0/3 in Black-Litterman). The cap starts at `bkm_mfik_max` (20) on a thin chain and rises linearly to `bkm_mfik_max_hard` (80) as the number of OTM strikes goes from 8 to 60. A dense index chain (SPY) can sit above 20 and still be kept. Black-Litterman counts observed SSVI strikes, not the integration grid.
+- **DTE window**: `dte_tol_iv` (minimum variance) and `polygon_dte_tol` (quadratic utility) default to **21** days, so a monthly expiry at 15 or 50 DTE is inside a 30-day target. The chain still uses the real DTE of the chosen expiry. Quadratic utility prints that DTE per ticker.
+- **Polygon entitlements**: this plan includes options and reference only. A stock snapshot or stock aggregate returns 403, is not retried, and is printed once. Spot and prices come from Yahoo. Option aggregates stay on `O:` contract tickers. Non-US names in quadratic utility are labeled `sin_opciones_us` and are not sent to Polygon.
 - **Risk-neutral vs. physical measure (Q vs. P)**: implied variance and implied correlation embed risk premia. The scripts estimate a bounded ratio of realized to implied moments. The upper bound is 1, so physical vol does not exceed implied vol.
 - **EWMA + Ledoit-Wolf**: historical covariance from daily returns, weighted toward the recent regime, then shrunk toward a constant-correlation target.
 - **Co-moments**: portfolio skewness and kurtosis are not the weighted average of the marginal moments. The scripts evaluate them on a scenario panel.

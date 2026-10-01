@@ -50,7 +50,7 @@ if not POLYGON_API_KEY:
     print("ADVERTENCIA: No hay POLYGON_API_KEY configurada. Todas las consultas de opciones")
     print("             fallaran y cada activo caera a fallback historico (sin BKM real).")
 
-polygon_dte_tol = 10
+polygon_dte_tol = 21
 atm_strike_band = 0.10
 
 # ------------------------------------------------------------------------------
@@ -136,6 +136,9 @@ bkm_moneyness_hi = 1.40
 bkm_hist_contracts_estimate = 40
 bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
+# Cadena corta: tope 20. Cadena densa (muchos strikes OTM): hasta este techo.
+# SPY y otros indices superan 20 con alas liquidas; no se descartan por eso.
+bkm_mfik_max_hard = 80.0
 bkm_lookback_months = 12
 bkm_hist_sample_freq = "2W"
 bkm_hist_anchor = "2020-01-05"
@@ -164,6 +167,11 @@ use_q_to_p_vol = True
 vrp_ratio_bounds = (0.70, 1.00)
 vrp_fallback_ratio = 0.90
 use_q_to_p_correlation = True
+# La cesta de dispersion tiene que cubrir esta fraccion de la cap conocida
+# de los componentes de SPY, y conocer al menos estas caps. Si no, se usa
+# la correlacion realizada. La implicita que si entra se recorta a >= 0.
+dispersion_min_cap_share = 0.40
+dispersion_min_known_caps = 50
 crp_ratio_bounds = (0.60, 1.00)
 crp_fallback_ratio = 0.85
 
@@ -305,10 +313,12 @@ def polygon_format_ticker(ticker):
     return pc.polygon_format_ticker(ticker)
 
 
-def polygon_get_atm_option(ticker, target_dte, dte_tol=10, api_key=None, contract_type="call"):
+def polygon_get_atm_option(ticker, target_dte, dte_tol=21, api_key=None, contract_type="call"):
     api_key = api_key or POLYGON_API_KEY
     vacio = dict(iv=np.nan, delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan,
                  dte=np.nan, strike=np.nan, ok=False)
+    if not is_us_ticker(ticker):
+        return vacio
 
     hoy = date.today()
     fecha_min = (hoy + timedelta(days=max(target_dte - dte_tol, 1))).strftime("%Y-%m-%d")
@@ -397,6 +407,10 @@ def polygon_contracts_asof(ticker, strike_lo, strike_hi, exp_min, exp_max, as_of
 
 def polygon_contract_close_near(contract_ticker, target_date, window_days=5, api_key=None):
     """Cierre diario del contrato mas cercano a target_date. Devuelve (precio, definitivo)."""
+    # Solo agregados de opciones (O:...). Un agregado de accion devuelve 403
+    # en este plan y no se usa: los precios salen de yfinance.
+    if not str(contract_ticker).startswith("O:"):
+        return np.nan, True
     target_d = pd.Timestamp(target_date)
     from_d = (target_d - timedelta(days=window_days)).strftime("%Y-%m-%d")
     to_d = (target_d + timedelta(days=window_days)).strftime("%Y-%m-%d")
@@ -485,9 +499,12 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
     motivo = None
-    if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
+    cap_mfik = rk.mfik_cap(len(calls_df) + len(puts_df), base=bkm_mfik_max, hard=bkm_mfik_max_hard)
+    if not rk.higher_moments_admissible(mfis, mfik, cap_mfik):
         mfis, mfik = np.nan, np.nan
-        motivo = "momentos_inadmisibles (MFIV se conserva)"
+        motivo = (f"momentos_inadmisibles (MFIS={mfis:.2f}, MFIK={mfik:.2f}, "
+                  f"tope={cap_mfik:.1f} con {len(calls_df) + len(puts_df)} strikes OTM; "
+                  f"MFIV se conserva)")
 
     return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True, motivo=motivo)
 
@@ -504,6 +521,9 @@ def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_
 def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
     vacio = dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False,
                  spot=np.nan, dte=np.nan, motivo="sin_spot")
+    if not is_us_ticker(ticker):
+        vacio.update(motivo="sin_opciones_us", transitorio=False)
+        return vacio
     S = get_spot_safe_bkm(ticker)
     if pd.isna(S) or S <= 0:
         return vacio
@@ -580,6 +600,8 @@ def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness
 def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, dte_tol,
                                  moneyness_lo, moneyness_hi, rf, min_validos=None):
     """MFIS historico. Cada fecha usa el DTE real de su vencimiento, no target_dte/365."""
+    if not is_us_ticker(ticker):
+        return np.full(len(sample_dates), np.nan)
     mfis_hist = [np.nan] * len(sample_dates)
     validos = 0
     for i, fecha_i in enumerate(sample_dates):
@@ -628,6 +650,8 @@ sector_keywords = {
 
 
 def polygon_get_sic_description(ticker, api_key=None):
+    if not is_us_ticker(ticker):
+        return None
     api_key = api_key or POLYGON_API_KEY
     url_ref = f"https://api.polygon.io/v3/reference/tickers/{polygon_format_ticker(ticker)}"
     try:
@@ -736,7 +760,7 @@ etf_geograficos = [
     "AAXJ", "EWJ",
     "MCHI", "FXI", "INDA",
     "ILF", "EWZ",
-    "VXUS", "ACWX", "VT", "FM",
+    "VXUS", "ACWX", "VT",
 ]
 
 etf_tickers = list(dict.fromkeys(etf_core + etf_sectoriales + etf_subsectoriales + etf_geograficos))
@@ -884,6 +908,7 @@ def download_period_returns(tickers, start, end, period="1mo", fx_prices=None):
             yf_tk = yf.Ticker(tk)
             hist = yf_tk.history(start=start, end=end, interval=period, auto_adjust=True)
             if hist is None or hist.empty:
+                print(f"   {tk}: sin cotizacion en Yahoo; se excluye")
                 continue
             hist = hist[["Close"]].rename(columns={"Close": "adjusted"})
             hist.index = pd.to_datetime(hist.index).tz_localize(None)
@@ -1079,6 +1104,12 @@ if ff_data is not None:
                 merged["excess_return"] = merged["monthly_return"] - merged["RF"]
                 X = sm.add_constant(merged[["Mkt-RF", "SMB", "HML"]])
                 y = merged["excess_return"]
+                mat = np.asarray(X, dtype=float)
+                yy = np.asarray(y, dtype=float)
+                filas_ok = np.isfinite(mat).all(axis=1) & np.isfinite(yy)
+                if int(filas_ok.sum()) < mat.shape[1] or np.linalg.matrix_rank(mat[filas_ok]) < mat.shape[1]:
+                    rows.append(dict(symbol=sym, beta_mkt=np.nan, beta_smb=np.nan, beta_hml=np.nan))
+                    continue
                 model = sm.OLS(y, X, missing="drop").fit()
                 rows.append(dict(symbol=sym, beta_mkt=model.params.get("Mkt-RF", np.nan),
                                   beta_smb=model.params.get("SMB", np.nan),
@@ -1482,15 +1513,18 @@ bkm_current_moments = {}
 def evaluar_bkm_activo(ticker):
     mom_actual = bkm_get_current_moments(ticker, target_dte_polygon, polygon_dte_tol, rf_rate)
     bkm_current_moments[ticker] = mom_actual
+
+    def _fila(decision, motivo, z=np.nan):
+        return dict(symbol=ticker, decision=decision, motivo=motivo, z=z,
+                    dte=mom_actual.get("dte", np.nan))
+
     if not mom_actual["ok"]:
-        return dict(symbol=ticker, decision="mantener",
-                    motivo=mom_actual.get("motivo") or "sin_mfis_actual", z=np.nan)
+        return _fila("mantener", mom_actual.get("motivo") or "sin_mfis_actual")
     if not np.isfinite(mom_actual["mfis"]):
-        return dict(symbol=ticker, decision="mantener",
-                    motivo=mom_actual.get("motivo") or "mfis_inadmisible", z=np.nan)
+        return _fila("mantener", mom_actual.get("motivo") or "mfis_inadmisible")
 
     if omitir_historia_bkm:
-        return dict(symbol=ticker, decision="mantener", motivo="historia_omitida_por_tiempo", z=np.nan)
+        return _fila("mantener", "historia_omitida_por_tiempo")
 
     spot_series_tk = None
     if bkm_fechas_pendientes(ticker) > 0:
@@ -1500,12 +1534,12 @@ def evaluar_bkm_activo(ticker):
             # Cierre sin ajustar: el strike de la opcion no esta ajustado por dividendos (A-5).
             hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=False)
             if hist is None or hist.empty or len(hist) < 20:
-                return dict(symbol=ticker, decision="mantener", motivo="sin_precio_historico", z=np.nan)
+                return _fila("mantener", "sin_precio_historico")
             spot_series_tk = hist[["Close"]].rename(columns={"Close": "close"}).reset_index()
             spot_series_tk = spot_series_tk.rename(columns={"Date": "date"})
             spot_series_tk["date"] = pd.to_datetime(spot_series_tk["date"]).dt.tz_localize(None)
         except Exception:
-            return dict(symbol=ticker, decision="mantener", motivo="sin_precio_historico", z=np.nan)
+            return _fila("mantener", "sin_precio_historico")
 
     hist_mfis = bkm_reconstruct_mfis_history(
         ticker, spot_series_tk, sample_dates_bkm, target_dte_polygon, polygon_dte_tol,
@@ -1515,16 +1549,16 @@ def evaluar_bkm_activo(ticker):
     hist_mfis_validos = hist_mfis[~np.isnan(hist_mfis)]
 
     if len(hist_mfis_validos) < bkm_hist_min_valid:
-        return dict(symbol=ticker, decision="mantener", motivo="muestra_insuficiente", z=np.nan)
+        return _fila("mantener", "muestra_insuficiente")
 
     media_hist = np.mean(hist_mfis_validos)
     sd_hist = np.std(hist_mfis_validos, ddof=1)
     if sd_hist <= 0 or np.isnan(sd_hist):
-        return dict(symbol=ticker, decision="mantener", motivo="sd_hist_invalida", z=np.nan)
+        return _fila("mantener", "sd_hist_invalida")
 
     z = (mom_actual["mfis"] - media_hist) / sd_hist
     decision, motivo = qm.mfis_tail_decision(z, bkm_z_threshold, bkm_tail_mode)
-    return dict(symbol=ticker, decision=decision, motivo=motivo, z=z)
+    return _fila(decision, motivo, z)
 
 
 def bkm_fechas_pendientes(ticker):
@@ -1608,7 +1642,7 @@ if len(bkm_log_df):
     conteo = bkm_log_df["motivo"].fillna("(sin motivo)").value_counts()
     for motivo, n in conteo.items():
         print(f"      {n:4d}  {motivo}")
-    cols_bkm = [c for c in ("symbol", "decision", "motivo", "z") if c in bkm_log_df.columns]
+    cols_bkm = [c for c in ("symbol", "decision", "motivo", "dte", "z") if c in bkm_log_df.columns]
     print(bkm_log_df[cols_bkm].to_string(index=False))
 
 if len(full_set) < bkm_min_survivors:
@@ -1769,35 +1803,58 @@ print(f"   Alpha shrinkage global (promedio): {alpha_global:.3f} ({alpha_global 
 # COVARIANZA HISTORICA ANUALIZADA
 # ==============================================================================
 Sigma_hist = None
+cov_label = "mensual por pares"
+df_daily_for_mdd = None
 if use_daily_cov:
     print("\n   Descargando retornos DIARIOS de los finalistas para la covarianza...")
     try:
         fx_prices_daily = download_fx_prices(start_date, end_date, period="1d")
-        df_daily = download_period_returns(assets, start_date, end_date,
+        # SPY arma el calendario aunque no este en el portafolio. Un nombre de
+        # historia corta se cae de la diaria; no tira la matriz de los demas.
+        nombres_diarios = list(dict.fromkeys(list(assets) + ["SPY"]))
+        df_daily = download_period_returns(nombres_diarios, start_date, end_date,
                                            period="1d", fx_prices=fx_prices_daily)
+        df_daily_for_mdd = df_daily
         price_wide = (df_daily.pivot_table(index="date", columns="symbol", values="adjusted")
-                      .sort_index().reindex(columns=assets))
-        ref = price_wide.notna().sum().idxmax() if price_wide.shape[1] else None
-        calendar = price_wide.index[price_wide[ref].notna()] if ref is not None else price_wide.index[:0]
-        aligned_px, align_info = md.align_prices_to_calendar(
-            price_wide, calendar, max_ffill=2, min_coverage=0.80)
-        print(f"   Alineacion diaria (ffill<=2, calendario={ref}): "
+                      .sort_index())
+        aligned_px, align_info = qm.align_daily_panel(
+            price_wide, assets, spy_col="SPY", max_ffill=2, min_coverage=0.80)
+        print(f"   Alineacion diaria (ffill<=2, calendario={align_info['calendar']}): "
               f"{align_info['n_rows']} dias, rellenos={int(align_info['n_filled'].sum())}, "
               f"baja cobertura={align_info['dropped_low_coverage'] or 'ninguno'}")
-        daily_wide = aligned_px.pct_change().iloc[1:].dropna(how="any")
+        daily_names = list(align_info["kept"])
+        if len(aligned_px) >= 2 and aligned_px.shape[1] >= 2:
+            daily_wide = aligned_px.pct_change().iloc[1:].dropna(how="any")
+        else:
+            daily_wide = aligned_px.iloc[0:0]
         print(f"   Retornos diarios alineados: {daily_wide.shape[0]} dias x {daily_wide.shape[1]} activos")
 
-        if daily_wide.shape[1] == len(assets) and len(daily_wide) >= 120:
-            Sigma_hist_df, cov_info = rk.cov_ewma_shrunk(
+        if daily_wide.shape[1] >= 2 and len(daily_wide) >= 120:
+            Sigma_daily_df, cov_info = rk.cov_ewma_shrunk(
                 daily_wide, halflife=cov_halflife_days, scale=252.0,
                 shrink=use_lw_shrinkage)
-            Sigma_hist = np.asarray(Sigma_hist_df)
-            vol_daily_based = np.sqrt(np.diag(Sigma_hist))
-            vol_monthly_based = df_xts[assets].std().values * math.sqrt(12)
-            print("   COVARIANZA (EWMA + Ledoit-Wolf, base diaria):")
+            if set(daily_names) == set(assets):
+                Sigma_hist = np.asarray(
+                    Sigma_daily_df.reindex(index=assets, columns=assets), dtype=float)
+                cov_label = "diaria EWMA+LW"
+                print("   COVARIANZA (EWMA + Ledoit-Wolf, base diaria, calendario SPY):")
+            else:
+                Sigma_pair, _ = qm.covariance_min_history(df_xts[assets], min_observations)
+                mensual = pd.DataFrame(
+                    np.asarray(rk.nearest_psd(Sigma_pair, eps_rel=1e-8), dtype=float) * returns_per_year,
+                    index=list(assets), columns=list(assets))
+                cosida = qm.stitch_covariance(assets, Sigma_daily_df, daily_names, mensual)
+                Sigma_hist = np.asarray(rk.nearest_psd(cosida, eps_rel=1e-8), dtype=float)
+                cov_label = ("mixta: diaria EWMA+LW en la submatriz larga, "
+                             "mensual por pares en el resto")
+                print("   COVARIANZA MIXTA: la historia corta no descarta el EWMA diario.")
+                print(f"      fuera de la diaria: {align_info['dropped_low_coverage']}")
+            vol_daily_based = np.sqrt(np.clip(np.diag(np.asarray(Sigma_daily_df, dtype=float)), 0, None))
+            en_diaria = [a for a in assets if a in daily_names]
+            vol_monthly_based = df_xts[en_diaria].std().values * math.sqrt(12)
             print(f"      obs diarias: {cov_info['n_obs']} | t_eff (Kish): {cov_info['t_eff']:.1f} "
                   f"| delta shrinkage: {cov_info['delta']:.3f}")
-            print(f"      vol anual media: mensual={vol_monthly_based.mean() * 100:.1f}% -> "
+            print(f"      vol anual media (nombres con diaria): mensual={vol_monthly_based.mean() * 100:.1f}% -> "
                   f"diaria+EWMA={vol_daily_based.mean() * 100:.1f}%")
         else:
             print(f"   ADVERTENCIA Cobertura diaria insuficiente "
@@ -1808,6 +1865,7 @@ if use_daily_cov:
 if Sigma_hist is None:
     Sigma_pair, _ = qm.covariance_min_history(df_xts[assets], min_observations)
     Sigma_hist = np.asarray(rk.nearest_psd(Sigma_pair, eps_rel=1e-8), dtype=float) * returns_per_year
+    cov_label = "mensual por pares"
     print("   COVARIANZA: muestral mensual por pares, anualizada (fallback; cada serie usa su historia)")
 
 # ==============================================================================
@@ -1826,6 +1884,14 @@ elif disp_info["mode"] == "insuficiente":
 elif disp_info["n"] < n_assets:
     print(f"   Quedan fuera ETFs, internacionales y nombres sin MFIV "
           f"({n_assets - disp_info['n']} de {n_assets}).")
+_cap_share = disp_info.get("cap_share", float("nan"))
+_txt_share = f"{_cap_share:.1%}" if np.isfinite(_cap_share) else "n/d"
+print(f"   Cobertura de la cesta: cap_share={_txt_share} de la cap conocida | "
+      f"n_caps={disp_info.get('n_caps_conocidas', 0)}")
+cesta_ok = qm.dispersion_usable(disp_info, dispersion_min_cap_share, dispersion_min_known_caps)
+if not cesta_ok:
+    print(f"   Cobertura bajo el minimo ({dispersion_min_cap_share:.0%} y "
+          f"{dispersion_min_known_caps} caps): se usa la correlacion realizada.")
 sigma_i = iv_final
 sigma_i_q = iv_final_q
 
@@ -1840,7 +1906,7 @@ np.fill_diagonal(R_hist_full, 1.0)
 tril_idx = np.tril_indices(n_assets, k=-1)
 rho_realized_avg = float(np.nanmean(R_hist_full[tril_idx]))
 
-if sigma_total_sq > weighted_var_i and sigma_total_sq > 0:
+if cesta_ok and sigma_total_sq > weighted_var_i and sigma_total_sq > 0:
     rho_implied_q = (var_spy_impl - weighted_var_i) / (sigma_total_sq - weighted_var_i)
     rho_implied_q = max(-0.999, min(0.999, rho_implied_q))
     print(f"   Correlacion promedio implicita Q (dispersion SPY): {rho_implied_q:.4f}")
@@ -1849,15 +1915,19 @@ if sigma_total_sq > weighted_var_i and sigma_total_sq > 0:
         rho_implied_avg, crp_ratio = rk.q_to_p_correlation(
             rho_implied_q, rho_realized_avg,
             ratio_bounds=crp_ratio_bounds, fallback_ratio=crp_fallback_ratio)
-        print(f"   Correlacion realizada (diaria EWMA):        {rho_realized_avg:.4f}")
+        print(f"   Correlacion realizada ({cov_label}):        {rho_realized_avg:.4f}")
+        rho_bruto = rho_implied_avg
+        rho_implied_avg = qm.clip_implied_correlation(rho_implied_avg)
         print(f"   Correlacion promedio P (post-correccion):   {rho_implied_avg:.4f} "
               f"(ratio={crp_ratio:.3f})")
+        if rho_implied_avg != rho_bruto:
+            print(f"   Correlacion P recortada a >= 0 (venia de {rho_bruto:.4f})")
     else:
-        rho_implied_avg = rho_implied_q
-        print("   ADVERTENCIA use_q_to_p_correlation=False - correlacion bajo medida Q")
+        rho_implied_avg = qm.clip_implied_correlation(rho_implied_q)
+        print("   ADVERTENCIA use_q_to_p_correlation=False - correlacion bajo medida Q, piso 0")
 else:
-    rho_implied_avg = max(-0.999, min(0.999, rho_realized_avg))
-    print(f"   Correlacion promedio implicita (fallback historico): {rho_implied_avg:.4f}")
+    rho_implied_avg = qm.clip_implied_correlation(rho_realized_avg)
+    print(f"   Correlacion promedio (fallback a la realizada, piso 0): {rho_implied_avg:.4f}")
 
 rho_hist_avg_ref = np.nanmean(np.abs(R_hist_full[tril_idx]))
 
@@ -1899,9 +1969,12 @@ for etf in etf_sectoriales:
         else:
             rho_sec = rho_sec_q
 
+        rho_sec_bruto = rho_sec
+        rho_sec = qm.clip_implied_correlation(rho_sec)
         rho_sector_lookup[etf] = rho_sec
+        _recorte = "" if rho_sec == rho_sec_bruto else f", recortada desde {rho_sec_bruto:.4f}"
         print(f"      {etf:<5}: rho Q = {rho_sec_q:.4f} -> rho P = {rho_sec:.4f} "
-              f"(realizada {rho_sec_realized:.4f}, {len(stocks_sector)} acciones)")
+              f"(realizada {rho_sec_realized:.4f}, {len(stocks_sector)} acciones{_recorte})")
 
 n_sectores_ok = sum(1 for v in rho_sector_lookup.values() if not pd.isna(v))
 print(f"   Correlacion sectorial calculada para {n_sectores_ok} de {len(etf_sectoriales)} sectores")
@@ -2520,14 +2593,23 @@ def calc_mdd(returns_vector):
     return mdd
 
 
-portfolio_hist = df_prices_monthly[
-    df_prices_monthly["symbol"].isin(tickers_portfolio)
-    & (df_prices_monthly["date"].dt.year >= mdd_start_year)
-    & (df_prices_monthly["date"].dt.year <= max(target_years))
+_mdd_base = df_prices_monthly
+_mdd_fuente = "mensual"
+if df_daily_for_mdd is not None and len(df_daily_for_mdd):
+    _diaria = df_daily_for_mdd[df_daily_for_mdd["symbol"].isin(tickers_portfolio)]
+    if len(_diaria) >= 20 and _diaria["symbol"].nunique() >= 1 and "return" in _diaria.columns:
+        _mdd_base = _diaria.rename(columns={"return": "monthly_return"})
+        _mdd_fuente = "diaria"
+portfolio_hist = _mdd_base[
+    _mdd_base["symbol"].isin(tickers_portfolio)
+    & (_mdd_base["date"].dt.year >= mdd_start_year)
+    & (_mdd_base["date"].dt.year <= max(target_years))
 ]
 
-print(f"  Datos historicos: {len(portfolio_hist)} observaciones | "
-      f"{portfolio_hist['date'].min():%Y-%m} a {portfolio_hist['date'].max():%Y-%m}")
+_fmt_mdd = "%Y-%m-%d" if _mdd_fuente == "diaria" else "%Y-%m"
+print(f"  Datos historicos ({_mdd_fuente}): {len(portfolio_hist)} observaciones | "
+      f"{portfolio_hist['date'].min().strftime(_fmt_mdd)} a "
+      f"{portfolio_hist['date'].max().strftime(_fmt_mdd)}")
 
 portfolio_wide = portfolio_hist.pivot_table(index="date", columns="symbol", values="monthly_return").sort_index()
 

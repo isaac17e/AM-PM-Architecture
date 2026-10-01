@@ -53,7 +53,7 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 TICKERS = [
     "META", "GOOGL", "ORCL", "DELL", "MSFT",
     "BLK", "CRM", "CMCSA", "GS", "REGN",
-    "ABNB", "ARES", "LVS", "BXP", "CYBR",
+    "ABNB", "ARES", "LVS", "BXP", "CRWD",
     "YELP", "EBAY", "IT", "EL"
 ]
 
@@ -117,7 +117,7 @@ ETF_TICKERS = [
     "REM",
     "ARKW", "ARKF",
     "VWO", "EEM", "EFA", "VGK", "EZU", "AAXJ", "EWJ", "MCHI", "FXI", "INDA",
-    "ILF", "EWZ", "VXUS", "ACWX", "VT", "FM", "EWC", "EWG", "EWU", "EWQ", "EWP",
+    "ILF", "EWZ", "VXUS", "ACWX", "VT", "EWC", "EWG", "EWU", "EWQ", "EWP",
 ]
 COMMODITY_TICKERS = ["SLV", "UNG"]
 
@@ -202,6 +202,14 @@ EP_TOL_ENS = 0.10
 # ------------------------------------------------------------------------------
 NIVEL_CONFIANZA_VAR = 0.95
 BKM_MFIK_MAX = 20.0
+# Tope de MFIK: 20 con cadena corta, hasta BKM_MFIK_MAX_HARD si hay muchos
+# strikes OTM observados (no los puntos de la rejilla sintetica). Un indice
+# liquido supera 20 sin que el momento sea inadmisible.
+BKM_MFIK_MAX_HARD = 80.0
+# Alas de la integral BKM. +/-6 sigma sobre SSVI inflaba el MFIV frente a la
+# cadena OTM de mercado (META ~4x). Se corta en +/- BKM_N_STD y en el k visto.
+BKM_N_STD = 3.0
+BKM_MFIV_RATIO = (0.80, 2.0)
 NIVELES_CVAR = (0.95, 0.99)
 UMBRAL_OMEGA_RATIO = 0.0
 
@@ -219,6 +227,19 @@ MAX_ESCENARIOS_LP = 4000
 # ------------------------------------------------------------------------------
 # VALIDACION DE API KEY Y SEMILLA GLOBAL
 # ------------------------------------------------------------------------------
+# AMPM_SMOKE=1 ejecuta el script con universo chico y sin Polygon, para que
+# un test pueda recorrer el camino hasta Cornish-Fisher (el alias `rk` no
+# puede quedar pisado por un array).
+if os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}:
+    USAR_IV_POLYGON = False
+    TICKERS = ["AAPL", "MSFT", "SPY"]
+    N_ESCENARIOS = 60
+    N_REP_BOOTSTRAP_MOM = 2
+    J_POR_REPLICA_MOM = 30
+    N_MC_DELTA = 4
+    MAX_ESCENARIOS_LP = 30
+    MIN_VENTANAS_ROLLING = 4
+
 if USAR_IV_POLYGON and not POLYGON_API_KEY:
     raise ValueError(
         "USAR_IV_POLYGON = True pero POLYGON_API_KEY no esta definida. "
@@ -422,12 +443,6 @@ if USAR_IV_POLYGON:
         phi = phi_powerlaw(theta, eta, gamma)
         return theta / 2 * (1 + rho * phi * k + np.sqrt((phi * k + rho) ** 2 + (1 - rho ** 2)))
 
-    def sigmoid(x):
-        return 1 / (1 + np.exp(-x))
-
-    def qlogis(p):
-        return math.log(p / (1 - p))
-
     def calibrar_ssvi_ticker(ticker, api_key, tau_obj,
                               min_strikes=MIN_STRIKES_SLICE,
                               min_dias=MIN_DIAS_VENCIMIENTO):
@@ -509,39 +524,22 @@ if USAR_IV_POLYGON:
 
         theta_por_fila = theta_fijo[datos["slice"].values]
 
-        u0 = np.array([math.atanh(0.0), math.log(1.0), qlogis((0.3 - 0.05) / 0.9)])
-
-        def objetivo(u):
-            rho = math.tanh(u[0])
-            eta = math.exp(u[1])
-            gamma = sigmoid(u[2]) * 0.9 + 0.05
-
-            w_modelo = ssvi_w(datos["k"].values, theta_por_fila, rho, eta, gamma)
-            error_ajuste = np.sum((w_modelo - datos["w"].values) ** 2)
-
-            gj = theta_fijo * phi_powerlaw(theta_fijo, eta, gamma) * (1 + abs(rho))
-            penalizacion = np.sum(np.maximum(0, gj - 4) ** 2) * 1e3
-
-            return error_ajuste + penalizacion
-
-        opt = minimize(objetivo, u0, method="BFGS", options=dict(maxiter=2000, gtol=1e-10))
-
-        rho = math.tanh(opt.x[0])
-        eta = math.exp(opt.x[1])
-        gamma = sigmoid(opt.x[2]) * 0.9 + 0.05
-
-        gj_max = np.max(theta_fijo * phi_powerlaw(theta_fijo, eta, gamma) * (1 + abs(rho)))
-        sin_arbitraje = gj_max <= 4 + 1e-6
-
-        ssvi_confiable = opt.success and sin_arbitraje
-        metodo = "ssvi_conjunto" if ssvi_confiable else "ssvi_no_convergio"
+        ajuste = bm.fit_ssvi(
+            datos["k"].values, datos["w"].values, theta_por_fila, theta_fijo,
+            slice_index=datos["slice"].values)
+        if not ajuste["aceptado"]:
+            raise ValueError(
+                f"SSVI rechazado (rmse_rel={ajuste['rmse_rel']:.3f}, "
+                f"GJ_max={ajuste['gj_max']:.3f}, success={ajuste['success']})"
+            )
 
         # sqrt(w/T) es la vol ANUAL. Sigma y el fallback de MFIV viven al horizonte.
         sigma_atm_annual = math.sqrt(theta_tau / tau_obj)
 
         return dict(sigma_atm_annual=sigma_atm_annual, theta_j=theta_fijo, t_years=t_years,
-                    rho=rho, eta=eta, gamma=gamma, n_vencimientos=m,
-                    metodo=metodo, gj_max=gj_max)
+                    rho=ajuste["rho"], eta=ajuste["eta"], gamma=ajuste["gamma"],
+                    n_vencimientos=m, metodo=ajuste["metodo"], gj_max=ajuste["gj_max"],
+                    n_strikes=ajuste["n_strikes"], k_min=ajuste["k_min"], k_max=ajuste["k_max"])
 
     sigma_iv_horizon = {t: np.nan for t in tickers}
     sigma_iv_annual = {t: np.nan for t in tickers}
@@ -620,10 +618,10 @@ def otm_price_ssvi(K, S, F, T, r, rho, eta, gamma, theta_tau):
 
 
 def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
-                          n_std=6, n_puntos=400):
+                          n_std=BKM_N_STD, n_puntos=400, k_min=None, k_max=None):
     sigma_atm = sigma_desde_ssvi(F, F, T, rho, eta, gamma, theta_tau)
-    K_min = F * np.exp(-n_std * sigma_atm * np.sqrt(T))
-    K_max = F * np.exp(n_std * sigma_atm * np.sqrt(T))
+    K_min, K_max = bm.integration_strike_bounds(
+        F, sigma_atm, T, n_std=n_std, k_min=k_min, k_max=k_max)
     strikes = np.linspace(K_min, K_max, n_puntos)
 
     precios = np.array([
@@ -677,12 +675,23 @@ for tk in tickers:
         resultado_bkm = calcular_bkm_moments(
             S=S_tk, F=F_tk, T=tau_horizonte, r=r_bkm,
             rho=det["rho"], eta=det["eta"], gamma=det["gamma"],
-            theta_tau=theta_tau_tk,
+            theta_tau=theta_tau_tk, n_std=BKM_N_STD,
+            k_min=det.get("k_min"), k_max=det.get("k_max"),
         )
-        if not rk.higher_moments_admissible(resultado_bkm["MFIS"], resultado_bkm["MFIK"], BKM_MFIK_MAX):
-            print(f"  {tk}: MFIS/MFIK inadmisibles ({resultado_bkm['MFIS']:.3f}, "
-                  f"{resultado_bkm['MFIK']:.3f}) -> neutro (MFIS=0, MFIK=3)")
-            resultado_bkm = {**resultado_bkm, "MFIS": 0.0, "MFIK": 3.0}
+        banda = bm.mfiv_vs_atm(resultado_bkm["MFIV"], theta_tau_tk, *BKM_MFIV_RATIO)
+        if not banda["ok"]:
+            print(f"  {tk}: MFIV/varianza ATM = {banda['ratio']} fuera de "
+                  f"{BKM_MFIV_RATIO}; se usa la varianza ATM y momentos neutros")
+            resultado_bkm = {**resultado_bkm, "MFIV": banda["mfiv"], "MFIS": 0.0, "MFIK": 3.0}
+        else:
+            cap_mfik = rk.mfik_cap(
+                det.get("n_strikes", 0), base=BKM_MFIK_MAX, hard=BKM_MFIK_MAX_HARD)
+            if not rk.higher_moments_admissible(
+                    resultado_bkm["MFIS"], resultado_bkm["MFIK"], cap_mfik):
+                print(f"  {tk}: MFIS/MFIK inadmisibles ({resultado_bkm['MFIS']:.3f}, "
+                      f"{resultado_bkm['MFIK']:.3f}, tope {cap_mfik:.1f} con "
+                      f"{det.get('n_strikes', 0)} strikes) -> neutro (MFIS=0, MFIK=3)")
+                resultado_bkm = {**resultado_bkm, "MFIS": 0.0, "MFIK": 3.0}
         bkm_moments[tk] = resultado_bkm
         print(f"  {tk}: MFIV={resultado_bkm['MFIV']:.4f} | MFIS={resultado_bkm['MFIS']:.3f} "
               f"| MFIK={resultado_bkm['MFIK']:.3f}")
@@ -833,16 +842,17 @@ def media_hac(x):
 
 filas_roll = []
 for tk in tickers:
-    rv, rs, rk = momentos_realizados_rolling(retornos_dia[tk])
+    # kurt_roll, no `rk`: ese nombre es el modulo risk_estimators.
+    rv, rs, kurt_roll = momentos_realizados_rolling(retornos_dia[tk])
     if len(rv) < MIN_VENTANAS_ROLLING:
         filas_roll.append(dict(ticker=tk, n_ventanas=len(rv),
                                RV_med=float(Sigma_hist_df.loc[tk, tk]), RV_se=np.nan,
                                RS_roll=0.0, RK_roll=3.0))
         continue
-    rv, rs, rk = winsorizar(rv), winsorizar(rs), winsorizar(rk)
+    rv, rs, kurt_roll = winsorizar(rv), winsorizar(rs), winsorizar(kurt_roll)
     rv_m, rv_se, _ = media_hac(rv)
     rs_m, _, _ = media_hac(rs)
-    rk_m, _, _ = media_hac(rk)
+    rk_m, _, _ = media_hac(kurt_roll)
     filas_roll.append(dict(ticker=tk, n_ventanas=len(rv),
                            RV_med=rv_m, RV_se=rv_se, RS_roll=rs_m, RK_roll=rk_m))
 
@@ -1425,14 +1435,21 @@ N_VIEWS = 3
 # ==============================================================================
 P = pd.DataFrame(0.0, index=[f"View_{i+1}" for i in range(N_VIEWS)], columns=tickers)
 
-P.loc["View_1", "DELL"] = 1
-P.loc["View_1", "META"] = -1
+if os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}:
+    cols = list(P.columns)
+    for i, (a, b) in enumerate(((0, 1), (1, 2), (0, 2))):
+        if i < len(P.index) and b < len(cols):
+            P.iloc[i, a] = 1.0
+            P.iloc[i, b] = -1.0
+else:
+    P.loc["View_1", "DELL"] = 1
+    P.loc["View_1", "META"] = -1
 
-P.loc["View_2", "GS"] = 1
-P.loc["View_2", "REGN"] = -1
+    P.loc["View_2", "GS"] = 1
+    P.loc["View_2", "REGN"] = -1
 
-P.loc["View_3", "EBAY"] = 1
-P.loc["View_3", "ARES"] = -1
+    P.loc["View_3", "EBAY"] = 1
+    P.loc["View_3", "ARES"] = -1
 
 print("\n=== Matriz P (views del gestor) ===")
 print(P.round(4))

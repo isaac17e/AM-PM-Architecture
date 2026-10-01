@@ -84,6 +84,9 @@ bkm_moneyness_lo = 0.70
 bkm_moneyness_hi = 1.30
 bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
+# Con pocos strikes OTM el tope sigue en 20. Con una cadena densa sube hasta
+# bkm_mfik_max_hard: SPY y otros indices superan 20 sin ser inadmisibles.
+bkm_mfik_max_hard = 80.0
 tail_risk_min_hist_weeks = 26
 tail_risk_filter_confidence = 0.99
 cornish_fisher_confidence = 0.95
@@ -162,7 +165,7 @@ annualization_factor = 52
 # consultando para el shrinkage de la covarianza y las griegas de diagnostico.
 delta_strike_mode = "atm"
 target_dte_iv = 30
-dte_tol_iv = 7
+dte_tol_iv = 21
 moneyness_tol_iv = 0.02
 
 # ------------------------------------------------------------------------------
@@ -352,7 +355,7 @@ etf_geograficos = [
     "AAXJ", "EWJ",
     "MCHI", "FXI", "INDA",
     "ILF", "EWZ",
-    "VXUS", "ACWX", "VT", "FM",
+    "VXUS", "ACWX", "VT",
     "EWC", "EWG", "EWU", "EWQ", "EWP",
 ]
 etf_tickers = list(dict.fromkeys(etf_core + etf_sectoriales + etf_subsectoriales + etf_geograficos))
@@ -533,6 +536,7 @@ for i, ticker in enumerate(all_tickers, start=1):
         successful_tickers.append(ticker)
     else:
         failed_tickers.append(ticker)
+        print(f"   {ticker}: sin cotizacion en Yahoo; se excluye")
     if i % 25 == 0 or i == n_total:
         print(f"   Descargados {i}/{n_total}...")
 
@@ -781,7 +785,7 @@ def get_polygon_option_snapshot(ticker):
             raise ValueError("sin spot Yahoo para filtrar la llamada a Polygon")
 
         hoy = date.today()
-        fecha_min = (hoy + timedelta(days=target_dte_iv - dte_tol_iv)).strftime("%Y-%m-%d")
+        fecha_min = (hoy + timedelta(days=max(target_dte_iv - dte_tol_iv, 1))).strftime("%Y-%m-%d")
         fecha_max = (hoy + timedelta(days=target_dte_iv + dte_tol_iv)).strftime("%Y-%m-%d")
         strike_min = round(S * (1 - moneyness_tol_iv), 2)
         strike_max = round(S * (1 + moneyness_tol_iv), 2)
@@ -861,7 +865,7 @@ def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
 def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_hi):
     """Cadena OTM paginada de un unico vencimiento (el mas cercano a target_dte)."""
     hoy = date.today()
-    fecha_min = (hoy + timedelta(days=target_dte - dte_tol)).strftime("%Y-%m-%d")
+    fecha_min = (hoy + timedelta(days=max(target_dte - dte_tol, 1))).strftime("%Y-%m-%d")
     fecha_max = (hoy + timedelta(days=target_dte + dte_tol)).strftime("%Y-%m-%d")
     return pc.fetch_otm_chain(
         pc.polygon_format_ticker(ticker), S, fecha_min, fecha_max,
@@ -925,8 +929,10 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
     motivo = None
-    if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
-        motivo = f"momentos_inadmisibles (MFIS={mfis:.2f}, MFIK={mfik:.2f}; MFIV se conserva)"
+    cap_mfik = rk.mfik_cap(n_c + n_p, base=bkm_mfik_max, hard=bkm_mfik_max_hard)
+    if not rk.higher_moments_admissible(mfis, mfik, cap_mfik):
+        motivo = (f"momentos_inadmisibles (MFIS={mfis:.2f}, MFIK={mfik:.2f}, "
+                  f"tope={cap_mfik:.1f} con {n_c + n_p} strikes OTM; MFIV se conserva)")
         mfis, mfik = np.nan, np.nan
 
     return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True, motivo=motivo)
@@ -1675,6 +1681,15 @@ else:
         )
 
 n_etf_en_pool = sum(1 for t in optimization_pool if t in etf_universe_tickers)
+if use_etf_band:
+    _etf_min, _etf_max, _nota_banda = pq.relax_group_band(
+        n_etf_en_pool, len(optimization_pool) - n_etf_en_pool, max_weight_per_asset,
+        etf_min_weight, etf_max_weight)
+    etf_min_weight, etf_max_weight = _etf_min, _etf_max
+    if _nota_banda:
+        print(f"  ADVERTENCIA Banda ETF: {_nota_banda}")
+    if n_etf_en_pool == 0:
+        use_etf_band = False
 if use_etf_band:
     print(f"[INFO] Restriccion de participacion ETF activa: {etf_min_weight * 100:.0f}%-{etf_max_weight * 100:.0f}% "
           f"del capital invertido")
