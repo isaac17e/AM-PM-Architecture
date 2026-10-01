@@ -1,23 +1,25 @@
 # AM-PM
 
-A collection of Python scripts for **portfolio construction, active management, and risk monitoring**, built on market data (Yahoo Finance) and the options chain from **Polygon.io**.
+Python scripts for **portfolio construction** on market data (Yahoo Finance) and the options chain from **Polygon.io**.
 
-The repository combines classical portfolio optimization (mean-variance, quadratic utility, minimum variance, Black-Litterman) with forward-looking information extracted from the options market: implied volatility, Bakshi-Kapadia-Madan (BKM) risk-neutral moments, dealer gamma exposure (GEX), order flow, and Cornish-Fisher expansions for tail risk.
+The repository combines classical portfolio optimization (quadratic utility, minimum tail risk, Black-Litterman) with forward-looking information from the options market: implied volatility, Bakshi-Kapadia-Madan (BKM) risk-neutral moments, risk-neutral to physical (Q→P) corrections, and Cornish-Fisher tail risk.
 
-> ⚠️ **Disclaimer**: this code is quantitative research and analysis material. It is not investment advice. The default parameters (portfolios, tickers, rates) are examples and should be adjusted before any real use.
+> ⚠️ **Disclaimer**: this code is quantitative research. It is not investment advice. The default parameters (universes, tickers, rates) are examples and should be adjusted before any real use.
+
+The active-management and visualization scripts (`entry_signal_tool.py`, `active_management.py`, `portfolio_risk_score_leverage.py`, `portfolio_gex_field.py`) were removed from this repository. They are not part of the pipeline below.
 
 ---
 
 ## Table of contents
 
 - [Workflow architecture](#workflow-architecture)
+- [Pull request merge order](#pull-request-merge-order)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Methodology knobs that do not change the default](#methodology-knobs-that-do-not-change-the-default)
 - [Scripts](#scripts)
-  - [1. Portfolio construction](#1-portfolio-construction)
-  - [2. Active management and entry signals](#2-active-management-and-entry-signals)
-  - [3. Risk and visualization](#3-risk-and-visualization)
+- [Tests](#tests)
 - [Key concepts](#key-concepts)
 - [Notes on the Polygon API](#notes-on-the-polygon-api)
 
@@ -25,55 +27,61 @@ The repository combines classical portfolio optimization (mean-variance, quadrat
 
 ## Workflow architecture
 
-The scripts run independently, but they are designed to chain together: the output of an optimizer (a `ticker: weight` dictionary) becomes the input for the management and risk modules.
+Each optimizer is a standalone script. Shared estimation lives in imported modules, not in a second copy of the formulas.
 
 ```
-                        risk_estimators.py
-                 (shared estimation layer, imported by all optimizers)
-                                   │
-   [ SELECTION + OPTIMIZATION ]    │
-   quadratic_utility.py     ◄──────┤
-   minimum_variance.py      ◄──────┤  ──►  portfolio  { "GLD": 0.18, "DHR": 0.18, ... }
-   black_litterman.py       ◄──────┘             │
-                                                 ▼
-                              ┌──────────────────┴──────────┐
-                              ▼                             ▼
-                       [ ENTRY TIMING ]          [ MANAGEMENT AND RISK ]
-                   entry_signal_tool.py           active_management.py
-                                                  portfolio_risk_score_leverage.py
-                                                  portfolio_gex_field.py
+   polygon_client.py          rate limit, cache, pagination, OTM chain, ticker format
+   risk_estimators.py         EWMA+LW, Q→P, Cornish-Fisher, time scaling, trapezoid
+   market_data.py             currency from the provider, bounded ffill, partial weeks
+   portfolio_constraints.py   quadprog weight bands (minimum variance)
+   qu_metrics.py              quadratic-utility helpers (correlation, horizon, lambda, tails)
+   bl_metrics.py              Black-Litterman units, market delta, log-return drawdown
+                 │
+   quadratic_utility.py              (+ quadratic_utility_(seasonal_version).py)
+   minimum_variance.py               (+ minimum_variance_(seasonal_version).py)
+   black_litterman.py
+                 │
+                 ▼
+        portfolio weights, console summary, Plotly charts
 ```
+
+### `polygon_client.py`
+Shared Polygon.io access: a process-wide rate limiter, retries with `Retry-After`, pagination that never treats a truncated chain as complete, a disk cache (permanent for history, TTL for snapshots), and `polygon_format_ticker` (`BRK-B` → `BRK.B`) so every script asks for the same contract.
 
 ### `risk_estimators.py`
-A dependency-free (numpy/pandas/scipy only) module holding the estimation logic
-the optimizers share, so the same choices are not re-implemented five times:
+Estimation the optimizers share: EWMA covariance with Ledoit-Wolf shrinkage, Q→P vol and correlation, co-moment portfolio skewness and kurtosis, Cornish-Fisher VaR/ES (Maillard, 2012), `scale_moments` / `implied_variance_to_horizon` for changing the horizon, and `trapezoid` (`np.trapezoid` on NumPy 2, `np.trapz` on 1.x). BKM integration goes through `trapezoid`; no script calls `np.trapezoid` directly.
 
-| Function | Purpose |
-|---|---|
-| `cov_ewma_shrunk` | EWMA covariance + Ledoit-Wolf shrinkage toward a constant-correlation target. Replaces the equal-weighted sample covariance. |
-| `q_to_p_vol` / `q_to_p_correlation` | Risk-neutral → physical corrections for the variance and correlation risk premia. |
-| `standardized_panel` / `rescale_panel` / `portfolio_moments` | Portfolio skewness and kurtosis from co-moments, in `O(J·n)`, instead of averaging marginal moments. |
-| `portfolio_moment_gradients` | Analytic gradients of σ, skew and excess kurtosis, for Euler-style marginal CVaR contributions. |
-| `higher_moments_admissible` | Checks that a (skewness, kurtosis) pair is possible (K ≥ 1 + S²) and below a sanity ceiling. Used to reject bad BKM integrations instead of clipping them. |
-| `cornish_fisher_tail` / `var_cvar_cornish_fisher` / `cornish_fisher_es_gradient` | Cornish-Fisher quantile and closed-form ES built from the **actual** skewness and kurtosis (Maillard, 2012): the expansion parameters are solved so the resulting distribution has those moments, which keeps the quantile monotone in S and K. |
-| `martin_wagner_excess_return` | **Experimental, off by default.** Expected return from risk-neutral variance. The formula is not verified against the source paper — see the warning in the module. |
+### `market_data.py`
+Currency comes from the provider (`yfinance` `history_metadata`). A manual override is used only when the provider is silent, and a contradiction is reported rather than applied (HSBC and BP are USD ADRs). Prices in minor units (GBp, ZAc) are scaled before FX. Daily panels align to one calendar with a bounded forward-fill. A weekly `resample("W")` drops the in-progress week.
+
+### `portfolio_constraints.py`
+Quadprog constraint columns for minimum variance: per-asset bounds, full investment, the ETF band, and the FX cap. The optimizer and the efficient frontier use the same block. `bs_call_delta` documents why an ATM delta filter (`K = S`, `delta_min = 0.30`) never dropped a name.
+
+### `qu_metrics.py`
+Quadratic-utility pieces that do not need Polygon: average absolute correlation of a full matrix row, the history window through the last complete month, monthly annualization (return ×12, vol ×√12), optional annual-lambda conversion, MFIS tail choice, minimum history per ticker, pairwise covariance, skip-na portfolio returns, the SPY dispersion basket, and the historical OTM grid used to rebuild MFIS.
+
+### `bl_metrics.py`
+Black-Litterman units (annual SSVI vol versus horizon variance), the three market-delta modes, and maximum drawdown of log returns via `exp(cumsum)`.
+
+---
+
+## Pull request merge order
+
+The fixes are stacked. Merge them in this order, retargeting the next PR to `main` after each merge:
+
+1. **#2** `cursor/shared-modules-fixes-2e98` — `polygon_client.py`, `risk_estimators.py`, tests. Base: `main`.
+2. **#3** `cursor/minimum-variance-fixes-2e98` — both minimum-variance scripts, `market_data.py`, `portfolio_constraints.py`. Base: #2.
+3. **#4** `cursor/quadratic-utility-fixes-2e98` — both quadratic-utility scripts, `qu_metrics.py`. Base: #3.
+4. **This PR** — `black_litterman.py`, `bl_metrics.py`, this README. Base: #4.
 
 ---
 
 ## Requirements
 
 - Python 3.9 or higher
-- A [Polygon.io](https://polygon.io) API key (the options modules will not work without one)
+- A [Polygon.io](https://polygon.io) API key for any path that reads the options chain
 
-Libraries used:
-
-| Area | Packages |
-|---|---|
-| Data and computation | `numpy`, `pandas`, `requests`, `python-dateutil` |
-| Market data | `yfinance`, `pandas-datareader`, `beautifulsoup4` |
-| Statistics / optimization | `scipy`, `statsmodels`, `quadprog` |
-| Visualization | `plotly`, `matplotlib` |
-| Environment | `python-dotenv` |
+Libraries are pinned in `requirements.txt` (NumPy ≥ 1.24, pandas, SciPy, requests, python-dotenv, yfinance, pandas-datareader, beautifulsoup4, lxml, statsmodels, quadprog, plotly, pytest). `quadprog` needs a C compiler; on Windows a prebuilt wheel is easier.
 
 ---
 
@@ -84,27 +92,30 @@ git clone https://github.com/isaac17e/AM-PM.git
 cd AM-PM
 
 python -m venv .venv
-source .venv/bin/activate        # on Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-pip install numpy pandas requests python-dateutil \
-            yfinance pandas-datareader beautifulsoup4 \
-            scipy statsmodels quadprog \
-            plotly matplotlib python-dotenv
+pip install -r requirements.txt
 ```
-
-`quadprog` requires a C compiler. On Windows it is usually easier to install it from a prebuilt wheel.
 
 ## Configuration
 
-Create a `.env` file in the repository root (it is already covered by `.gitignore`):
+Create a `.env` file in the repository root (it is covered by `.gitignore`):
 
 ```env
 POLYGON_API_KEY=your_api_key_here
+POLYGON_CALLS_PER_MIN=300
 ```
 
-Every script loads it via `load_dotenv()`. If the key is missing, the optimizers print a warning and fall back to historical methods, while the options-driven modules (`black_litterman.py` with `USAR_IV_POLYGON = True`, `portfolio_gex_field.py`, `active_management.py`, `entry_signal_tool.py`) will not run correctly.
+| Variable | Role |
+|---|---|
+| `POLYGON_API_KEY` | Polygon key. Without it, every options call returns `sin_api_key` and is not retried. `black_litterman.py` with `USAR_IV_POLYGON = True` stops at startup. The other optimizers continue on the historical fallback and print why each ticker missed the chain. |
+| `POLYGON_CALLS_PER_MIN` | Rate cap. Default **300** (5 calls/second), meant for paid plans that still answer 429 under bursts. Use `5` on the free tier. `0`, `none`, or `unlimited` turns the limiter off. |
+| `POLYGON_SNAPSHOT_TTL_MIN` | Snapshot cache TTL in minutes (default 60; `0` disables it). |
+| `POLYGON_CACHE_DIR` | Cache directory (default `.cache/polygon`). |
 
-**Parameters are edited directly in the configuration block at the top of each file.** There is no CLI and no external config file: each script runs with `python script_name.py` and opens its Plotly charts in the browser.
+`bkm_hist_max_minutes` (default **60**, top of `quadratic_utility.py` and its seasonal copy) is not an environment variable. Before rebuilding historical MFIS, the script estimates minutes as pending contract calls divided by `POLYGON_CALLS_PER_MIN`. Above that budget it skips the historical z-score and still computes the live moments. A cold `mfis_hist_v2` cache on the full OTM chain is expected to hit the cap; later runs only pay uncached dates. The estimate assumes about `bkm_hist_contracts_estimate` (40) priced contracts per date.
+
+**Parameters are edited in the configuration block at the top of each file.** There is no CLI. Run a script with `python script_name.py`. Plotly charts open in the browser.
 
 ### ETFs in the resulting portfolio
 
@@ -123,136 +134,108 @@ The switch only affects the final optimization. ETFs are still downloaded and us
 
 ---
 
+## Methodology knobs that do not change the default
+
+These exist so the choice is explicit. Leaving them at the default reproduces the previous behavior.
+
+| Knob | Where | Default | What the other settings do |
+|---|---|---|---|
+| `lambda_annual` | both quadratic-utility scripts | `None` (keeps `lambda_` at 0.5 or 0.8, monthly) | If set, monthly λ = `lambda_annual × 12`. That inflates the risk penalty. The ranking-preserving conversion, if λ was defined on annual μ and annual Σ, would leave λ unchanged because the 12 cancels. The summary prints μ′w against (λ/2) w′Σw at the optimum. |
+| `bkm_tail_mode` | both quadratic-utility scripts | `"upper"` | Drops z above the MFIS threshold (call demand; the old label was `cobertura_anomala`). `"lower"` drops z below minus the threshold (put demand, an actual hedge). `"both"` drops whichever side is hit, with `cola_superior` / `cola_inferior`. |
+| `DELTA_MKT_MODO` | `black_litterman.py` | `"historical"` | Equilibrium π = δ Σ w. Historical δ is the 2-year excess return over horizon variance and can be negative. `"fixed"` uses `DELTA_MKT_FIJO` (2.5). `"implied"` is market risk-neutral variance over market physical variance (Martin: the market's excess return is its SVIX²). That ratio usually sits near 1, not near 2.5, because the premium is already in variance units. The run prints the mode and all three numbers. |
+
+---
+
 ## Scripts
 
 ### 1. Portfolio construction
 
-#### `quadratic_utility.py` (~2,460 lines)
-Portfolio optimizer based on **quadratic utility maximization** (`U = μ'w − λ/2 · w'Σw`).
+#### `quadratic_utility.py`
+Portfolio optimizer based on **quadratic utility maximization** (`U = μ'w − λ/2 · w'Σw`), with μ and Σ monthly.
 
 Pipeline:
-1. Builds the universe (top S&P 500 and NASDAQ names via scraping, commodities, ETFs, and international tickers), mapping currency by ticker suffix and converting prices to USD through FX pairs.
-2. Computes descriptive statistics, correlations, and **Fama-French 3-factor betas** (`pandas_datareader`).
-3. **Joint candidate selection via QUBO/Ising**: brute force when the search space is small, simulated annealing otherwise, with an objective blending Sharpe, low volatility, and decorrelation.
-4. Applies sequential filters: delta, recent volatility, IV vs. realized volatility, and a **BKM MFIS filter** (flags anomalous hedging vs. speculation via a z-score against the asset's own historical MFIS).
-5. Builds the covariance matrix as a **shrinkage between implied (BKM) and historical covariance**. The historical leg is estimated from **daily** returns with EWMA weighting and Ledoit-Wolf shrinkage, not from the monthly sample covariance. Implied volatilities and implied correlations are converted from the risk-neutral to the physical measure before use.
-6. Optimizes with `quadprog` and produces: efficient frontier, lambda comparison, risk attribution by Greeks, maximum drawdown analysis, and an executive summary.
+1. Builds the universe (S&P 500 and NASDAQ names, commodities, ETFs, international tickers). Currency comes from the provider, with suffix fallback; prices are converted to USD.
+2. Computes descriptive statistics and **Fama-French 3-factor betas**. Excess return is the stock's monthly return minus that month's French RF column.
+3. **Joint candidate selection via QUBO/Ising**: brute force when the search space is small, simulated annealing otherwise.
+4. Filters: recent volatility, IV vs. realized volatility, and a **BKM MFIS** z-score. The historical MFIS series uses the same OTM rule and moneyness bounds as the live chain (real strikes, real DTE, unadjusted prices).
+5. Covariance is a **shrinkage between implied (BKM) and historical covariance**. The historical leg uses daily returns, bounded calendar alignment, EWMA, and Ledoit-Wolf. Implied vols use each chain's real DTE, then Q→P. A sector implied correlation needs at least `sector_implied_min_names` names (default 4); a two-name sector keeps the global correlation. Call deltas scale expected returns with `delta_scale_mode = "direct"` (the delta itself, clipped to `[delta_min, 1]`). `"minmax"` restores the old cross-sectional stretch. The script prints delta and multiplier per name.
+6. Optimizes with `quadprog`. Output: efficient frontier, lambda comparison, Greeks, maximum drawdown, and an executive summary. Annualization is return ×12 and vol ×√12 from the monthly figures (`qu_metrics.annualize_monthly`).
 
-Key parameters: `lambda_`, `max_weight`, `horizon_months`, `target_total_tickers`, `bkm_z_threshold`, `cornish_fisher_confidence`, `cov_halflife_days`, `use_q_to_p_vol`, `use_q_to_p_correlation`.
+Key parameters: `lambda_`, `lambda_annual`, `max_weight`, `horizon_months`, `target_total_tickers`, `bkm_z_threshold`, `bkm_tail_mode`, `bkm_hist_max_minutes`, `cornish_fisher_confidence`, `cov_halflife_days`, `use_q_to_p_vol`, `use_q_to_p_correlation`.
 
-#### `minimum_variance.py` (~2,100 lines)
-Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**, an evolution of the classical minimum-variance approach.
+#### `minimum_variance.py`
+Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 
-- Replaces the traditional volatility filter with a **Cornish-Fisher VaR** ranking built from risk-neutral moments.
-- **Implied correlation model by factors**: market + sector + country + FX.
-- Blends the factor covariance with a historical one estimated from **daily** returns via EWMA + Ledoit-Wolf shrinkage. Implied volatilities are converted from the risk-neutral to the physical measure (`use_q_to_p_vol`) before entering Σ.
-- Portfolio tail risk is measured from the **co-moments** of an empirical scenario panel, so skewness and kurtosis diversify. The pruning loop's marginal CVaR contribution uses the analytic gradients of those co-moments.
-- Configurable constraints: max/min weight per asset, maximum number of holdings, ETF participation (`etf_max_weight`), and currency exposure (`max_fx_exposure`).
-- Outputs: efficient frontier, Plotly visualizations, and synthetic risk attribution using Black-Scholes Greeks.
+- Ranks names by a **Cornish-Fisher VaR** built from risk-neutral moments, scaled with the chain's real DTE.
+- The tail-risk portfolio is pruned down to `max_assets_in_portfolio` by **smallest weight** (`tail_prune_rule = "min_weight"`). `"max_mtr"` keeps the previous rule (drop the largest marginal tail contribution). Duplicate share classes are removed (`share_class_groups`, default keep `GOOGL` and drop `GOOG`).
+- **Implied correlation by factors**: market + sector + country + FX, with the same Q→P correction on the factors as on the assets.
+- Blends that covariance with a historical one from daily returns (EWMA + Ledoit-Wolf), after a bounded forward-fill so one market's holiday does not delete the row.
+- Portfolio tail risk uses co-moments of a scenario panel. Skewness and kurtosis are scaled to the horizon with the same function as the per-asset filter.
+- Constraints (max/min weight, ETF band, FX cap) are shared with the efficient frontier.
+- The delta screen is off: an ATM call delta is above 0.5 whenever the strike is the spot, so `delta_min = 0.30` never removed a name.
 
-#### `black_litterman.py` (~1,100 lines)
-**Black-Litterman** implementation over a manually defined ticker universe.
+#### `black_litterman.py`
+**Black-Litterman** on a fixed ticker list (19 names).
 
-- Equilibrium returns `π` from reverse CAPM, using market capitalizations as reference weights.
-- Implied volatility from Polygon with an **SSVI** surface fit and PCHIP interpolation.
-- **BKM** module for higher-order risk-neutral moments, used as a bridge to systematically construct `Q` and `Ω` (the views and their uncertainty).
-- The correlation structure behind `Σ`, `Σ_P` and `Σ_BL` comes from **daily** returns with EWMA weighting and Ledoit-Wolf shrinkage (`USAR_COV_DIARIA`, `COV_HALFLIFE_DIAS`).
-- Converts risk-neutral moments to the physical measure before optimizing (`COTA_RATIO_VOL_P`), and computes portfolio moments over an entropy-pooled scenario panel — so skewness and kurtosis diversify correctly. These two were already the model's strongest points and are unchanged.
-- **MVSK** optimization (mean-variance-skewness-kurtosis) instead of pure mean-variance.
-- Predefined risk profiles (`conservador`, `moderado`, `agresivo`) that set `tau`, `omega_scale`, and `gamma_ra`.
-- Reports a `CF_exacta` flag alongside the risk metrics: when it is 0, the portfolio's (skewness, kurtosis) pair is not reachable by the Cornish-Fisher family and the nearest reachable pair was used.
-- Includes maximum drawdown analysis of the resulting portfolio.
+- Equilibrium returns `π = δ Σ w` from reverse CAPM. Market-cap weights are the reference. δ defaults to the historical estimate; see the methodology table.
+- Implied volatility from Polygon with an **SSVI** fit on `|k| <= 0.5` (`SSVI_K_ABS_MAX`), weighted by relative vega and open interest. The ATM vol is annual (`sqrt(total variance / T)`) and is **kept when the smile is rejected**. A fit with `|rho| >= 0.95` or without both wings (`SSVI_K_SIDE_MIN`, `SSVI_MIN_PER_SIDE`) is logged as degenerate and falls back to the ATM source: the wings are not integrated. An accepted smile feeds BKM over **±3 sigma** of the SSVI wings (`BKM_N_STD`), not over the `|k| <= 0.5` calibration window. Σ and the MFIV fallback are the horizon quantities (`bl_metrics`). The Q→P vol ratio is applied only when the vol source is implied (`ssvi` or `atm`). A historical vol is left as the horizon variance. MFIV-vs-ATM and the MFIK cap still apply.
+- **BKM** on the SSVI surface builds `Q` and `Ω`. Integration uses `risk_estimators.trapezoid`.
+- Q→P is a cross-sectional Mincer-Zarnowitz regression (n is the universe, about 19: low power; left as designed) plus an Esscher transform. `COTA_RATIO_VOL_P = (0.70, 1.00)` matches minimum variance and quadratic utility, so physical vol is not allowed above implied vol.
+- Correlation for `Σ_P` comes from daily returns with EWMA and Ledoit-Wolf.
+- Posterior views can be combined by entropy pooling. Optimization is MVSK or CVaR. `LAMBDA3 = LAMBDA4 = 1` on raw central moments is a design note: those terms are small next to mean and variance, so MVSK is close to mean-variance. Not recalibrated here.
+- The historical tail panel uses overlapping horizon windows on about two years of daily data. The window count is not the number of independent observations; that is documented in the output and left overlapping on purpose.
+- Maximum drawdown of the optimized portfolio uses log returns (`exp(cumsum)`), and the portfolio log return is `log(1 + Σ w (e^r − 1))`, not the weighted sum of logs.
 
 Manager views are edited in **Block 6** of the file.
 
+Risk-free fallback `Rf` in this file stays at `0.046`. Minimum variance and quadratic utility use `0.047`.
+
 #### Seasonal versions
-`minimum_variance_(seasonal_version).py` and `quadratic_utility_(seasonal_version).py` mirror the pipelines above, but restrict the analysis to **specific months of the year** (`execution_months` / `rebalance_months`, defaulting to `[9]`).
+`minimum_variance_(seasonal_version).py` and `quadratic_utility_(seasonal_version).py` mirror the pipelines above, but restrict part of the analysis to **specific months** (`execution_months` / `rebalance_months`, default `[9]`). `None` builds that list from the run date (`execution_n_months` / `rebalance_n_months` consecutive months). An explicit list that does not include the current month prints a warning and is left unchanged.
 
-Two things change:
-- The **per-asset Cornish-Fisher VaR filter** is computed over the historical seasonal window rather than the full series (`seasonal_min_weeks` sets the minimum number of valid observations). Note that the **covariance matrix deliberately still uses the full sample**: restricting Σ to one month of the year would leave roughly four observations per year, and the estimation error would swamp any seasonal signal.
-- An exclusion filter on `seasonal_vol_ratio_max` is added: if an asset's seasonal volatility exceeds its general volatility by more than that multiple, it is dropped; `seasonal_min_survivors` prevents the universe from emptying out.
+What is seasonal:
+- The sample used for the seasonal volatility ratio, and the minimum observation count (`seasonal_min_weeks`).
+- In minimum variance, the drift `mu_T` inside the Cornish-Fisher filter, and the historical vol used as the Q→P reference for that filter, are computed on months in `execution_months`.
 
-Use these when optimizing for a specific entry month rather than a generic horizon.
+What is not seasonal:
+- **BKM moments are the live chain** (about 30 DTE; an expiry at or beyond the target, and at least `dte_min_iv` / `polygon_dte_min` days, is preferred over a nearer short-dated expiry), not a September surface. VaR scales those moments to the target tenor. The per-asset CVaR/VaR filter is seasonal only in that drift and in the historical vol reference.
+- Moments from the seasonal window replace BKM **only** when `tail_risk_hist_fallback=True` (default `False`).
+- The **covariance matrix uses the full sample**. Restricting Σ to one month of the year would leave a handful of observations per year.
 
----
-
-### 2. Active management and entry signals
-
-#### `active_management.py` (~790 lines)
-**Tactical rebalancing** engine for an existing portfolio, driven by options-market microstructure.
-
-Blocks:
-1. Options chain extraction and processing (Polygon v3, with pagination and retries).
-2. Microstructure metrics: **GEX** (gamma exposure) and the zero-gamma flip point, order flow, unusual options activity (UOA), sweep dominance, put/call ratio, and **vanna-charm** effects.
-3. A weighted **tactical score** (`score_gex_weight`, `score_flow_sweep`, `score_pcr_scale`, …) that maps to a per-asset recommendation.
-4. Rebalancing with explicit thresholds: increase (score ≥ 50), hold, trim (≤ −50), with freed cash allocated up to the `cash_reserve_limit` cap (30% by default).
-5. Reporting: gamma profiles consolidated onto a single page, plus a before/after allocation chart.
-
-Input: the `portfolio` dictionary and `investment_horizon_days` at the top of the file.
-
-#### `entry_signal_tool.py` (~310 lines)
-A lightweight **entry-timing conviction score**. For each ticker it computes eight indicators and normalizes them by historical percentile:
-
-| Indicator | Weight |
-|---|---|
-| GEX regime | 0.18 |
-| Distance to zero gamma | 0.15 |
-| IV rank | 0.15 |
-| Room to the walls | 0.12 |
-| Skew | 0.10 |
-| Expected move | 0.10 |
-| Smart money | 0.10 |
-| Relative volume | 0.10 |
-
-The resulting score (0-100) maps to a **suggested entry percentage**: full entry above 75, a graduated partial entry between 40 and 75, and a minimal entry below that.
-
-Each run persists results to `entry_signal_history.csv` (one row per ticker per day, replacing the same day's row if it already exists). That history is what feeds the percentiles, so **the first few runs produce weak signals** until enough history accumulates.
-
-It respects Polygon's free-tier limit by waiting `SEGUNDOS_ENTRE_LLAMADAS_STOCKS` (13 s) between tickers.
+The seasonal quadratic-utility script keeps a single QUBO pass. Its `rf_rate` is `0.047`, same as the base script.
 
 ---
 
-### 3. Risk and visualization
+## Tests
 
-#### `portfolio_risk_score_leverage.py` (~990 lines)
-A two-layer risk pipeline plus a leverage module:
+```bash
+python -m pytest
+```
 
-- **Ex-post risk (historical)**: annualized volatility, historical VaR and CVaR at 95% and 99%, drawdowns, and risk-adjusted ratios (configurable MAR).
-- **Ex-ante risk (options)**: ATM IV, GEX profile, and put/call ratio by open interest, sourced from Polygon.
-- **Dynamic per-asset leverage**: a 0-100 `Risk_Score` weighting HV (30%), CVaR (30%), IV (25%), and the GEX/PCR block (15%), mapped inversely to a leverage range between `leverage_min` (2.0) and `leverage_max` (5.0).
-
-Ends with a tabular report and per-asset charts.
-
-#### `portfolio_gex_field.py` (~980 lines)
-A 3D visualization of the portfolio as a **composite force field**.
-
-- X axis: price in sigma units (±3σ, 60-point resolution).
-- Y axis: composite macro factor (VIX 50%, TNX 25%, DXY 25%).
-- Z axis: potential surface derived from smoothed net GEX, with macro amplification (`BETA_MACRO_AMPLIFICATION`) and tilt (`GAMMA_MACRO_TILT`).
-
-Portfolio positions are plotted on the surface along with gradient vectors indicating the path of least resistance. Output is written to `portfolio_gex_field.html` with **auto-refresh every 60 seconds** (`REFRESH_SECONDS`), optional camera rotation, and automatic browser launch. This is the only script meant to be left running in a loop.
+Tests cover the shared modules and the extracted optimizer logic (FX and calendar alignment, quadprog constraints, time scaling, Cornish-Fisher, Polygon client behavior with recorded responses, quadratic-utility metrics, Black-Litterman units, delta modes, and log-return drawdown). `tests/test_script_smoke.py` parses every optimizer for a module-level name that shadows an import (`rk = ...` used to hide `risk_estimators`) and runs `black_litterman.py` under `AMPM_SMOKE=1` with mocked prices. They do not call Polygon and they do not run a full universe.
 
 ---
 
 ## Key concepts
 
-- **BKM (Bakshi, Kapadia, and Madan, 2003)**: extraction of *risk-neutral* variance, skewness, and kurtosis (MFIV, MFIS, MFIK) by integrating OTM option prices. Used here as a forward-looking risk estimator, in contrast to historical moments.
-- **Cornish-Fisher**: an expansion that adjusts normal quantiles for skewness and kurtosis, producing a VaR/CVaR sensitive to fat tails. The S and K in the formula are *parameters*, not the moments of the resulting distribution; plugging observed moments in directly leaves the monotonicity domain for heavy tails and, even inside it, can rank a more negatively skewed asset as *safer*. The scripts therefore solve for the parameters that reproduce the observed moments (Maillard, 2012), projecting onto the nearest reachable pair when needed. BKM moment pairs that violate K ≥ 1 + S² or exceed `bkm_mfik_max` are discarded rather than clipped: the MFIV is kept, and MFIS/MFIK become NaN (or neutral 0/3 in Black-Litterman).
-- **Risk-neutral vs. physical measure (Q vs. P)**: the implied density is the physical one reweighted by the pricing kernel, so implied moments carry risk premia. Implied variance exceeds physical variance (the variance risk premium) and implied correlation exceeds realized correlation (the correlation risk premium). Feeding raw Q moments to an optimizer overstates risk and understates diversification, so the scripts estimate a bounded per-asset Q→P ratio from realized data before building Σ.
-- **EWMA + Ledoit-Wolf**: the historical covariance is estimated from daily returns, exponentially weighted toward the recent regime, then shrunk toward a constant-correlation target. Covariance precision improves with sampling frequency while the mean's does not (Merton, 1980), and shrinkage corrects the downward bias of the small eigenvalues that a minimum-variance optimizer loads on (Michaud).
-- **Co-moments**: portfolio skewness and kurtosis depend on the M3 and M4 tensors, not on the marginal moments alone. Averaging per-asset MFIS/MFIK implicitly assumes perfect dependence and does not diversify; the error grows roughly with √n for weakly correlated assets. The scripts evaluate the exact quantities over a scenario panel in `O(J·n)`.
-- **GEX (Gamma Exposure)**: aggregate dealer gamma exposure. Positive GEX is associated with range-bound markets (dealers dampen moves); negative GEX with amplified moves. The zero-gamma flip marks the boundary between the two regimes.
-- **Implied/historical shrinkage**: the final covariance is a weighted blend of the implied-volatility estimate and the historical one, with the weight controlled by `shrinkage_min`, `shrinkage_max`, and `ratio_band`.
-- **QUBO/Ising**: asset selection is framed as a quadratic binary optimization problem, where the `h_i` terms capture individual quality and `J_ij` penalizes correlation.
+- **BKM (Bakshi, Kapadia, and Madan, 2003)**: risk-neutral variance, skewness, and kurtosis (MFIV, MFIS, MFIK) from OTM option prices. MFIV is the variance integrated over the life of the contracts, not an annual variance. Annualize with the chain's real DTE, then scale to the portfolio horizon.
+- **Cornish-Fisher**: adjusts a normal quantile for skewness and kurtosis. The S and K in the expansion are parameters, not the moments of the resulting distribution. The scripts solve for the parameters that reproduce the observed moments (Maillard, 2012). Pairs that violate K ≥ 1 + S² or exceed the MFIK cap are rejected rather than clipped: MFIV is kept, and MFIS/MFIK become NaN (or the neutral 0/3 in Black-Litterman). The cap starts at `bkm_mfik_max` (20) on a thin chain and rises linearly to `bkm_mfik_max_hard` (80) as the number of OTM strikes goes from 8 to 60. A dense index chain (SPY) can sit above 20 and still be kept. Black-Litterman counts observed SSVI strikes, not the integration grid.
+- **DTE window**: `dte_tol_iv` (minimum variance) and `polygon_dte_tol` (quadratic utility) default to **21** days, so a monthly expiry at 15 or 50 DTE is inside a 30-day target. The chosen expiry prefers DTE ≥ `dte_min_iv` / `polygon_dte_min` (21) and DTE ≥ the target, so 50 beats 15. The printed MFIS/MFIK stay on the chain's real DTE. Cornish-Fisher VaR and the MFIS z-score scale skewness and excess kurtosis to the target tenor. The MFIK cap's excess over 3 scales with `ref_dte / chain_dte`. US listings, including class shares such as `BRK-B` / `BRK.B`, are detected by `polygon_client.is_us_ticker`; exchange suffixes (`.L`, `.TO`, `.AS`, `.SW`, `.HK`, and the rest of the known list) are not sent to the options API.
+- **Polygon entitlements**: this plan includes options and reference only. A stock snapshot or stock aggregate returns 403, is not retried, and is printed once. Spot and prices come from Yahoo. Option aggregates stay on `O:` contract tickers. Non-US names in quadratic utility are labeled `sin_opciones_us` and are not sent to Polygon.
+- **Risk-neutral vs. physical measure (Q vs. P)**: implied variance and implied correlation embed risk premia. The scripts estimate a bounded ratio of realized to implied moments. The upper bound is 1, so physical vol does not exceed implied vol.
+- **EWMA + Ledoit-Wolf**: historical covariance from daily returns, weighted toward the recent regime, then shrunk toward a constant-correlation target.
+- **Co-moments**: portfolio skewness and kurtosis are not the weighted average of the marginal moments. The scripts evaluate them on a scenario panel.
+- **QUBO/Ising**: candidate selection as a quadratic binary problem. Individual quality is in the linear terms; correlation is in the pairwise penalty.
 
 ---
 
 ## Notes on the Polygon API
 
-- The free *Stocks Basic* tier allows **5 calls per minute**; several scripts include pauses and retries (`polygon_max_retries`, `polygon_retry_wait_sec`, `SEGUNDOS_ENTRE_LLAMADAS_STOCKS`) to stay within it.
-- The optimizers iterate over hundreds of tickers, so on the free tier a full run can take hours. Lower `n_top_sp500`, `n_top_nasdaq`, and `target_total_tickers` for quick tests.
-- `bkm_max_workers` controls parallelism in the BKM filter; raise it only if your plan allows.
-- When an options query fails, the code falls back to a historical method (no real BKM) and reports it in the output. Always check the **data quality** section at the end of the optimizers.
+- The free *Stocks Basic* tier allows **5 calls per minute**. Set `POLYGON_CALLS_PER_MIN=5`. The default 300 assumes a paid plan.
+- A full optimizer run walks hundreds of tickers. Lower `n_top_sp500`, `n_top_nasdaq`, and `target_total_tickers` for a short test.
+- `bkm_max_workers` is the BKM thread pool. Raise it only if the plan allows; the rate limiter is still global.
+- When an options query fails, the ticker falls back to a historical estimate and the summary lists the reason. Read that table before trusting an "implied" book.
+- Historical MFIS in quadratic utility and a cold cache can exceed `bkm_hist_max_minutes`. The script says so and skips the z-score rather than running for hours.
 
 ---
 

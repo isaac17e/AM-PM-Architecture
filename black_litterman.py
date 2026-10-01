@@ -25,6 +25,8 @@ from plotly.subplots import make_subplots
 
 import risk_estimators as rk
 import polygon_client as pc
+import market_data as md
+import bl_metrics as bm
 
 try:
     import statsmodels.api as sm
@@ -51,7 +53,7 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 TICKERS = [
     "META", "GOOGL", "ORCL", "DELL", "MSFT",
     "BLK", "CRM", "CMCSA", "GS", "REGN",
-    "ABNB", "ARES", "LVS", "BXP", "CYBR",
+    "ABNB", "ARES", "LVS", "BXP", "CRWD",
     "YELP", "EBAY", "IT", "EL"
 ]
 
@@ -115,7 +117,7 @@ ETF_TICKERS = [
     "REM",
     "ARKW", "ARKF",
     "VWO", "EEM", "EFA", "VGK", "EZU", "AAXJ", "EWJ", "MCHI", "FXI", "INDA",
-    "ILF", "EWZ", "VXUS", "ACWX", "VT", "FM", "EWC", "EWG", "EWU", "EWQ", "EWP",
+    "ILF", "EWZ", "VXUS", "ACWX", "VT", "EWC", "EWG", "EWU", "EWQ", "EWP",
 ]
 COMMODITY_TICKERS = ["SLV", "UNG"]
 
@@ -128,6 +130,20 @@ if not (0.0 < PESO_MAX_ETFS <= 1.0):
 Rf = 0.046
 
 # ------------------------------------------------------------------------------
+# DELTA DE MERCADO (M-12). Independiente del perfil.
+# "historical" es el comportamiento de siempre: exceso de ~2 anos / varianza,
+# ambos al horizonte. La media corta puede ser negativa y pi hereda el signo.
+# "fixed" usa DELTA_MKT_FIJO (rango habitual de aversion 2-4).
+# "implied" = var_Q de la cartera de mercado / var_P. La prima implicita es
+# la varianza neutral (Martin: el exceso del mercado es SVIX^2 = MFIV de
+# esa cartera) ya disponible en la cadena Q -> P. No es el default: ese
+# cociente suele quedar cerca de 1, no en 2.5, porque la prima ya esta en
+# unidades de varianza.
+# ------------------------------------------------------------------------------
+DELTA_MKT_MODO = "historical"
+DELTA_MKT_FIJO = 2.5
+
+# ------------------------------------------------------------------------------
 # 7. ANALISIS DE MAXIMUM DRAWDOWN (MDD)
 # ------------------------------------------------------------------------------
 MDD_START_YEAR = date.today().year - 2
@@ -138,6 +154,13 @@ MDD_START_YEAR = date.today().year - 2
 USAR_IV_POLYGON = True
 MIN_STRIKES_SLICE = 5
 MIN_DIAS_VENCIMIENTO = 5
+SSVI_K_ABS_MAX = 0.5
+# |rho| cerca de tanh(3.8) ~ 0.999 es la cota del optimizador, no una sonrisa.
+# Sin strikes de los dos lados rho tampoco se identifica. Esas alas no entran
+# a BKM; se conserva la vol ATM.
+SSVI_RHO_ABS_MAX = 0.95
+SSVI_K_SIDE_MIN = 0.10
+SSVI_MIN_PER_SIDE = 2
 
 # ------------------------------------------------------------------------------
 # 9. MODULO ECONOMETRICO Q -> P (BLOQUE 1D)
@@ -158,7 +181,10 @@ MAX_PRIMA_HM_SIGMA = 0.35
 
 COTA_SKEW_P = (-2.5, 1.5)
 COTA_KURT_P = (1.8, 12.0)
-COTA_RATIO_VOL_P = (0.55, 1.25)
+# Misma cota que vrp_ratio_bounds de MV/QU y que rk.q_to_p_vol (B-9).
+# hi = 1.0 impone el signo del VRP: la vol fisica no supera a la implicita.
+# Antes (0.55, 1.25) dejaba sigma_P > sigma_Q, al reves que el resto del repo.
+COTA_RATIO_VOL_P = (0.70, 1.00)
 
 # ------------------------------------------------------------------------------
 # COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF
@@ -183,10 +209,23 @@ EP_TOL_ENS = 0.10
 # ------------------------------------------------------------------------------
 NIVEL_CONFIANZA_VAR = 0.95
 BKM_MFIK_MAX = 20.0
+# Tope de MFIK: 20 con cadena corta, hasta BKM_MFIK_MAX_HARD si hay muchos
+# strikes OTM observados (no los puntos de la rejilla sintetica). Un indice
+# liquido supera 20 sin que el momento sea inadmisible.
+BKM_MFIK_MAX_HARD = 80.0
+# Alas de la integral BKM. El ajuste es |k|<=0.5; la integral usa las alas
+# SSVI (GJ ya chequeado) en +/- BKM_N_STD * sigma * sqrt(T). Recortar al
+# k del ajuste dejaba MFIK < 3. +/-6 sigma inflaba el MFIV (META ~4x).
+BKM_N_STD = 3.0
+BKM_MFIV_RATIO = (0.80, 2.0)
 NIVELES_CVAR = (0.95, 0.99)
 UMBRAL_OMEGA_RATIO = 0.0
 
 MODO_OPTIMIZACION = "mvsk"
+# NOTA DE DISENO (B-10), no se recalibra: LAMBDA3 y LAMBDA4 ponderan momentos
+# centrales crudos (skew * sigma^3, exceso de curtosis * sigma^4). Frente a
+# mu del horizonte y a (gamma/2) w'Sigma w esos terminos quedan en ordenes
+# menores, asi que el objetivo MVSK se comporta casi como media-varianza.
 LAMBDA3 = 1.0
 LAMBDA4 = 1.0
 ALPHA_CVAR_OBJETIVO = 0.95
@@ -196,12 +235,30 @@ MAX_ESCENARIOS_LP = 4000
 # ------------------------------------------------------------------------------
 # VALIDACION DE API KEY Y SEMILLA GLOBAL
 # ------------------------------------------------------------------------------
+# AMPM_SMOKE=1 ejecuta el script con universo chico y sin Polygon, para que
+# un test pueda recorrer el camino hasta Cornish-Fisher (el alias `rk` no
+# puede quedar pisado por un array).
+if os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}:
+    USAR_IV_POLYGON = False
+    TICKERS = ["AAPL", "MSFT", "SPY"]
+    N_ESCENARIOS = 60
+    N_REP_BOOTSTRAP_MOM = 2
+    J_POR_REPLICA_MOM = 30
+    N_MC_DELTA = 4
+    MAX_ESCENARIOS_LP = 30
+    MIN_VENTANAS_ROLLING = 4
+
 if USAR_IV_POLYGON and not POLYGON_API_KEY:
     raise ValueError(
         "USAR_IV_POLYGON = True pero POLYGON_API_KEY no esta definida. "
         "Configura el secreto 'PolygonAPI' en Colab, o pon USAR_IV_POLYGON = False "
         "para usar el metodo historico."
     )
+
+if DELTA_MKT_MODO not in ("historical", "fixed", "implied"):
+    raise ValueError("DELTA_MKT_MODO debe ser 'historical', 'fixed' o 'implied'")
+if not np.isfinite(DELTA_MKT_FIJO) or DELTA_MKT_FIJO <= 0:
+    raise ValueError("DELTA_MKT_FIJO debe ser positivo")
 
 rng_global = np.random.default_rng(SEMILLA)
 
@@ -262,6 +319,10 @@ print(f"Tickers descargados: {len(tickers_ok)} / {len(TICKERS)}")
 
 precios_diarios = pd.DataFrame(precios_dict)[tickers_ok]
 precios_semanales = precios_diarios.resample("W").last()
+precios_semanales, _semana_parcial = md.drop_partial_last_week(
+    precios_semanales, precios_diarios.index.max())
+if _semana_parcial:
+    print("  Semana en curso incompleta descartada del resample semanal.")
 
 retornos_sem = np.log(precios_semanales / precios_semanales.shift(1)).dropna(how="all")
 
@@ -303,6 +364,7 @@ if USAR_COV_DIARIA:
 if Sigma_sem is None:
     Sigma_sem = retornos_sem.cov().values
 
+# Al horizonte (semanal x factor de semanas), no anual (M-11). mu_historico igual.
 Sigma_hist = Sigma_sem * factor_anualizacion
 D_hist_inv = np.diag(1 / np.sqrt(np.diag(Sigma_hist)))
 Corr_hist = D_hist_inv @ Sigma_hist @ D_hist_inv
@@ -316,6 +378,8 @@ print(pd.Series(np.round(mu_historico, 4), index=tickers))
 # BLOQUE 1B: VOLATILIDAD IMPLICITA VIA POLYGON (SSVI)
 # ==============================================================================
 
+fuente_vol = {t: "historica" for t in tickers}
+
 if USAR_IV_POLYGON:
 
     tau_horizonte = MESES_HORIZONTE / 12
@@ -325,7 +389,8 @@ if USAR_IV_POLYGON:
 
     def polygon_fetch_chain(ticker, api_key, max_pages=40):
         """Cadena completa de opciones paginada; falla si queda incompleta."""
-        url = f"{pc.BASE_URL}/v3/snapshot/options/{ticker}?limit=250"
+        url = (f"{pc.BASE_URL}/v3/snapshot/options/"
+               f"{pc.polygon_format_ticker(ticker)}?limit=250")
         results, completo, status = pc.get_all(url, api_key=api_key, max_pages=max_pages)
         if not completo:
             raise ValueError(f"cadena incompleta (status {status})")
@@ -388,12 +453,6 @@ if USAR_IV_POLYGON:
         phi = phi_powerlaw(theta, eta, gamma)
         return theta / 2 * (1 + rho * phi * k + np.sqrt((phi * k + rho) ** 2 + (1 - rho ** 2)))
 
-    def sigmoid(x):
-        return 1 / (1 + np.exp(-x))
-
-    def qlogis(p):
-        return math.log(p / (1 - p))
-
     def calibrar_ssvi_ticker(ticker, api_key, tau_obj,
                               min_strikes=MIN_STRIKES_SLICE,
                               min_dias=MIN_DIAS_VENCIMIENTO):
@@ -430,22 +489,39 @@ if USAR_IV_POLYGON:
             otm_call = df_exp[(df_exp["tipo"] == "call") & (df_exp["k"] >= 0)]
             otm = pd.concat([otm_put, otm_call])
             otm = otm.drop_duplicates(subset="strike")
-            if len(otm) < min_strikes:
+            if "precio" not in otm.columns:
+                otm["precio"] = np.nan
+            if "oi" not in otm.columns:
+                otm["oi"] = np.nan
+            mask = bm.ssvi_row_mask(otm["precio"].to_numpy(), otm["oi"].to_numpy())
+            otm = otm.loc[mask].copy()
+            ventana = otm[otm["k"].abs() <= SSVI_K_ABS_MAX].copy()
+            if len(ventana) < min_strikes:
                 continue
 
-            otm = otm.copy()
-            otm["w"] = otm["iv"] ** 2 * T_anios
-            otm = otm.sort_values("k")
+            ventana["w"] = ventana["iv"] ** 2 * T_anios
+            ventana = ventana.sort_values("k")
+            pesos = bm.ssvi_weights(
+                ventana["k"].to_numpy(), ventana["w"].to_numpy(), ventana["oi"].to_numpy())
 
+            ancho = otm[otm["k"].abs() <= 1.0]
+            if (ancho["k"] < 0).any() and (ancho["k"] >= 0).any():
+                base = ancho.sort_values("k")
+            else:
+                base = otm.sort_values("k")
+            base_w = base["iv"].to_numpy(dtype=float) ** 2 * T_anios
             try:
-                theta0 = np.interp(0, otm["k"].values, otm["w"].values)
+                theta0 = np.interp(0.0, base["k"].to_numpy(dtype=float), base_w)
             except Exception:
                 theta0 = np.nan
             if pd.isna(theta0) or theta0 <= 0:
                 continue
 
             idx = len(puntos)
-            puntos.append(pd.DataFrame({"k": otm["k"].values, "w": otm["w"].values, "slice": idx}))
+            puntos.append(pd.DataFrame({
+                "k": ventana["k"].to_numpy(), "w": ventana["w"].to_numpy(),
+                "slice": idx, "peso": pesos,
+            }))
             theta_guess.append(theta0)
             t_years.append(T_anios)
 
@@ -475,40 +551,35 @@ if USAR_IV_POLYGON:
 
         theta_por_fila = theta_fijo[datos["slice"].values]
 
-        u0 = np.array([math.atanh(0.0), math.log(1.0), qlogis((0.3 - 0.05) / 0.9)])
+        ajuste = bm.fit_ssvi(
+            datos["k"].values, datos["w"].values, theta_por_fila, theta_fijo,
+            slice_index=datos["slice"].values, weights=datos["peso"].values,
+            k_abs_max=SSVI_K_ABS_MAX)
+        # sqrt(w/T) es la vol ANUAL y no depende de las alas. Se conserva
+        # aunque el RMSE de la sonrisa supere el umbral.
+        sigma_atm_annual = math.sqrt(theta_tau / tau_obj) if theta_tau > 0 else np.nan
+        n_put = int(np.sum(datos["k"].to_numpy(dtype=float) < 0))
+        n_call = int(np.sum(datos["k"].to_numpy(dtype=float) >= 0))
+        decision = bm.ssvi_surface_decision(
+            ajuste, sigma_atm_annual, n_put=n_put, n_call=n_call,
+            rho_abs_max=SSVI_RHO_ABS_MAX, k_side_min=SSVI_K_SIDE_MIN,
+            min_per_side=SSVI_MIN_PER_SIDE)
+        if decision["fuente"] == "historica":
+            raise ValueError(
+                f"SSVI sin vol ATM (rmse_rel={ajuste['rmse_rel']:.3f}, "
+                f"GJ_max={ajuste['gj_max']:.3f})"
+            )
 
-        def objetivo(u):
-            rho = math.tanh(u[0])
-            eta = math.exp(u[1])
-            gamma = sigmoid(u[2]) * 0.9 + 0.05
+        return dict(sigma_atm_annual=decision["sigma_atm_annual"], theta_j=theta_fijo,
+                    t_years=t_years, rho=ajuste["rho"], eta=ajuste["eta"], gamma=ajuste["gamma"],
+                    n_vencimientos=m, metodo=ajuste["metodo"], gj_max=ajuste["gj_max"],
+                    rmse_rel=ajuste["rmse_rel"], usar_alas=decision["usar_alas"],
+                    fuente=decision["fuente"], motivos=decision.get("motivos") or [],
+                    n_put=n_put, n_call=n_call, n_strikes=ajuste["n_strikes"],
+                    k_min=ajuste["k_min"], k_max=ajuste["k_max"])
 
-            w_modelo = ssvi_w(datos["k"].values, theta_por_fila, rho, eta, gamma)
-            error_ajuste = np.sum((w_modelo - datos["w"].values) ** 2)
-
-            gj = theta_fijo * phi_powerlaw(theta_fijo, eta, gamma) * (1 + abs(rho))
-            penalizacion = np.sum(np.maximum(0, gj - 4) ** 2) * 1e3
-
-            return error_ajuste + penalizacion
-
-        opt = minimize(objetivo, u0, method="BFGS", options=dict(maxiter=2000, gtol=1e-10))
-
-        rho = math.tanh(opt.x[0])
-        eta = math.exp(opt.x[1])
-        gamma = sigmoid(opt.x[2]) * 0.9 + 0.05
-
-        gj_max = np.max(theta_fijo * phi_powerlaw(theta_fijo, eta, gamma) * (1 + abs(rho)))
-        sin_arbitraje = gj_max <= 4 + 1e-6
-
-        ssvi_confiable = opt.success and sin_arbitraje
-        metodo = "ssvi_conjunto" if ssvi_confiable else "ssvi_no_convergio"
-
-        sigma_atm = math.sqrt(theta_tau / tau_obj)
-
-        return dict(sigma_atm=sigma_atm, theta_j=theta_fijo, t_years=t_years,
-                    rho=rho, eta=eta, gamma=gamma, n_vencimientos=m,
-                    metodo=metodo, gj_max=gj_max)
-
-    sigma_iv = {t: np.nan for t in tickers}
+    sigma_iv_horizon = {t: np.nan for t in tickers}
+    sigma_iv_annual = {t: np.nan for t in tickers}
     detalle_ssvi = {}
 
     for tk in tickers:
@@ -519,27 +590,54 @@ if USAR_IV_POLYGON:
             print(f"FALLBACK ({e}) ", end="")
             resultado = None
 
-        if resultado is not None:
-            sigma_iv[tk] = resultado["sigma_atm"]
+        if resultado is not None and resultado.get("usar_alas"):
+            anual = resultado["sigma_atm_annual"]
+            sigma_iv_annual[tk] = anual
+            sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
+                anual, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
             detalle_ssvi[tk] = resultado
-            print(f"OK ({resultado['metodo']}) - sigma_ATM = {resultado['sigma_atm']:.4f} "
+            fuente_vol[tk] = "ssvi"
+            print(f"OK ({resultado['metodo']}) - sigma_ATM anual = {anual:.4f} "
+                  f"| al horizonte = {sigma_iv_horizon[tk]:.4f} "
                   f"| vencimientos: {resultado['n_vencimientos']} | rho = {resultado['rho']:.3f} "
                   f"| GJ_max = {resultado['gj_max']:.3f} (<=4 sin arbitraje)")
+        elif resultado is not None and resultado.get("fuente") == "atm":
+            anual = resultado["sigma_atm_annual"]
+            sigma_iv_annual[tk] = anual
+            sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
+                anual, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
+            fuente_vol[tk] = "atm"
+            motivos = resultado.get("motivos") or []
+            if resultado.get("metodo") == "ssvi_conjunto" and motivos:
+                detalle = f"degenerada: {', '.join(motivos)}"
+            else:
+                extra = f", {', '.join(motivos)}" if motivos else ""
+                detalle = (f"sonrisa {resultado['metodo']}, "
+                           f"rmse_rel={resultado['rmse_rel']:.3f}{extra}")
+            print(f"ATM ({detalle}, rho={resultado['rho']:.3f}, "
+                  f"k=[{resultado['k_min']:.2f}, {resultado['k_max']:.2f}], "
+                  f"puts={resultado.get('n_put')}, calls={resultado.get('n_call')}) "
+                  f"- sigma_ATM anual = {anual:.4f} "
+                  f"| al horizonte = {sigma_iv_horizon[tk]:.4f} "
+                  f"| alas no usadas en BKM")
         else:
-            sigma_iv[tk] = math.sqrt(Sigma_hist_df.loc[tk, tk])
-            print(f"-> vol historica = {sigma_iv[tk]:.4f}")
+            sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
+                np.nan, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
+            fuente_vol[tk] = "historica"
+            print(f"-> vol historica al horizonte = {sigma_iv_horizon[tk]:.4f}")
 
-    print(f"\n=== Volatilidades ATM implicitas (SSVI, horizonte {MESES_HORIZONTE} meses) ===")
-    print(pd.Series({t: round(sigma_iv[t], 4) for t in tickers}))
+    print(f"\n=== Volatilidades ATM al horizonte de {MESES_HORIZONTE} meses "
+          f"(SSVI anualizada y luego escalada; M-11) ===")
+    print(pd.Series({t: round(sigma_iv_horizon[t], 4) for t in tickers}))
 
-    sigma_iv_vec = np.array([sigma_iv[t] for t in tickers])
-    D_IV = np.diag(sigma_iv_vec)
-    Sigma = D_IV @ Corr_hist @ D_IV
-    Sigma = pd.DataFrame(Sigma, index=tickers, columns=tickers)
+    sigma_iv_horizon_vec = np.array([sigma_iv_horizon[t] for t in tickers])
+    D_IV_horizon = np.diag(sigma_iv_horizon_vec)
+    Sigma_horizon = D_IV_horizon @ Corr_hist @ D_IV_horizon
+    Sigma_horizon = pd.DataFrame(Sigma_horizon, index=tickers, columns=tickers)
 
 else:
-    print("\n=== USAR_IV_POLYGON = False - usando Sigma 100% historica ===")
-    Sigma = Sigma_hist_df.copy()
+    print("\n=== USAR_IV_POLYGON = False - usando Sigma 100% historica al horizonte ===")
+    Sigma_horizon = Sigma_hist_df.copy()
     tau_horizonte = MESES_HORIZONTE / 12
     detalle_ssvi = {}
 
@@ -577,14 +675,11 @@ def otm_price_ssvi(K, S, F, T, r, rho, eta, gamma, theta_tau):
     return bs_price(S, K, T, r, sigma_k, tipo=tipo)
 
 
-_trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-
-
 def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
-                          n_std=6, n_puntos=400):
+                          n_std=BKM_N_STD, n_puntos=400, k_min=None, k_max=None):
     sigma_atm = sigma_desde_ssvi(F, F, T, rho, eta, gamma, theta_tau)
-    K_min = F * np.exp(-n_std * sigma_atm * np.sqrt(T))
-    K_max = F * np.exp(n_std * sigma_atm * np.sqrt(T))
+    K_min, K_max = bm.integration_strike_bounds(
+        F, sigma_atm, T, n_std=n_std, k_min=k_min, k_max=k_max)
     strikes = np.linspace(K_min, K_max, n_puntos)
 
     precios = np.array([
@@ -598,9 +693,9 @@ def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
     peso_W = (6.0 * lnKS - 3.0 * lnKS ** 2) / strikes ** 2
     peso_X = (12.0 * lnKS ** 2 - 4.0 * lnKS ** 3) / strikes ** 2
 
-    V_T = _trapz(peso_V * precios, strikes)
-    W_T = _trapz(peso_W * precios, strikes)
-    X_T = _trapz(peso_X * precios, strikes)
+    V_T = rk.trapezoid(peso_V * precios, strikes)
+    W_T = rk.trapezoid(peso_W * precios, strikes)
+    X_T = rk.trapezoid(peso_X * precios, strikes)
 
     mu_T = (np.exp(r * T) - 1
             - np.exp(r * T) / 2 * V_T
@@ -634,19 +729,33 @@ for tk in tickers:
     try:
         S_tk = precios_diarios[tk].iloc[-1]
         F_tk = S_tk * np.exp(r_bkm * tau_horizonte)
-        theta_tau_tk = det["sigma_atm"] ** 2 * tau_horizonte
+        theta_tau_tk = det["sigma_atm_annual"] ** 2 * tau_horizonte
+        # Sin k_min/k_max: la integral es +/- BKM_N_STD sigma al horizonte,
+        # sobre las alas SSVI. El k del ajuste (|k|<=0.5) no recorta.
         resultado_bkm = calcular_bkm_moments(
             S=S_tk, F=F_tk, T=tau_horizonte, r=r_bkm,
             rho=det["rho"], eta=det["eta"], gamma=det["gamma"],
-            theta_tau=theta_tau_tk,
+            theta_tau=theta_tau_tk, n_std=BKM_N_STD,
         )
-        if not rk.higher_moments_admissible(resultado_bkm["MFIS"], resultado_bkm["MFIK"], BKM_MFIK_MAX):
-            print(f"  {tk}: MFIS/MFIK inadmisibles ({resultado_bkm['MFIS']:.3f}, "
-                  f"{resultado_bkm['MFIK']:.3f}) -> neutro (MFIS=0, MFIK=3)")
-            resultado_bkm = {**resultado_bkm, "MFIS": 0.0, "MFIK": 3.0}
+        ala = BKM_N_STD * det["sigma_atm_annual"] * math.sqrt(tau_horizonte)
+        banda = bm.mfiv_vs_atm(resultado_bkm["MFIV"], theta_tau_tk, *BKM_MFIV_RATIO)
+        if not banda["ok"]:
+            print(f"  {tk}: MFIV/varianza ATM = {banda['ratio']} fuera de "
+                  f"{BKM_MFIV_RATIO}; se usa la varianza ATM y momentos neutros")
+            resultado_bkm = {**resultado_bkm, "MFIV": banda["mfiv"], "MFIS": 0.0, "MFIK": 3.0}
+        else:
+            cap_mfik = rk.mfik_cap(
+                det.get("n_strikes", 0), base=BKM_MFIK_MAX, hard=BKM_MFIK_MAX_HARD)
+            if not rk.higher_moments_admissible(
+                    resultado_bkm["MFIS"], resultado_bkm["MFIK"], cap_mfik):
+                print(f"  {tk}: MFIS/MFIK inadmisibles ({resultado_bkm['MFIS']:.3f}, "
+                      f"{resultado_bkm['MFIK']:.3f}, tope {cap_mfik:.1f} con "
+                      f"{det.get('n_strikes', 0)} strikes) -> neutro (MFIS=0, MFIK=3)")
+                resultado_bkm = {**resultado_bkm, "MFIS": 0.0, "MFIK": 3.0}
         bkm_moments[tk] = resultado_bkm
         print(f"  {tk}: MFIV={resultado_bkm['MFIV']:.4f} | MFIS={resultado_bkm['MFIS']:.3f} "
-              f"| MFIK={resultado_bkm['MFIK']:.3f}")
+              f"| MFIK={resultado_bkm['MFIK']:.3f} | integral k=+/-{ala:.2f} "
+              f"({BKM_N_STD:.0f} sigma; ajuste |k|<={SSVI_K_ABS_MAX})")
     except Exception as e:
         print(f"  {tk}: fallback neutro ({e})")
         bkm_moments[tk] = dict(MFIV=np.nan, MFIS=0.0, MFIK=3.0, V_T=np.nan, W_T=np.nan, X_T=np.nan)
@@ -794,16 +903,17 @@ def media_hac(x):
 
 filas_roll = []
 for tk in tickers:
-    rv, rs, rk = momentos_realizados_rolling(retornos_dia[tk])
+    # kurt_roll, no `rk`: ese nombre es el modulo risk_estimators.
+    rv, rs, kurt_roll = momentos_realizados_rolling(retornos_dia[tk])
     if len(rv) < MIN_VENTANAS_ROLLING:
         filas_roll.append(dict(ticker=tk, n_ventanas=len(rv),
                                RV_med=float(Sigma_hist_df.loc[tk, tk]), RV_se=np.nan,
                                RS_roll=0.0, RK_roll=3.0))
         continue
-    rv, rs, rk = winsorizar(rv), winsorizar(rs), winsorizar(rk)
+    rv, rs, kurt_roll = winsorizar(rv), winsorizar(rs), winsorizar(kurt_roll)
     rv_m, rv_se, _ = media_hac(rv)
     rs_m, _, _ = media_hac(rs)
-    rk_m, _, _ = media_hac(rk)
+    rk_m, _, _ = media_hac(kurt_roll)
     filas_roll.append(dict(ticker=tk, n_ventanas=len(rv),
                            RV_med=rv_m, RV_se=rv_se, RS_roll=rs_m, RK_roll=rk_m))
 
@@ -875,9 +985,16 @@ print("  (las columnas *_iid_roll son el estimador de ventanas rodantes bajo "
 # ==============================================================================
 
 MFIV_vec = np.array([bkm_moments[t]["MFIV"] for t in tickers], dtype=float)
+n_mfiv_fallback = 0
 for i, tk in enumerate(tickers):
-    if not np.isfinite(MFIV_vec[i]) or MFIV_vec[i] <= 0:
-        MFIV_vec[i] = float(Sigma.iloc[i, i])
+    # La diagonal de Sigma_horizon ya es varianza al horizonte. Antes, con
+    # SSVI bien y BKM mal, aqui entraba sigma_atm^2 anual (~1/tau veces mayor).
+    previo = MFIV_vec[i]
+    MFIV_vec[i] = bm.mfiv_or_horizon_variance(previo, float(Sigma_horizon.iloc[i, i]))
+    if not (np.isfinite(previo) and previo > 0):
+        n_mfiv_fallback += 1
+if n_mfiv_fallback:
+    print(f"  MFIV de respaldo (varianza al horizonte, no anual) en {n_mfiv_fallback} tickers")
 
 
 def mincer_zarnowitz(y, x, se_y, nombre, dominio=None, piso=None):
@@ -1013,6 +1130,8 @@ print(pd.DataFrame([
 ]).to_string(index=False))
 print("  (b < 1 => el momento implicito sobre-reacciona respecto del fisico, "
       "que es el patron documentado)")
+print(f"  NOTA (B-10): Mincer-Zarnowitz es transversal con n = {n}. Con ~19 nombres "
+      "la potencia es baja y a, b salen ruidosos. No se cambia el estimador.")
 
 # ==============================================================================
 # PRONOSTICOS FISICOS Y PRIMAS DE RIESGO
@@ -1053,10 +1172,14 @@ print(f"  KRP medio: {np.nanmean(KRP):+.4f}  "
 # 1D.3  COTAS DE SENSATEZ Y CUMULANTES FISICOS
 # ==============================================================================
 
-ratio_vol = np.sqrt(np.maximum(var_P, 1e-12) / np.maximum(MFIV_vec, 1e-12))
-n_clip_vol = int(np.sum((ratio_vol < COTA_RATIO_VOL_P[0]) | (ratio_vol > COTA_RATIO_VOL_P[1])))
-ratio_vol = np.clip(ratio_vol, *COTA_RATIO_VOL_P)
-var_P = ratio_vol ** 2 * MFIV_vec
+es_implicita = np.array(
+    [fuente_vol.get(t, "historica") in ("ssvi", "atm") for t in tickers])
+var_P, n_clip_vol = bm.apply_vol_q_to_p(var_P, MFIV_vec, es_implicita, COTA_RATIO_VOL_P)
+n_hist_vol = int((~es_implicita).sum())
+print("\n  Fuente de vol por ticker (ssvi=sonrisa, atm=theta sin alas, historica=sin ratio Q->P):")
+print(pd.Series({t: fuente_vol.get(t, "historica") for t in tickers}).to_string())
+if n_hist_vol:
+    print(f"  Q->P de volatilidad omitido en {n_hist_vol} tickers con fuente historica")
 
 n_clip_skew = int(np.sum((skew_P < COTA_SKEW_P[0]) | (skew_P > COTA_SKEW_P[1])))
 skew_P = np.clip(skew_P, *COTA_SKEW_P)
@@ -1154,17 +1277,36 @@ desc_perfiles = dict(
 )
 
 # ==============================================================================
-# DELTA DE MERCADO (FIJO, NO DEPENDE DEL PERFIL)
+# DELTA DE MERCADO (NO DEPENDE DEL PERFIL). Modo: DELTA_MKT_MODO (M-12)
 # ==============================================================================
 Rf_h = Rf * (MESES_HORIZONTE / 12)
 ret_mkt_hist = float(w_mkt @ mu_historico)
 var_mkt_hist = float(w_mkt @ Sigma_hist @ w_mkt)
-delta_mkt = (ret_mkt_hist - Rf_h) / var_mkt_hist
+D_Q_horizon = np.diag(np.sqrt(np.maximum(MFIV_vec, 0.0)))
+var_mkt_q = float(w_mkt @ (D_Q_horizon @ Corr_hist @ D_Q_horizon) @ w_mkt)
+var_mkt_p = float(w_mkt @ Sigma_P.values @ w_mkt)
+delta_mkt, delta_info = bm.market_delta(
+    DELTA_MKT_MODO,
+    excess_hist=ret_mkt_hist - Rf_h,
+    var_hist=var_mkt_hist,
+    delta_fixed=DELTA_MKT_FIJO,
+    var_q=var_mkt_q,
+    var_p=var_mkt_p,
+)
 
 print(f"\n=== PERFIL: {PERFIL_RIESGO.upper()} ===")
 print(f"Descripcion: {desc_perfiles[PERFIL_RIESGO]}")
-print(f"Delta de mercado (fijo): {delta_mkt:.4f} | Tau (t): {tau} | "
-      f"Omega scale: {perfil['omega_scale']} | Gamma_RA: {gamma_ra}")
+_impl = delta_info["implied"]
+_impl_txt = f"{_impl:.4f}" if np.isfinite(_impl) else "n/a"
+print(f"Delta de mercado (modo {delta_info['mode']}): {delta_mkt:.4f} | "
+      f"historico={delta_info['historical']:.4f} | fijo={delta_info['fixed']:.2f} | "
+      f"implicito={_impl_txt}")
+if delta_info["fallback"]:
+    print(f"  {delta_info['fallback']}")
+if delta_info["mode"] == "historical" and np.isfinite(delta_mkt) and delta_mkt < 0:
+    print("  La media de ~2 anos dio exceso negativo: pi hereda ese signo. "
+          "DELTA_MKT_MODO = 'fixed' o 'implied' no usa esa muestra.")
+print(f"Tau (t): {tau} | Omega scale: {perfil['omega_scale']} | Gamma_RA: {gamma_ra}")
 
 # ==============================================================================
 # BLOQUE 4: RETORNOS DE EQUILIBRIO pi - CAPM INVERTIDO
@@ -1358,14 +1500,21 @@ N_VIEWS = 3
 # ==============================================================================
 P = pd.DataFrame(0.0, index=[f"View_{i+1}" for i in range(N_VIEWS)], columns=tickers)
 
-P.loc["View_1", "DELL"] = 1
-P.loc["View_1", "META"] = -1
+if os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}:
+    cols = list(P.columns)
+    for i, (a, b) in enumerate(((0, 1), (1, 2), (0, 2))):
+        if i < len(P.index) and b < len(cols):
+            P.iloc[i, a] = 1.0
+            P.iloc[i, b] = -1.0
+else:
+    P.loc["View_1", "DELL"] = 1
+    P.loc["View_1", "META"] = -1
 
-P.loc["View_2", "GS"] = 1
-P.loc["View_2", "REGN"] = -1
+    P.loc["View_2", "GS"] = 1
+    P.loc["View_2", "REGN"] = -1
 
-P.loc["View_3", "EBAY"] = 1
-P.loc["View_3", "ARES"] = -1
+    P.loc["View_3", "EBAY"] = 1
+    P.loc["View_3", "ARES"] = -1
 
 print("\n=== Matriz P (views del gestor) ===")
 print(P.round(4))
@@ -1899,8 +2048,7 @@ def optimizar_mvsk(X, p, gamma, lam3, lam4, activos_permitidos=None, w_ini=None)
                    options=dict(maxiter=600, ftol=1e-11))
     if not res.success:
         print(f"  Aviso SLSQP: {res.message}")
-    w = np.clip(res.x, 0.0, None)
-    return w / w.sum(), res
+    return bm.clip_negligible_weights(res.x), res
 
 
 def optimizar_min_cvar(X, p, alpha, retorno_min, mu_vec,
@@ -2097,8 +2245,7 @@ def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO, mask_etf=
             Amat = np.column_stack([Amat, -mask_etf.astype(float)])
             bvec = np.concatenate([bvec, [-PESO_MAX_ETFS]])
         w = quadprog.solve_qp(G, mu_vec, Amat, bvec, meq=1)[0]
-        w = np.clip(w, 0.0, None)
-        return w / w.sum()
+        return bm.clip_negligible_weights(w)
     except Exception as e:
         print(f"  quadprog fallo ({e}); se usa SLSQP")
         obj = lambda w: -(w @ mu_vec - (gamma / 2.0) * w @ Sigma_arr @ w)
@@ -2107,8 +2254,7 @@ def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO, mask_etf=
             cons.append({"type": "ineq", "fun": lambda w: PESO_MAX_ETFS - w[mask_etf].sum()})
         res = minimize(obj, np.full(n_, 1.0 / n_), method="SLSQP",
                        bounds=[(0.0, w_max)] * n_, constraints=cons)
-        w = np.clip(res.x, 0.0, None)
-        return w / w.sum()
+        return bm.clip_negligible_weights(res.x)
 
 
 idx_eleg = np.where(activos_elegibles)[0]
@@ -2148,6 +2294,10 @@ ret_hist_horizonte = (retornos_dia[tickers]
                       .dropna())
 print(f"\nPanel historico: {len(ret_hist_horizonte)} ventanas solapadas de "
       f"{horizonte_dias} dias | Panel posterior: {N_ESCENARIOS} escenarios")
+_n_indep = max(1, int(np.floor(len(retornos_dia) / max(horizonte_dias, 1))))
+print(f"  NOTA (B-10): las ventanas se solapan. Observaciones aproximadamente "
+      f"independientes en 2 anos: ~{_n_indep}, no el conteo de ventanas. "
+      "Se dejan solapadas a proposito.")
 
 portafolios = {
     "Mercado (w_mkt)": pd.Series(w_mkt, index=tickers),
@@ -2349,15 +2499,8 @@ print(f"Periodo de analisis MDD: desde {MDD_START_YEAR}")
 
 
 def calc_mdd(r):
-    r = pd.Series(r).dropna()
-    if len(r) < 2:
-        return np.nan
-    cv = (1 + r).cumprod()
-    dd = (cv - cv.cummax()) / cv.cummax()
-    mdd = dd.min()
-    if not np.isfinite(mdd):
-        return np.nan
-    return mdd
+    """MDD de log-retornos: riqueza = exp(cumsum) (B-1)."""
+    return bm.mdd_from_log_returns(r)
 
 
 tickers_bl = w_mvsk[w_mvsk > 0].index.tolist()
@@ -2392,11 +2535,8 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
     retornos_diarios_mdd = np.log(precios_mdd / precios_mdd.shift(1)).dropna(how="all")
 
     def port_ret_row(fila):
-        validos = fila.notna()
-        if validos.sum() == 0:
-            return np.nan
-        w_norm = weights_bl[validos.index[validos]] / weights_bl[validos.index[validos]].sum()
-        return float((fila[validos] * w_norm).sum())
+        # Log exacto del portafolio. La suma de logs solo coincide a primer orden.
+        return bm.log_portfolio_return(fila, weights_bl)
 
     retornos_diarios_mdd = retornos_diarios_mdd[tickers_bl]
     port_ret = retornos_diarios_mdd.apply(port_ret_row, axis=1)

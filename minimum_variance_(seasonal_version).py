@@ -1,5 +1,5 @@
 # ==============================================================================
-# OPTIMIZACION DE PORTAFOLIOS - MINIMA VARIANZA (Seasonal Version)
+# OPTIMIZACION DE PORTAFOLIOS - MINIMO RIESGO DE COLA PROSPECTIVO (BKM + CORNISH-FISHER) - VERSION ESTACIONAL
 # ==============================================================================
 
 import warnings
@@ -28,6 +28,8 @@ import plotly.graph_objects as go
 
 import risk_estimators as rk
 import polygon_client as pc
+import market_data as md
+import portfolio_constraints as pq
 
 # ==============================================================================
 # SECCION 1: PARAMETROS CONFIGURABLES
@@ -69,11 +71,12 @@ end_date = date.today()
 # MESES DE EJECUCION
 # ------------------------------------------------------------------------------
 execution_months = [9]
+execution_n_months = 1
 
 # ------------------------------------------------------------------------------
 # TASA LIBRE DE RIESGO
 # ------------------------------------------------------------------------------
-risk_free_rate = 0.045
+risk_free_rate = 0.047   # alineada con minimum_variance.py (B-9)
 risk_free_rate_weekly = risk_free_rate / 52
 
 # ------------------------------------------------------------------------------
@@ -88,6 +91,13 @@ n_divers_candidates = 45
 volatility_percentile = 0.55
 correlation_percentile = 0.60
 max_assets_in_portfolio = 15
+# Poda hasta max_assets. min_weight saca el peso chico. max_mtr es la regla
+# anterior (mayor contribucion marginal: poda defensivos en la cota del 12%).
+# min_weight_x_mtr ordena por peso * contribucion, de menor a mayor.
+tail_prune_rule = "min_weight"
+# Clases duplicadas. El primer ticker de cada grupo se queda.
+dedupe_share_classes = True
+share_class_groups = (("GOOGL", "GOOG"),)
 
 # ------------------------------------------------------------------------------
 # FILTRO ESTACIONAL
@@ -101,6 +111,9 @@ bkm_moneyness_lo = 0.70
 bkm_moneyness_hi = 1.30
 bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
+# Con pocos strikes OTM el tope sigue en 20. Con una cadena densa sube hasta
+# bkm_mfik_max_hard: SPY y otros indices superan 20 sin ser inadmisibles.
+bkm_mfik_max_hard = 80.0
 tail_risk_filter_confidence = 0.99
 cornish_fisher_confidence = 0.95
 
@@ -150,13 +163,17 @@ max_fx_exposure = 0.45
 annualization_factor = 52
 
 # ------------------------------------------------------------------------------
-# FILTRO DELTA (BLACK-SCHOLES)
+# IV ATM (~30 DTE) Y GRIEGAS DE DIAGNOSTICO
 # ------------------------------------------------------------------------------
-use_delta_filter = True
-delta_min = 0.3
+# El antiguo "filtro Delta" (delta BS de una call ATM >= delta_min) se elimino
+# (M-3): con K = S la delta es N(d1) con d1 = (r + sigma^2/2) sqrt(T) / sigma
+# > 0, asi que siempre supera 0.5 y nunca descartaba nada. El riesgo de cola
+# se filtra mas abajo con BKM + Cornish-Fisher. La IV ATM se sigue
+# consultando para el shrinkage de la covarianza y las griegas de diagnostico.
 delta_strike_mode = "atm"
 target_dte_iv = 30
-dte_tol_iv = 7
+dte_tol_iv = 21
+dte_min_iv = 21
 moneyness_tol_iv = 0.02
 
 # ------------------------------------------------------------------------------
@@ -170,9 +187,30 @@ ratio_band = 0.30
 # ------------------------------------------------------------------------------
 # COVARIANZA HISTORICA: EWMA + SHRINKAGE LEDOIT-WOLF
 # ------------------------------------------------------------------------------
-use_daily_cov = True
+# hist_cov_frequency:
+#   "daily"  : retornos diarios (mas precision en varianzas, Merton 1980), pero
+#              los cierres de Tokio/Europa/EE. UU. no son sincronicos y las
+#              correlaciones entre zonas horarias quedan subestimadas (M-2).
+#   "weekly" : retornos semanales; el desfase de cierres es una fraccion
+#              pequena del intervalo y la correlacion es robusta.
+#   "auto"   : weekly si hay algun ticker de bolsa no estadounidense en el
+#              pool final, daily si todos cotizan en EE. UU.
+hist_cov_frequency = "auto"
 cov_halflife_days = 120
+cov_halflife_weeks = 26
 use_lw_shrinkage = True
+
+# Peso de la covarianza historica en el blend con la implicita de factores.
+hist_shrink_alpha = 0.35
+
+# ------------------------------------------------------------------------------
+# ALINEACION DE PRECIOS MULTI-MERCADO
+# ------------------------------------------------------------------------------
+# Festivos locales: cada ticker se rellena hacia adelante como maximo
+# max_ffill_days sobre el calendario del benchmark (M-1). Lagunas mas largas
+# siguen eliminando la fila.
+max_ffill_days = 2
+min_price_coverage = 0.80
 
 # ------------------------------------------------------------------------------
 # CORRECCION Q -> P (PRIMA DE RIESGO DE VARIANZA)
@@ -195,6 +233,11 @@ use_country_factor = True
 # ==============================================================================
 # SECCION 2: VALIDACION DEL HORIZONTE
 # ==============================================================================
+
+execution_months, _aviso_meses = md.resolve_execution_months(
+    execution_months, as_of=end_date, n_months=execution_n_months)
+if _aviso_meses:
+    print(f"ADVERTENCIA: {_aviso_meses}")
 
 if not (1 <= len(execution_months) <= 3):
     raise ValueError("Error: execution_months debe contener entre 1 y 3 meses.")
@@ -234,7 +277,7 @@ execution_label = "-".join(MONTH_NAME[m] for m in execution_months)
 horizon_label = f"{horizon_months} {'mes' if horizon_months == 1 else 'meses'} ({execution_label})"
 
 print("\n" + "=" * 68)
-print("     OPTIMIZACION DE PORTAFOLIO - MINIMA VARIANZA")
+print("     OPTIMIZACION DE PORTAFOLIO - MINIMO RIESGO DE COLA (BKM + CORNISH-FISHER) - ESTACIONAL")
 print("     Retornos: SEMANALES | Entrenamiento: Historico completo")
 print("=" * 68 + "\n")
 print(f"Horizonte de inversion : {horizon_label}")
@@ -352,7 +395,7 @@ etf_geograficos = [
     "AAXJ", "EWJ",
     "MCHI", "FXI", "INDA",
     "ILF", "EWZ",
-    "VXUS", "ACWX", "VT", "FM",
+    "VXUS", "ACWX", "VT",
     "EWC", "EWG", "EWU", "EWQ", "EWP",
 ]
 etf_tickers = list(dict.fromkeys(etf_core + etf_sectoriales + etf_subsectoriales + etf_geograficos))
@@ -431,6 +474,10 @@ if target_total_tickers > 0 and len(all_tickers) < target_total_tickers:
         print(f"  ADVERTENCIA: No se pudo alcanzar target_total_tickers; faltan {shortage}")
 
 all_tickers = list(dict.fromkeys(all_tickers))
+if dedupe_share_classes:
+    all_tickers, _clases = md.dedupe_share_classes(all_tickers, share_class_groups)
+    for se_queda, se_van in _clases:
+        print(f"[INFO] Clase duplicada: se queda {se_queda}, sale {', '.join(se_van)}")
 print(f"[INFO] Total de tickers FINAL (unicos): {len(all_tickers)}\n")
 
 # ==============================================================================
@@ -451,19 +498,26 @@ ticker_currency_by_suffix = {
     ".L": "GBP",
     ".T": "JPY",
 }
-ticker_currency_override = {
-    "HSBC": "GBP",
-    "BP": "GBP",
-}
+# Overrides manuales. Solo se usan si el proveedor no informa la moneda; si la
+# contradicen se avisa y gana el proveedor. El antiguo {"HSBC": "GBP",
+# "BP": "GBP"} era incorrecto: ambos son ADRs de NYSE cotizados en USD (A-2).
+ticker_currency_override = {}
+
+# Se rellena tras la descarga con history_metadata["currency"] de yfinance.
+provider_currency = {}
+ticker_currency = {}
+
+
+def is_non_us_exchange(ticker):
+    return not pc.is_us_ticker(ticker)
 
 
 def get_currency_for_ticker(ticker):
+    if ticker in ticker_currency:
+        return ticker_currency[ticker]
     if ticker in ticker_currency_override:
-        return ticker_currency_override[ticker]
-    for suf, cur in ticker_currency_by_suffix.items():
-        if ticker.endswith(suf):
-            return cur
-    return "USD"
+        return md.normalize_currency(ticker_currency_override[ticker])
+    return md.currency_from_suffix(ticker, ticker_currency_by_suffix) or "USD"
 
 
 # ==============================================================================
@@ -496,15 +550,20 @@ print("[INFO] Se convertiran a retornos SEMANALES para el entrenamiento\n")
 
 
 def download_ticker_data(ticker, start, end, max_retries=3):
+    """Precios ajustados diarios. La moneda del proveedor queda en data.attrs["currency"]."""
     for attempt in range(max_retries):
         try:
-            data = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+            tk = yf.Ticker(ticker)
+            data = tk.history(start=start, end=end, auto_adjust=True)
             if data is not None and len(data) > 0:
+                meta = getattr(tk, "history_metadata", None) or {}
                 data = data[["Close"]].rename(columns={"Close": "adjusted"}).reset_index()
                 data = data.rename(columns={"Date": "date"})
                 data["date"] = pd.to_datetime(data["date"]).dt.tz_localize(None)
                 data["symbol"] = ticker
-                return data[["date", "symbol", "adjusted"]]
+                data = data[["date", "symbol", "adjusted"]]
+                data.attrs["currency"] = meta.get("currency")
+                return data
         except Exception:
             time.sleep(1)
     return None
@@ -518,10 +577,16 @@ n_total = len(all_tickers)
 for i, ticker in enumerate(all_tickers, start=1):
     data = download_ticker_data(ticker, start_date, end_date)
     if data is not None and len(data) > 0:
+        cur_prov = data.attrs.get("currency")
+        if cur_prov:
+            provider_currency[ticker] = cur_prov
+            # GBp / ZAc: el proveedor cotiza en unidad menor; se lleva a la unidad mayor.
+            data["adjusted"] = data["adjusted"] * md.price_scale_factor(cur_prov)
         stock_data_list[ticker] = data
         successful_tickers.append(ticker)
     else:
         failed_tickers.append(ticker)
+        print(f"   {ticker}: sin cotizacion en Yahoo; se excluye")
     if i % 25 == 0 or i == n_total:
         print(f"   Descargados {i}/{n_total}...")
 
@@ -532,6 +597,21 @@ if failed_tickers:
           f"{'...' if len(failed_tickers) > 10 else ''}")
 
 stock_data = pd.concat(stock_data_list.values(), ignore_index=True) if stock_data_list else pd.DataFrame()
+
+# ------------------------------------------------------------------------------
+# MONEDA FINAL POR TICKER: proveedor > override manual > sufijo > USD (A-2)
+# ------------------------------------------------------------------------------
+ticker_currency, currency_conflicts = md.resolve_currencies(
+    successful_tickers, ticker_currency_by_suffix, overrides=ticker_currency_override,
+    provider=provider_currency)
+n_sin_proveedor = sum(1 for t in successful_tickers if t not in provider_currency)
+print(f"\n[INFO] Moneda por ticker: {len(provider_currency)} informadas por el proveedor"
+      f"{f', {n_sin_proveedor} por sufijo/default' if n_sin_proveedor else ''}")
+for c in currency_conflicts:
+    print(f"  ADVERTENCIA moneda de {c['ticker']}: {c['fuente']} dice {c['manual']} pero el proveedor "
+          f"reporta {c['proveedor']} - se usa {c['proveedor']}")
+monedas_presentes = sorted(set(ticker_currency.values()))
+print(f"[INFO] Monedas presentes: {', '.join(monedas_presentes)}")
 
 print("\n[INFO] Descargando benchmark (SPY)...")
 benchmark_data = download_ticker_data(benchmark, start_date, end_date)
@@ -560,21 +640,42 @@ print("\n[INFO] Convirtiendo precios diarios -> retornos semanales...")
 
 prices_wide = stock_data.pivot_table(index="date", columns="symbol", values="adjusted")
 
-n_expected = len(prices_wide)
-na_counts = prices_wide.isna().sum()
-valid_tickers = na_counts[na_counts < 0.2 * n_expected].index.tolist()
-print(f"[INFO] Tickers con datos completos (>80%): {len(valid_tickers)}")
-
-prices_wide_clean = prices_wide[valid_tickers].dropna()
+# ------------------------------------------------------------------------------
+# ALINEACION MULTI-MERCADO (M-1): calendario del benchmark + ffill acotado
+# ------------------------------------------------------------------------------
+# Antes: prices_wide.dropna() borraba la fila entera cuando CUALQUIER mercado
+# (Tokio, Londres, Toronto, ...) estaba cerrado: ~12% de los dias, con huecos
+# de 4-5 dias que distorsionaban los retornos "diarios" y el ultimo precio
+# semanal. Ahora cada ticker se rellena hasta max_ffill_days sobre los dias
+# de negociacion de SPY y solo se descartan las filas con lagunas mayores.
+benchmark_calendar = pd.DatetimeIndex(benchmark_data["date"])
+prices_wide_clean, align_info = md.align_prices_to_calendar(
+    prices_wide, benchmark_calendar, max_ffill=max_ffill_days, min_coverage=min_price_coverage)
+valid_tickers = list(prices_wide_clean.columns)
+print(f"[INFO] Tickers con cobertura >= {min_price_coverage * 100:.0f}% del calendario SPY: {len(valid_tickers)}"
+      + (f" (descartados: {', '.join(align_info['dropped_low_coverage'][:8])}"
+         f"{'...' if len(align_info['dropped_low_coverage']) > 8 else ''})"
+         if align_info["dropped_low_coverage"] else ""))
+print(f"[INFO] Dias rellenados por festivos locales (ffill <= {max_ffill_days}): "
+      f"{int(align_info['n_filled'].sum())} celdas en "
+      f"{int((align_info['n_filled'] > 0).sum())} tickers | "
+      f"filas eliminadas por lagunas mayores: {align_info['n_rows_dropped']} de "
+      f"{align_info['n_rows_dropped'] + align_info['n_rows']}")
 
 if len(prices_wide_clean) == 0:
-    raise RuntimeError("Error: No hay datos despues de eliminar NAs.")
+    raise RuntimeError("Error: No hay datos despues de alinear los precios.")
 
-prices_weekly = prices_wide_clean.resample("W").last()
+# Ultima semana parcial (B-6): resample("W") etiqueta el domingo; si el ultimo
+# dato no llega al viernes, la ultima fila mezcla una semana incompleta.
+last_daily_date = prices_wide_clean.index.max()
+prices_weekly, semana_parcial = md.drop_partial_last_week(
+    prices_wide_clean.resample("W").last(), last_daily_date)
+if semana_parcial:
+    print(f"[INFO] Ultima semana parcial descartada (ultimo dato diario: {last_daily_date:%Y-%m-%d})")
 
 fx_weekly_price_usd = {}
 for cur, s in fx_data.items():
-    w = s.resample("W").last()
+    w, _ = md.drop_partial_last_week(s.resample("W").last(), last_daily_date)
     fx_weekly_price_usd[cur] = (1 / w) if fx_pairs[cur]["invert"] else w
 fx_weekly_price_usd = pd.DataFrame(fx_weekly_price_usd)
 
@@ -617,7 +718,7 @@ print(f"[INFO] Retornos diarios disponibles para Sigma: {len(daily_returns)} dia
 fx_weekly_returns = np.log(fx_weekly_price_usd / fx_weekly_price_usd.shift(1)).dropna(how="all")
 
 benchmark_daily = benchmark_data.set_index("date")["adjusted"]
-benchmark_weekly_prices = benchmark_daily.resample("W").last()
+benchmark_weekly_prices, _ = md.drop_partial_last_week(benchmark_daily.resample("W").last(), last_daily_date)
 benchmark_returns_full = np.log(benchmark_weekly_prices / benchmark_weekly_prices.shift(1)).dropna()
 benchmark_returns_full = benchmark_returns_full.rename("SPY").to_frame()
 
@@ -659,13 +760,8 @@ print("=" * 67 + "\n")
 
 
 def max_drawdown_from_returns(returns_series):
-    r = pd.Series(returns_series).dropna()
-    if len(r) < 2:
-        return np.nan
-    cum = (1 + r).cumprod()
-    peak = cum.cummax()
-    dd = (cum - peak) / peak
-    return dd.min()
+    """MDD de una serie de LOG-retornos (riqueza = exp(cumsum)), B-1."""
+    return rk.max_drawdown(returns_series, log_returns=True)
 
 
 asset_stats = pd.DataFrame({
@@ -745,13 +841,13 @@ def get_polygon_option_snapshot(ticker):
             raise ValueError("sin spot Yahoo para filtrar la llamada a Polygon")
 
         hoy = date.today()
-        fecha_min = (hoy + timedelta(days=target_dte_iv - dte_tol_iv)).strftime("%Y-%m-%d")
+        fecha_min = (hoy + timedelta(days=max(target_dte_iv - dte_tol_iv, 1))).strftime("%Y-%m-%d")
         fecha_max = (hoy + timedelta(days=target_dte_iv + dte_tol_iv)).strftime("%Y-%m-%d")
         strike_min = round(S * (1 - moneyness_tol_iv), 2)
         strike_max = round(S * (1 + moneyness_tol_iv), 2)
 
         url = (
-            f"https://api.polygon.io/v3/snapshot/options/{ticker}?"
+            f"https://api.polygon.io/v3/snapshot/options/{pc.polygon_format_ticker(ticker)}?"
             f"contract_type=call&"
             f"strike_price.gte={strike_min:.2f}&strike_price.lte={strike_max:.2f}&"
             f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
@@ -775,9 +871,10 @@ def get_polygon_option_snapshot(ticker):
         if len(df) == 0:
             raise ValueError("sin contratos en la ventana ~30 DTE")
 
-        df["_s1"] = (df["dte"] - target_dte_iv).abs()
-        df["_s2"] = (df["strike"] / S - 1).abs()
-        df = df.sort_values(["_s1", "_s2"])
+        rango = pc.expiry_rank_columns(df["dte"], target_dte_iv, np.ones(len(df)), dte_min_iv)
+        df = df.assign(**rango)
+        df["_moneyness"] = (df["strike"] / S - 1).abs()
+        df = df.sort_values(pc.EXPIRY_SORT_COLS + ["_moneyness"])
         elegido = df.iloc[0]
 
         spot_final = elegido.get("underlying_asset.price", np.nan)
@@ -825,11 +922,12 @@ def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
 def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_hi):
     """Cadena OTM paginada de un unico vencimiento (el mas cercano a target_dte)."""
     hoy = date.today()
-    fecha_min = (hoy + timedelta(days=target_dte - dte_tol)).strftime("%Y-%m-%d")
+    fecha_min = (hoy + timedelta(days=max(target_dte - dte_tol, 1))).strftime("%Y-%m-%d")
     fecha_max = (hoy + timedelta(days=target_dte + dte_tol)).strftime("%Y-%m-%d")
     return pc.fetch_otm_chain(
-        ticker, S, fecha_min, fecha_max, round(S * moneyness_lo, 2), round(S * moneyness_hi, 2),
-        target_dte, api_key=POLYGON_API_KEY, strike_fmt="{:.2f}")
+        pc.polygon_format_ticker(ticker), S, fecha_min, fecha_max,
+        round(S * moneyness_lo, 2), round(S * moneyness_hi, 2),
+        target_dte, api_key=POLYGON_API_KEY, strike_fmt="{:.2f}", min_dte=dte_min_iv)
 
 
 def bkm_iv_chain_to_prices(S, r, T, chain_df):
@@ -844,10 +942,17 @@ def bkm_iv_chain_to_prices(S, r, T, chain_df):
     return chain_df
 
 
+def _bkm_vacio(motivo):
+    return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, motivo=motivo)
+
+
 def bkm_compute_moments(S, r, T, calls_df, puts_df):
-    if calls_df is None or puts_df is None or len(calls_df) < bkm_min_options_per_side \
-            or len(puts_df) < bkm_min_options_per_side or T <= 0 or S <= 0:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+    n_c = 0 if calls_df is None else len(calls_df)
+    n_p = 0 if puts_df is None else len(puts_df)
+    if T <= 0 or S <= 0:
+        return _bkm_vacio("spot_o_plazo_invalido")
+    if n_c < bkm_min_options_per_side or n_p < bkm_min_options_per_side:
+        return _bkm_vacio(f"pocas_opciones_otm (calls={n_c}, puts={n_p}, min={bkm_min_options_per_side})")
 
     calls_df = calls_df.sort_values("strike")
     puts_df = puts_df.sort_values("strike")
@@ -861,41 +966,66 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     fC_X = (12 * np.log(Kc / S) ** 2 - 4 * np.log(Kc / S) ** 3) / Kc ** 2 * Cc
     fP_X = (12 * np.log(S / Kp) ** 2 + 4 * np.log(S / Kp) ** 3) / Kp ** 2 * Pp
 
+    # rk.trapezoid: np.trapezoid (numpy >= 2) o np.trapz. Antes np.trapezoid
+    # fallaba con numpy 1.x dentro de este try y TODOS los activos caian al
+    # historico en silencio (A-1).
     try:
-        V = np.trapezoid(fC_V, Kc) + np.trapezoid(fP_V, Kp)
-        W = np.trapezoid(fC_W, Kc) - np.trapezoid(fP_W, Kp)
-        X = np.trapezoid(fC_X, Kc) + np.trapezoid(fP_X, Kp)
-    except Exception:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+        V = rk.trapezoid(fC_V, Kc) + rk.trapezoid(fP_V, Kp)
+        W = rk.trapezoid(fC_W, Kc) - rk.trapezoid(fP_W, Kp)
+        X = rk.trapezoid(fC_X, Kc) + rk.trapezoid(fP_X, Kp)
+    except Exception as e:
+        return _bkm_vacio(f"integracion_fallida ({type(e).__name__})")
 
     erT = math.exp(r * T)
     mu = erT - 1 - erT / 2 * V - erT / 6 * W - erT / 24 * X
     mfiv = erT * V - mu ** 2
     if not np.isfinite(mfiv) or mfiv <= 0:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False)
+        return _bkm_vacio("mfiv_no_positiva")
 
     mfis = (erT * W - 3 * mu * erT * V + 2 * mu ** 3) / mfiv ** 1.5
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
-    if not rk.higher_moments_admissible(mfis, mfik, bkm_mfik_max):
+    motivo = None
+    dte_chain = float(T) * rk.DAYS_PER_YEAR
+    cap_mfik = rk.mfik_cap_tenor(
+        n_c + n_p, dte_chain, ref_dte=float(target_dte_iv),
+        base=bkm_mfik_max, hard=bkm_mfik_max_hard)
+    if not rk.higher_moments_admissible(mfis, mfik, cap_mfik):
+        motivo = (f"momentos_inadmisibles (MFIS={mfis:.2f}, MFIK={mfik:.2f}, "
+                  f"tope={cap_mfik:.1f} a {dte_chain:.0f}d vs ref {target_dte_iv}d "
+                  f"con {n_c + n_p} strikes OTM; MFIV se conserva)")
         mfis, mfik = np.nan, np.nan
 
-    return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True)
+    return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True, motivo=motivo)
 
 
 def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
     S = get_spot_safe(ticker)
     if pd.isna(S) or S <= 0:
-        return dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, spot=np.nan)
+        mom = _bkm_vacio("sin_spot_yahoo")
+        mom.update(spot=np.nan, dte=np.nan, transitorio=False)
+        return mom
     calls_df, puts_df, info_cadena = bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S,
                                                          bkm_moneyness_lo, bkm_moneyness_hi)
-    T = target_dte / 365
+    if not info_cadena["completo"]:
+        status = info_cadena["status"]
+        mom = _bkm_vacio("sin_api_key" if status == "sin_api_key" else f"cadena_incompleta (status {status})")
+        mom.update(spot=S, dte=np.nan, expiracion=None, transitorio=pc.es_transitorio(status))
+        return mom
+    if calls_df.empty and puts_df.empty:
+        mom = _bkm_vacio("sin_cadena_en_ventana_dte")
+        mom.update(spot=S, dte=np.nan, expiracion=None, transitorio=False)
+        return mom
+
+    # Plazo REAL de los contratos elegidos (A-3): la MFIV es la varianza
+    # integrada hasta ese vencimiento, no hasta target_dte ni hasta el
+    # horizonte del portafolio.
+    dte = info_cadena["dte"] if np.isfinite(info_cadena["dte"]) and info_cadena["dte"] > 0 else target_dte
+    T = rk.to_years(dte=dte)
     calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df)
     puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df)
     mom = bkm_compute_moments(S, rf, T, calls_df, puts_df)
-    mom["spot"] = S
-    mom["expiracion"] = info_cadena["expiracion"]
-    mom["transitorio"] = (not info_cadena["completo"]) and pc.es_transitorio(info_cadena["status"])
+    mom.update(spot=S, dte=int(dte), expiracion=info_cadena["expiracion"], transitorio=False)
     return mom
 
 
@@ -905,8 +1035,12 @@ bkm_moments_cache = {}
 def bkm_get_current_moments_cached(ticker):
     if ticker in bkm_moments_cache:
         return bkm_moments_cache[ticker]
-    if not use_iv_for_horizon or get_currency_for_ticker(ticker) != "USD":
-        mom = dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False, spot=np.nan)
+    if not use_iv_for_horizon:
+        mom = _bkm_vacio("opciones desactivadas")
+        mom.update(spot=np.nan, dte=np.nan)
+    elif get_currency_for_ticker(ticker) != "USD" or is_non_us_exchange(ticker):
+        mom = _bkm_vacio("sin_opciones_en_polygon (no cotiza en EE. UU.)")
+        mom.update(spot=np.nan, dte=np.nan)
     else:
         mom = bkm_get_current_moments(ticker, target_dte_iv, dte_tol_iv, risk_free_rate)
     if not mom.get("transitorio"):
@@ -914,109 +1048,77 @@ def bkm_get_current_moments_cached(ticker):
     return mom
 
 
-def bkm_annual_vol(ticker):
+def bkm_annual_vol(ticker, medida="Q"):
+    """Vol anual desde la MFIV del ticker, anualizada con el DTE real de la cadena (A-3).
+
+    medida="P" aplica la correccion Q->P con la vol historica del propio ticker.
+    NaN si no hay MFIV valida.
+    """
     mom = bkm_get_current_moments_cached(ticker)
-    if mom["ok"] and mom["mfiv"] > 0:
-        return math.sqrt(mom["mfiv"] / T_options)
-    return np.nan
+    if not (mom["ok"] and np.isfinite(mom["mfiv"]) and mom["mfiv"] > 0):
+        return np.nan
+    vol_q = rk.implied_variance_to_horizon(mom["mfiv"], mom["dte"], 1.0)["annual_vol"]
+    if medida == "Q" or not use_q_to_p_vol:
+        return vol_q
+    hv = log_returns[ticker].std() * math.sqrt(annualization_factor) if ticker in log_returns.columns else np.nan
+    return rk.q_to_p_vol(vol_q, hv, ratio_bounds=vrp_ratio_bounds, fallback_ratio=vrp_fallback_ratio)[0]
 
 
-if use_delta_filter:
-    print(f"\nAplicando filtro Delta BS (modo='{delta_strike_mode}', delta_min={delta_min:.2f}, "
-          f"T={horizon_months / 12:.3f} anios)...")
+def bkm_motivo_fallback(ticker):
+    """Motivo por el que un ticker no tiene momentos BKM completos (None si los tiene)."""
+    mom = bkm_moments_cache.get(ticker)
+    if mom is None:
+        return "no consultado"
+    if mom.get("ok") and np.isfinite(mom.get("mfis", np.nan)):
+        return None
+    return mom.get("motivo") or "desconocido"
 
-    T_horizon = horizon_months / 12
 
-    mu_weekly_for_delta = log_returns[selected_pre_seasonal].mean()
+def bkm_resumen_fallbacks(tickers, titulo):
+    """Tabla por ticker y conteo por motivo de los que cayeron al estimador historico (A-1)."""
+    filas = []
+    for t in tickers:
+        mom = bkm_moments_cache.get(t, {})
+        filas.append(dict(Ticker=t,
+                          MFIV="OK" if np.isfinite(mom.get("mfiv", np.nan)) else "-",
+                          MFIS_MFIK="OK" if np.isfinite(mom.get("mfis", np.nan)) else "-",
+                          DTE=mom.get("dte", np.nan),
+                          Motivo=bkm_motivo_fallback(t) or "BKM completo"))
+    df = pd.DataFrame(filas)
+    n_fb = int((df["Motivo"] != "BKM completo").sum())
+    print(f"\n  {titulo}: {len(df) - n_fb} con BKM completo | {n_fb} con fallback historico")
+    if n_fb:
+        conteo = df.loc[df["Motivo"] != "BKM completo", "Motivo"].str.replace(r" \(.*\)$", "", regex=True)
+        for motivo, n in conteo.value_counts().items():
+            print(f"     {n:>3}  {motivo}")
+    disp = df.copy()
+    disp["DTE"] = disp["DTE"].map(lambda x: f"{int(x)}" if pd.notna(x) else "-")
+    print("  " + disp.to_string(index=False).replace("\n", "\n  "))
+    return df
 
-    print(f"  Consultando spot + IV ATM (~{target_dte_iv} DTE) para {len(selected_pre_seasonal)} activos "
-          f"(pool pre-estacional)...")
 
-    spot_cache = {t: get_spot_safe(t) for t in selected_pre_seasonal}
-    iv_cache = {t: get_atm_iv_safe(t) for t in selected_pre_seasonal}
-
-    delta_rows = []
-    for ticker in selected_pre_seasonal:
-        S = spot_cache[ticker]
-        iv = iv_cache[ticker]
-
-        if pd.isna(iv) or iv <= 0:
-            hist_ret = log_returns[ticker].values
-            iv = np.nanstd(hist_ret) * math.sqrt(annualization_factor)
-
-        if pd.isna(S) or S <= 0 or pd.isna(iv) or iv <= 0:
-            delta_rows.append(dict(symbol=ticker, delta=np.nan, strike_mode=delta_strike_mode, iv_used=iv))
-            continue
-
-        mu_i = mu_weekly_for_delta.get(ticker, 0.0)
-        mu_i = 0.0 if pd.isna(mu_i) else mu_i
-
-        if delta_strike_mode == "atm":
-            K = S
-        elif delta_strike_mode == "rf":
-            K = S * (1 + risk_free_rate * T_horizon)
-        elif delta_strike_mode == "mu":
-            K = S * (1 + mu_i * horizon_weeks)
-        else:
-            K = S
-
-        d1 = (math.log(S / K) + (risk_free_rate + iv ** 2 / 2) * T_horizon) / (iv * math.sqrt(T_horizon))
-        delta_i = norm.cdf(d1)
-
-        delta_rows.append(dict(symbol=ticker, delta=delta_i, strike_mode=delta_strike_mode, iv_used=iv))
-
-    delta_df = pd.DataFrame(delta_rows)
-
-    n_delta_ok = delta_df["delta"].notna().sum()
-    n_delta_na = delta_df["delta"].isna().sum()
-    n_below = ((delta_df["delta"].notna()) & (delta_df["delta"] < delta_min)).sum()
-    n_pass = ((delta_df["delta"].notna()) & (delta_df["delta"] >= delta_min)).sum()
-
-    print(f"  OK Deltas calculados: {n_delta_ok} | Sin datos (se conservan): {n_delta_na}")
-    print(f"  X Descartados (delta < {delta_min:.2f}): {n_below}")
-    print(f"  OK Superan el filtro (delta >= {delta_min:.2f}): {n_pass}")
-
-    discarded_delta = delta_df[(delta_df["delta"].notna()) & (delta_df["delta"] < delta_min)].sort_values("delta")
-    if len(discarded_delta) > 0:
-        disp = discarded_delta.copy()
-        disp["Delta"] = disp["delta"].map(lambda x: f"{x:.3f}")
-        disp["IV_anual"] = disp["iv_used"].map(lambda x: f"{x * 100:.1f}%")
-        print("\n  Activos descartados por Delta insuficiente:")
-        print(disp.rename(columns={"symbol": "Symbol"})[["Symbol", "Delta", "IV_anual"]].to_string(index=False))
-
-    top_delta = (
-        delta_df[(delta_df["delta"].isna()) | (delta_df["delta"] >= delta_min)]
-        .sort_values("delta", ascending=False)
-        .head(10)
-        .dropna(subset=["delta"])
-        .copy()
-    )
-    if len(top_delta) > 0:
-        top_delta["Delta"] = top_delta["delta"].map(lambda x: f"{x:.3f}")
-        top_delta["IV_anual"] = top_delta["iv_used"].map(lambda x: f"{x * 100:.1f}%")
-        print("\n  Top 10 activos por Delta (mayor probabilidad de superar K):")
-        print(top_delta.rename(columns={"symbol": "Symbol"})[["Symbol", "Delta", "IV_anual"]].to_string(index=False))
-
-    selected_pre_seasonal = delta_df[(delta_df["delta"].isna()) | (delta_df["delta"] >= delta_min)]["symbol"].tolist()
-
-    spot_cache = {t: spot_cache[t] for t in selected_pre_seasonal}
-    iv_cache = {t: iv_cache[t] for t in selected_pre_seasonal}
-
-    print(f"\nTras filtro Delta (sobre pool pre-estacional): {len(selected_pre_seasonal)} tickers disponibles "
-          f"para el filtro estacional\n")
-
-else:
-    print("\nFiltro Delta desactivado (use_delta_filter = False)\n")
-    print(f"  Consultando spot + IV ATM (~{target_dte_iv} DTE) para {len(selected_pre_seasonal)} activos "
-          f"(uso: covarianza)...")
-    spot_cache = {t: get_spot_safe(t) for t in selected_pre_seasonal}
-    iv_cache = {t: get_atm_iv_safe(t) for t in selected_pre_seasonal}
+# ==============================================================================
+# SPOT E IV ATM (~30 DTE) PARA SHRINKAGE Y GRIEGAS DE DIAGNOSTICO
+# ==============================================================================
+# El filtro Delta BS que vivia aqui se elimino (M-3): con K = S la delta de la
+# call era siempre > 0.5 (observado: 0.535-0.563) y delta_min = 0.30 no
+# descartaba ningun activo. Una version "con sentido" (probabilidad implicita
+# de caer mas de x%) seria la version gaussiana del filtro de cola BKM +
+# Cornish-Fisher que sigue, asi que se evita duplicarlo.
+print(f"\nConsultando spot + IV ATM (~{target_dte_iv} DTE) para {len(selected_pre_seasonal)} activos "
+      "(uso: shrinkage de covarianza y griegas de diagnostico)...")
+spot_cache = {t: get_spot_safe(t) for t in selected_pre_seasonal}
+iv_cache = {t: get_atm_iv_safe(t) for t in selected_pre_seasonal}
+n_iv_atm = sum(1 for v in iv_cache.values() if pd.notna(v))
+print(f"  OK IV ATM obtenida: {n_iv_atm} de {len(selected_pre_seasonal)} (el resto usa vol historica)\n")
 
 # ==============================================================================
 # FILTRO ESTACIONAL DE TAIL RISK BKM: VaR_CF (Cornish-Fisher)
 # ==============================================================================
 print(f"\nAplicando filtro de Tail Risk BKM estacional ({execution_label}) - "
       f"VaR_CF a {tail_risk_filter_confidence * 100:.0f}% de confianza...")
+print(f"  VaR_CF al horizonte de {target_dte_iv} dias. MFIS/MFIK de la tabla son los de la cadena; "
+      "la cola se calcula con esos momentos escalados al objetivo.")
 
 log_returns_seasonal = log_returns.loc[log_returns.index.month.isin(execution_months), selected_pre_seasonal]
 
@@ -1027,22 +1129,23 @@ if tail_risk_hist_fallback:
     print("  Fallback historico ACTIVO: los activos sin BKM valido usan momentos historicos estacionales")
 
 
-def momentos_cola_historicos(r_semanal):
-    """Vol, asimetria y exceso de curtosis al horizonte target_dte_iv desde retornos semanales.
+def momentos_cola_historicos(r_semanal, dte=None):
+    """Vol, asimetria y exceso de curtosis al plazo `dte` (dias) desde retornos semanales.
 
-    Agregacion iid de h = target_dte_iv / 7 semanas: sigma_T = sigma_w * sqrt(h),
-    S_T = S_w / sqrt(h), ExK_T = ExK_w / h. Devuelve None si el par no es admisible.
+    Escalado iid centralizado en rk.scale_moments con h = dte / 7 semanas:
+    sigma_T = sigma_w sqrt(h), S_T = S_w / sqrt(h), ExK_T = ExK_w / h.
+    Devuelve None si el par resultante no es admisible.
     """
     r = pd.Series(r_semanal).dropna()
     sd_w = r.std()
     if len(r) < 6 or not np.isfinite(sd_w) or sd_w <= 0:
         return None
-    h = target_dte_iv / 7
-    s_T = float(skew(r)) / math.sqrt(h)
-    exk_T = float(kurtosis(r)) / h
-    if not rk.higher_moments_admissible(s_T, exk_T + 3.0, bkm_mfik_max):
+    dte = target_dte_iv if dte is None or not np.isfinite(dte) else dte
+    esc = rk.scale_moments(rk.to_years(weeks=1), rk.to_years(weeks=dte / 7),
+                           sd=sd_w, skew=float(skew(r)), exkurt=float(kurtosis(r)))
+    if not rk.higher_moments_admissible(esc["skew"], esc["exkurt"] + 3.0, bkm_mfik_max):
         return None
-    return dict(sigma_T=sd_w * math.sqrt(h), skew=s_T, exkurt=exk_T)
+    return dict(sigma_T=esc["sd"], skew=esc["skew"], exkurt=esc["exkurt"], dte=dte)
 
 
 tail_risk_rows = []
@@ -1054,21 +1157,36 @@ for ticker in selected_pre_seasonal:
     mom = bkm_get_current_moments_cached(ticker)
 
     fila = dict(Symbol=ticker, MFIV=np.nan, MFIS=np.nan, MFIK=np.nan, VaR_CF=np.nan,
-                Seasonal_SD=r_seasonal.std() if n_obs > 1 else np.nan, N_Obs=n_obs, Fuente=None)
+                Seasonal_SD=r_seasonal.std() if n_obs > 1 else np.nan, N_Obs=n_obs, Fuente=None, DTE=np.nan)
     if n_obs < seasonal_min_weeks:
         tail_risk_rows.append(fila)
         continue
     if mom["ok"] and np.isfinite(mom["mfis"]):
-        sigma_T, s_T, exk_T = math.sqrt(mom["mfiv"]), mom["mfis"], mom["mfik"] - 3.0
-        fila.update(MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"], Fuente="BKM")
+        # Momentos crudos de la cadena, escalados al DTE objetivo antes del VaR.
+        # La vol Q se lleva a P con la vol historica ESTACIONAL, tambien al
+        # objetivo. La tabla guarda MFIS/MFIK sin escalar. La estacionalidad
+        # entra por mu_T, esa vol de referencia y N_Obs, no por la superficie.
+        dte_chain = mom["dte"] if np.isfinite(mom.get("dte", np.nan)) else target_dte_iv
+        esc = rk.scale_bkm_moments(mom["mfiv"], mom["mfis"], mom["mfik"], dte_chain, target_dte_iv)
+        sigma_T_q = math.sqrt(esc["mfiv"])
+        sd_seasonal_w = r_seasonal.std()
+        if use_q_to_p_vol and np.isfinite(sd_seasonal_w) and sd_seasonal_w > 0:
+            hv_T = sd_seasonal_w * math.sqrt(target_dte_iv / 7)
+            sigma_T = rk.q_to_p_vol(sigma_T_q, hv_T, ratio_bounds=vrp_ratio_bounds,
+                                    fallback_ratio=vrp_fallback_ratio)[0]
+        else:
+            sigma_T = sigma_T_q
+        s_T, exk_T = esc["mfis"], esc["mfik"] - 3.0
+        dte_t = target_dte_iv
+        fila.update(MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"], Fuente="BKM", DTE=dte_chain)
     elif tail_risk_hist_fallback and (hist := momentos_cola_historicos(r_seasonal)) is not None:
-        sigma_T, s_T, exk_T = hist["sigma_T"], hist["skew"], hist["exkurt"]
-        fila.update(Fuente="Historico")
+        sigma_T, s_T, exk_T, dte_t = hist["sigma_T"], hist["skew"], hist["exkurt"], hist["dte"]
+        fila.update(Fuente="Historico", DTE=dte_t)
     else:
         tail_risk_rows.append(fila)
         continue
 
-    mu_T = mu_weekly_seasonal * (target_dte_iv / 7) if not pd.isna(mu_weekly_seasonal) else 0.0
+    mu_T = mu_weekly_seasonal * (dte_t / 7) if not pd.isna(mu_weekly_seasonal) else 0.0
     cola = rk.cornish_fisher_tail(1 - tail_risk_filter_confidence, s_T, exk_T)
     fila["VaR_CF"] = -(mu_T + sigma_T * cola["q"])
     tail_risk_rows.append(fila)
@@ -1082,7 +1200,7 @@ n_con_tail = len(tail_risk_stats)
 n_sin_tail = len(selected_pre_seasonal) - n_con_tail
 n_hist_tail = int((tail_risk_stats["Fuente"] == "Historico").sum())
 
-print(f"  OK Candidatos previos al filtro (post-Delta): {len(selected_pre_seasonal)}")
+print(f"  OK Candidatos previos al filtro: {len(selected_pre_seasonal)}")
 print(f"  OK Con VaR_CF calculable (estacional, >={seasonal_min_weeks} sem): {n_con_tail} "
       f"(BKM: {n_con_tail - n_hist_tail} | historico: {n_hist_tail})")
 print(f"  ADVERTENCIA Descartados (sin cobertura BKM, MFIS/MFIK inadmisibles o datos estacionales insuficientes): {n_sin_tail}")
@@ -1117,8 +1235,8 @@ seasonal_display["MFIV"] = seasonal_display["MFIV"].map(lambda x: f"{x:.5f}" if 
 seasonal_display["MFIS"] = seasonal_display["MFIS"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "N/D")
 seasonal_display["MFIK"] = seasonal_display["MFIK"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "N/D")
 seasonal_display["SD_Estacional"] = seasonal_display["Seasonal_SD"].map(lambda x: f"{x:.4f}")
-seasonal_display["Sharpe_fmt"] = seasonal_display["Sharpe"].map(lambda x: f"{x:.3f}")
-print(seasonal_display.rename(columns={"N_Obs": "Semanas", "Sharpe_fmt": "Sharpe"})
+seasonal_display["Sharpe"] = seasonal_display["Sharpe"].map(lambda x: f"{x:.3f}")
+print(seasonal_display.rename(columns={"N_Obs": "Semanas"})
       [["Symbol", "Fuente", "VaR_CF", "MFIV", "MFIS", "MFIK", "SD_Estacional", "Semanas", "Sharpe"]]
       .to_string(index=False))
 
@@ -1154,7 +1272,8 @@ descriptive_stats = pd.DataFrame({
 descriptive_stats["MFIV_T"] = [bkm_moments_cache.get(c, {}).get("mfiv", np.nan) for c in log_returns_selected.columns]
 descriptive_stats["MFIS_Q"] = [bkm_moments_cache.get(c, {}).get("mfis", np.nan) for c in log_returns_selected.columns]
 descriptive_stats["MFIK_Q"] = [bkm_moments_cache.get(c, {}).get("mfik", np.nan) for c in log_returns_selected.columns]
-descriptive_stats["MFIV_Vol_Anual_Q"] = np.sqrt(descriptive_stats["MFIV_T"] / T_options)
+# Anualizada con el DTE real de cada cadena, no con el horizonte del portafolio (A-3)
+descriptive_stats["MFIV_Vol_Anual_Q"] = [bkm_annual_vol(c, medida="Q") for c in log_returns_selected.columns]
 
 disp = descriptive_stats.copy()
 for col in ["Retorno_Horizonte", "Volatilidad_Horizonte", "Retorno_Anual", "Volatilidad_Anual",
@@ -1173,7 +1292,7 @@ print(disp[["Symbol", "Retorno_Horizonte", "Volatilidad_Horizonte", "Retorno_Anu
 # ==============================================================================
 
 print("\n" + "=" * 67)
-print("OPTIMIZACION DE PORTAFOLIOS - MINIMA VARIANZA")
+print("OPTIMIZACION DE PORTAFOLIOS - MINIMO RIESGO DE COLA (BKM) - ESTACIONAL")
 print(f"Datos: {n_weeks} semanas | Horizonte: {horizon_label} (~{horizon_weeks:.1f} sem) | "
       f"Activos: {len(selected_tickers)}")
 print("=" * 67 + "\n")
@@ -1188,13 +1307,13 @@ benchmark_iv = "SPY"
 
 print("\nEstimando MFIV (BKM) para covarianza forward-looking...")
 
-iv_assets_implied = np.array([bkm_annual_vol(t) for t in selected_tickers])
+# Vol anual Q por activo, anualizada con el DTE real de su cadena (A-3). La
+# correccion Q->P se aplica abajo sobre el vector completo (incluye fallbacks).
+iv_assets_implied = np.array([bkm_annual_vol(t, medida="Q") for t in selected_tickers])
 
 n_iv_ok = np.sum(~pd.isna(iv_assets_implied))
 n_iv_na = np.sum(pd.isna(iv_assets_implied))
 print(f"  OK MFIV (BKM) validas: {n_iv_ok} | Sin datos (fallback historico): {n_iv_na}")
-
-iv_spy_implied = bkm_annual_vol(benchmark_iv) if use_iv_for_horizon else np.nan
 
 sd_hist_annual = sd_ret.values * math.sqrt(annualization_factor)
 iv_final = np.where(~pd.isna(iv_assets_implied), iv_assets_implied, sd_hist_annual)
@@ -1221,18 +1340,24 @@ else:
 print("\n  DIAGNOSTICO DE ESCALA:")
 print(f"     sd_ret (semanal, primeros 3):      {sd_ret.values[0]:.6f} | {sd_ret.values[1]:.6f} | {sd_ret.values[2]:.6f}")
 print(f"     sd_hist_annual (primeros 3):       {sd_hist_annual[0]:.6f} | {sd_hist_annual[1]:.6f} | {sd_hist_annual[2]:.6f}")
-print(f"     iv_final (primeros 3):             {iv_final[0]:.6f} | {iv_final[1]:.6f} | {iv_final[2]:.6f}")
-print(f"     iv_spy_implied:                    {iv_spy_implied if not pd.isna(iv_spy_implied) else np.nan}")
+print(f"     iv_final (post Q->P, primeros 3):  {iv_final[0]:.6f} | {iv_final[1]:.6f} | {iv_final[2]:.6f}")
 
-if pd.isna(iv_spy_implied):
-    print("  ADVERTENCIA Sin IV para SPY - usando vol historica como fallback")
-    if "SPY" in log_returns_selected.columns:
-        iv_spy_implied = log_returns_selected["SPY"].std() * math.sqrt(annualization_factor)
-    else:
-        spy_hist = download_ticker_data("SPY", start_date, end_date)
-        spy_hist = spy_hist.set_index("date")["adjusted"].resample("W").last()
-        spy_ret = np.log(spy_hist / spy_hist.shift(1)).dropna()
-        iv_spy_implied = spy_ret.std() * math.sqrt(annualization_factor)
+# Varianza del factor de mercado en la MISMA medida (P) que la de los activos
+# (M-4). Antes SPY y los ETFs sectoriales entraban en Q mientras los activos
+# ya estaban corregidos, y la varianza "explicada" podia superar la total.
+spy_hist_annual = benchmark_returns.iloc[:, 0].std() * math.sqrt(annualization_factor)
+iv_spy_implied_q = bkm_annual_vol(benchmark_iv, medida="Q") if use_iv_for_horizon else np.nan
+print(f"     iv_spy_implied (MFIV, Q):          {iv_spy_implied_q if not pd.isna(iv_spy_implied_q) else np.nan}")
+
+if pd.isna(iv_spy_implied_q):
+    print("  ADVERTENCIA Sin MFIV para SPY - usando vol historica como fallback")
+    iv_spy_implied = spy_hist_annual
+elif use_q_to_p_vol:
+    iv_spy_implied = rk.q_to_p_vol(iv_spy_implied_q, spy_hist_annual, ratio_bounds=vrp_ratio_bounds,
+                                   fallback_ratio=vrp_fallback_ratio)[0]
+    print(f"     iv_spy_implied (post Q->P):        {iv_spy_implied:.6f}")
+else:
+    iv_spy_implied = iv_spy_implied_q
 
 # ==============================================================================
 # MODELO DE CORRELACION IMPLICITA: FACTORES (MERCADO + SECTOR + PAIS + FX)
@@ -1455,19 +1580,21 @@ corr_factors = factor_returns_mat.corr()
 
 iv_factor = {f: np.nan for f in factor_names}
 iv_factor["MKT"] = iv_spy_implied
-for s in sectores_unicos:
-    iv_s = bkm_annual_vol(s) if use_iv_for_horizon else np.nan
-    if pd.isna(iv_s) or iv_s <= 0:
-        iv_s = log_returns[s].std() * math.sqrt(annualization_factor)
-    iv_factor[s] = iv_s
-for p in paises_unicos:
-    iv_p = bkm_annual_vol(p) if use_iv_for_horizon else np.nan
-    if pd.isna(iv_p) or iv_p <= 0:
-        iv_p = log_returns[p].std() * math.sqrt(annualization_factor)
-    iv_factor[p] = iv_p
+n_factores_q_a_p = 0
+# ETFs sectoriales y de pais: MFIV anualizada con su DTE real y corregida Q->P
+# con su propia vol historica (M-4), igual que los activos. Sin MFIV -> historica.
+for f in sectores_unicos + paises_unicos:
+    iv_f = bkm_annual_vol(f, medida="P") if use_iv_for_horizon else np.nan
+    if pd.isna(iv_f) or iv_f <= 0:
+        iv_f = log_returns[f].std() * math.sqrt(annualization_factor)
+    else:
+        n_factores_q_a_p += 1
+    iv_factor[f] = iv_f
 for c in currencies_presentes:
     iv_c = fx_weekly_returns[c].std() * math.sqrt(annualization_factor)
     iv_factor[c] = iv_c
+print(f"     factores sector/pais con MFIV (Q->P aplicado): {n_factores_q_a_p} de "
+      f"{len(sectores_unicos) + len(paises_unicos)}")
 
 iv_factor_weekly = np.array([iv_factor[f] / math.sqrt(annualization_factor) for f in factor_names])
 D_factor = np.diag(iv_factor_weekly)
@@ -1525,13 +1652,22 @@ print(f"     vol_final semanal rango:           {vol_final_weekly.min() * 100:.4
 # VARIANZA IDIOSINCRATICA
 # ==============================================================================
 explained_var = np.diag(Cov_explained)
-idio_var = np.maximum(vol_final_weekly ** 2 - explained_var, 1e-8)
+idio_floor = 1e-8
+idio_var_raw = vol_final_weekly ** 2 - explained_var
+idio_var = np.maximum(idio_var_raw, idio_floor)
 
 cov_mat = Cov_explained + np.diag(idio_var)
 cov_mat = pd.DataFrame(cov_mat, index=selected_tickers, columns=selected_tickers)
 
 print(f"     varianza explicada por mercado+sector+pais+fx (rango): {explained_var.min():.6f} - {explained_var.max():.6f}")
 print(f"     varianza idiosincratica anadida (rango):       {idio_var.min():.6f} - {idio_var.max():.6f}")
+# Activos cuya varianza explicada por factores supera la total: la
+# idiosincratica se trunca al piso y su correlacion implicita queda
+# sobreestimada (M-4). Con factores y activos en la misma medida deberian
+# ser pocos; si son muchos, revisar betas o la correccion Q->P.
+idio_en_piso = [t for t, v in zip(selected_tickers, idio_var_raw) if v <= idio_floor]
+print(f"     activos con varianza idiosincratica en el piso ({idio_floor:g}): {len(idio_en_piso)} de {n_sel}"
+      + (f" -> {', '.join(idio_en_piso)}" if idio_en_piso else ""))
 print(f"     diag(cov_mat) final rango:         {np.diag(cov_mat.values).min():.6f} - {np.diag(cov_mat.values).max():.6f}")
 print(f"     sqrt(diag(cov_mat)) = vol semanal: {np.sqrt(np.diag(cov_mat.values)).min() * 100:.4f}% - "
       f"{np.sqrt(np.diag(cov_mat.values)).max() * 100:.4f}%")
@@ -1541,8 +1677,20 @@ print(f"     sqrt(diag(cov_mat)) = vol semanal: {np.sqrt(np.diag(cov_mat.values)
 # ==============================================================================
 cov_scale_d2w = 252.0 / annualization_factor
 
+# Frecuencia de la covarianza historica (M-2). Con tickers de bolsas no
+# estadounidenses en el pool, los cierres diarios no son sincronicos y la
+# correlacion diaria Asia/Europa vs EE. UU. queda subestimada: el optimizador
+# los veria como diversificadores. En "auto" se pasa a semanal en ese caso.
+tickers_no_us_pool = [t for t in selected_tickers if is_non_us_exchange(t)]
+if hist_cov_frequency == "auto":
+    cov_freq_usada = "weekly" if tickers_no_us_pool else "daily"
+else:
+    cov_freq_usada = hist_cov_frequency
+print(f"\n  Frecuencia covarianza historica: {cov_freq_usada} (config: {hist_cov_frequency}; "
+      f"tickers de bolsa no-EE. UU. en el pool: {len(tickers_no_us_pool)})")
+
 daily_sel = None
-if use_daily_cov:
+if cov_freq_usada == "daily":
     faltantes = [t for t in selected_tickers if t not in daily_returns.columns]
     if faltantes:
         print(f"  ADVERTENCIA {len(faltantes)} tickers sin serie diaria "
@@ -1557,15 +1705,24 @@ if daily_sel is not None and len(daily_sel) >= 60:
     cov_hist_simple = np.asarray(cov_hist_simple)
     print("\n  COVARIANZA HISTORICA (EWMA + Ledoit-Wolf, base diaria):")
     print(f"     observaciones diarias: {cov_info['n_obs']} | t_eff (Kish): {cov_info['t_eff']:.1f}")
-    print(f"     halflife: {cov_halflife_days} dias | delta shrinkage: {cov_info['delta']:.3f}")
-    cov_muestral_ref = log_returns_selected.cov().values
-    print(f"     vol semanal media: muestral={np.sqrt(np.diag(cov_muestral_ref)).mean() * 100:.3f}% -> "
-          f"EWMA+LW={np.sqrt(np.diag(cov_hist_simple)).mean() * 100:.3f}%")
+    print(f"     halflife: {cov_halflife_days} dias | delta shrinkage: {cov_info['delta']:.3f} "
+          f"({cov_info['delta'] * 100:.0f}% hacia correlacion constante)")
+elif len(log_returns_selected.dropna()) >= 60:
+    cov_hist_simple, cov_info = rk.cov_ewma_shrunk(
+        log_returns_selected, halflife=cov_halflife_weeks, scale=1.0,
+        shrink=use_lw_shrinkage)
+    cov_hist_simple = np.asarray(cov_hist_simple)
+    print("\n  COVARIANZA HISTORICA (EWMA + Ledoit-Wolf, base semanal):")
+    print(f"     observaciones semanales: {cov_info['n_obs']} | t_eff (Kish): {cov_info['t_eff']:.1f}")
+    print(f"     halflife: {cov_halflife_weeks} semanas | delta shrinkage: {cov_info['delta']:.3f} "
+          f"({cov_info['delta'] * 100:.0f}% hacia correlacion constante)")
 else:
     cov_hist_simple = log_returns_selected.cov().values
-    print("\n  COVARIANZA HISTORICA: muestral semanal (sin datos diarios suficientes)")
+    print("\n  COVARIANZA HISTORICA: muestral semanal (sin datos suficientes para EWMA)")
 
-hist_shrink_alpha = 0.35
+cov_muestral_ref = log_returns_selected.cov().values
+print(f"     vol semanal media: muestral={np.sqrt(np.diag(cov_muestral_ref)).mean() * 100:.3f}% -> "
+      f"EWMA+LW={np.sqrt(np.diag(cov_hist_simple)).mean() * 100:.3f}%")
 
 off_diag_factor = cov_mat.values - np.diag(np.diag(cov_mat.values))
 off_diag_hist = cov_hist_simple - np.diag(np.diag(cov_hist_simple))
@@ -1596,7 +1753,7 @@ print(f"  Rango beta_mercado: {beta_hist_arr.min():.3f} - {beta_hist_arr.max():.
       f"Rango beta_fx: {beta_fx_arr.min():.3f} - {beta_fx_arr.max():.3f}")
 
 # ==============================================================================
-# OPTIMIZACION MINIMA VARIANZA (quadprog)
+# OPTIMIZACION MINIMO RIESGO DE COLA (quadprog, SOBRE Sigma_modificada)
 # ==============================================================================
 etf_excluded_from_portfolio = set(etf_tickers) - set(commodity_tickers)
 use_etf_band = use_etf_constraint and include_etfs_in_portfolio
@@ -1620,13 +1777,22 @@ else:
 
 n_etf_en_pool = sum(1 for t in optimization_pool if t in etf_universe_tickers)
 if use_etf_band:
+    _etf_min, _etf_max, _nota_banda = pq.relax_group_band(
+        n_etf_en_pool, len(optimization_pool) - n_etf_en_pool, max_weight_per_asset,
+        etf_min_weight, etf_max_weight)
+    etf_min_weight, etf_max_weight = _etf_min, _etf_max
+    if _nota_banda:
+        print(f"  ADVERTENCIA Banda ETF: {_nota_banda}")
+    if n_etf_en_pool == 0:
+        use_etf_band = False
+if use_etf_band:
     print(f"[INFO] Restriccion de participacion ETF activa: {etf_min_weight * 100:.0f}%-{etf_max_weight * 100:.0f}% "
           f"del capital invertido")
     print(f"[INFO] ETFs/commodities en el pool tras filtros previos: {n_etf_en_pool} de {len(optimization_pool)} activos")
     if n_etf_en_pool == 0:
         print("  ADVERTENCIA Ningun ETF sobrevivio a los filtros de score/volatilidad/correlacion/")
-        print("     estacionalidad/Delta - la restriccion de % ETF no tendra efecto.")
-        print("     Revisa volatility_percentile, correlation_percentile o delta_min si")
+        print("     estacionalidad/Tail Risk - la restriccion de % ETF no tendra efecto.")
+        print("     Revisa volatility_percentile, correlation_percentile o seasonal_min_weeks si")
         print("     quieres que mas ETFs lleguen a esta etapa.")
 
 n_fx_en_pool = sum(1 for t in optimization_pool if get_currency_for_ticker(t) != "USD")
@@ -1660,6 +1826,25 @@ def constraints_feasible(tickers_list):
     return True
 
 
+def build_qp_constraints(tickers_subset):
+    """Restricciones de quadprog para un subconjunto. Ver pq.build_weight_constraints (B-5)."""
+    return pq.build_weight_constraints(
+        len(tickers_subset),
+        min_weight=min_weight_per_asset,
+        max_weight=max_weight_per_asset,
+        min_total=min_total_weight,
+        max_total=max_total_weight,
+        require_full_investment=require_full_investment,
+        is_etf=[t in etf_universe_tickers for t in tickers_subset],
+        use_etf_band=use_etf_band,
+        etf_min_weight=etf_min_weight,
+        etf_max_weight=etf_max_weight,
+        is_non_usd=[get_currency_for_ticker(t) != "USD" for t in tickers_subset],
+        use_fx_cap=use_fx_factor,
+        max_fx_exposure=max_fx_exposure,
+    )
+
+
 def run_minvar_qp(tickers_subset):
     cm = cov_mat.loc[tickers_subset, tickers_subset].values
     n = len(tickers_subset)
@@ -1667,45 +1852,10 @@ def run_minvar_qp(tickers_subset):
     Dm = 2 * cm + np.eye(n) * reg
     dv = np.zeros(n)
 
-    if require_full_investment or math.isclose(min_total_weight, max_total_weight):
-        target_total = 1.0 if require_full_investment else min_total_weight
-        A_eq = np.ones((n, 1))
-        b_eq = np.array([target_total])
-        meq = 1
-    else:
-        A_eq = np.column_stack([np.ones(n), -np.ones(n)])
-        b_eq = np.array([min_total_weight, -max_total_weight])
-        meq = 0
-
-    A_box = np.column_stack([np.eye(n), -np.eye(n)])
-    b_box = np.concatenate([np.full(n, min_weight_per_asset), np.full(n, -max_weight_per_asset)])
-
-    Amat_base = np.column_stack([A_eq, A_box])
-    bvec_base = np.concatenate([b_eq, b_box])
-
-    is_etf_vec = np.array([1.0 if t in etf_universe_tickers else 0.0 for t in tickers_subset])
-    has_etf = is_etf_vec.sum() > 0
-
-    is_fx_vec = np.array([1.0 if get_currency_for_ticker(t) != "USD" else 0.0 for t in tickers_subset])
-    has_fx = is_fx_vec.sum() > 0
-
-    extra_cols = []
-    extra_b = []
-    if use_etf_band and has_etf:
-        a_etf_min = is_etf_vec - etf_min_weight
-        a_etf_max = etf_max_weight - is_etf_vec
-        extra_cols += [a_etf_min, a_etf_max]
-        extra_b += [0.0, 0.0]
-    if use_fx_factor and has_fx:
-        a_fx_max = max_fx_exposure - is_fx_vec
-        extra_cols += [a_fx_max]
-        extra_b += [0.0]
-
-    Amat_full = Amat_base
-    bvec_full = bvec_base
-    if extra_cols:
-        Amat_full = np.column_stack([Amat_base] + extra_cols)
-        bvec_full = np.concatenate([bvec_base, extra_b])
+    cons = build_qp_constraints(tickers_subset)
+    Amat_base, bvec_base = cons["Amat_base"], cons["bvec_base"]
+    Amat_full, bvec_full, meq = cons["Amat_full"], cons["bvec_full"], cons["meq"]
+    extra_cols = cons["has_extra"]
 
     def solve_attempt(Amat_try, bvec_try):
         try:
@@ -1798,10 +1948,10 @@ while True:
         break
 
     mtr = compute_marginal_cvar_contrib(current_tickers, w_vec, cm_iter)
-    mtr_active = mtr.loc[active.index].sort_values(ascending=False)
+    orden_poda = pq.prune_order(w_iter, mtr, tail_prune_rule)
 
     drop_ticker = None
-    for candidate in mtr_active.index:
+    for candidate in orden_poda:
         remaining = [t for t in current_tickers if t != candidate]
         if constraints_feasible(remaining):
             drop_ticker = candidate
@@ -1811,12 +1961,13 @@ while True:
                   f"dejaria la banda ETF/FX estructuralmente infactible)")
 
     if drop_ticker is None:
-        drop_ticker = mtr_active.index[0]
+        drop_ticker = orden_poda[0]
         print("    ADVERTENCIA: ninguna eliminacion preserva la banda ETF/FX factible - "
-              "eliminando por mayor MTR de todas formas")
+              f"eliminando igual ({tail_prune_rule})")
 
     current_tickers = [t for t in current_tickers if t != drop_ticker]
-    print(f"    -> Eliminando '{drop_ticker}' (MTR={mtr_active[drop_ticker]:.6f}, peso {active[drop_ticker] * 100:.3f}%)")
+    print(f"    -> Eliminando '{drop_ticker}' ({tail_prune_rule}, "
+          f"MTR={mtr[drop_ticker]:.6f}, peso {active[drop_ticker] * 100:.3f}%)")
 
     if len(current_tickers) < 3:
         print("  ADVERTENCIA Quedan menos de 3 activos - deteniendo iteracion")
@@ -1824,7 +1975,7 @@ while True:
 
 if w_last_valid is None:
     raise RuntimeError(
-        "Error: la optimizacion de minima varianza no encontro ninguna solucion factible.\n"
+        "Error: la optimizacion de minimo riesgo de cola no encontro ninguna solucion factible.\n"
         "   Revisa: (1) que cov_mat sea PSD, (2) min_weight_per_asset * n_activos <= max_total_weight,\n"
         "   (3) max_weight_per_asset * n_activos >= min_total_weight, (4) la restriccion ETF\n"
         "   (etf_min_weight/etf_max_weight) si use_etf_constraint e include_etfs_in_portfolio = True, y (5) la restriccion\n"
@@ -1856,42 +2007,33 @@ max_ret = mean_ret.max() * horizon_weeks
 target_returns = np.linspace(min_ret, max_ret, 50)
 
 n = len(selected_tickers)
-Dmat_ef = 2 * cov_mat.values
+Dmat_ef = 2 * cov_mat.values + np.eye(n) * (1e-6 * np.mean(np.diag(cov_mat.values)))
 dvec_ef = np.zeros(n)
 
+# Mismas restricciones que el optimizador (cotas, inversion total, banda ETF,
+# tope FX) mas el retorno objetivo (B-5). Los puntos infactibles se cuentan en
+# vez de silenciarse: quadprog lanza ValueError cuando no hay solucion.
+cons_ef = build_qp_constraints(selected_tickers)
 efficient_frontier_rows = []
+n_ef_infactibles = 0
 for target_ret in target_returns:
+    target_weekly = target_ret / horizon_weeks
+    Amat, bvec, meq_ef = pq.with_return_target(cons_ef, mean_ret.values, target_weekly)
     try:
-        target_weekly = target_ret / horizon_weeks
+        sol = quadprog.solve_qp(Dmat_ef, dvec_ef, Amat, bvec, meq_ef)
+    except ValueError:
+        n_ef_infactibles += 1
+        continue
+    w_sol = sol[0].copy()
+    w_sol[w_sol < 1e-6] = 0
 
-        Amat = np.column_stack([
-            np.eye(n),
-            np.ones(n),
-            -np.ones(n),
-            mean_ret.values,
-            -np.eye(n),
-        ])
-        bvec = np.concatenate([
-            np.zeros(n),
-            [min_total_weight],
-            [-max_total_weight],
-            [target_weekly],
-            np.full(n, -max_weight_per_asset),
-        ])
+    ret = float(np.sum(w_sol * mean_ret.values)) * horizon_weeks
+    risk = math.sqrt(float(w_sol @ cov_mat.values @ w_sol)) * horizon_sqrt
+    efficient_frontier_rows.append(dict(Return=ret, Risk=risk))
 
-        sol = quadprog.solve_qp(Dmat_ef, dvec_ef, Amat, bvec, 0)
-        w_sol = sol[0].copy()
-        w_sol[w_sol < 1e-6] = 0
-
-        ret = float(np.sum(w_sol * mean_ret.values)) * horizon_weeks
-        risk = math.sqrt(float(w_sol @ cov_mat.values @ w_sol)) * horizon_sqrt
-
-        efficient_frontier_rows.append(dict(Return=ret, Risk=risk))
-    except Exception:
-        pass
-
-efficient_frontier = pd.DataFrame(efficient_frontier_rows)
-print(f"[INFO] Frontera eficiente calculada con {len(efficient_frontier)} puntos.")
+efficient_frontier = pd.DataFrame(efficient_frontier_rows, columns=["Return", "Risk"])
+print(f"[INFO] Frontera eficiente calculada con {len(efficient_frontier)} puntos"
+      f"{f' ({n_ef_infactibles} objetivos infactibles con las bandas ETF/FX)' if n_ef_infactibles else ''}.")
 
 # ==============================================================================
 # SECCION 10: EXTRACCION DE METRICAS
@@ -1921,7 +2063,8 @@ def extract_metrics(opt_obj, label):
     ret_weekly = float(np.sum(w_vec * mr.values))
     risk_weekly = math.sqrt(float(w_vec @ cm.values @ w_vec))
 
-    port_returns = ret_mat.dot(w)
+    # Log-retorno exacto del portafolio (B-2); el efectivo no invertido rinde 0.
+    port_returns = rk.portfolio_log_returns(ret_mat, w)
     mdd = max_drawdown_from_returns(port_returns)
 
     port_excess = port_returns.values - risk_free_rate_weekly
@@ -1939,7 +2082,7 @@ def extract_metrics(opt_obj, label):
     )
 
 
-metrics_minvar = extract_metrics(opt_min_var, "Minima Varianza")
+metrics_minvar = extract_metrics(opt_min_var, "Minimo Riesgo de Cola")
 
 # ==============================================================================
 # VaR/CVaR (Expected Shortfall) prospectivo global, Cornish-Fisher
@@ -1960,8 +2103,8 @@ if len(panel_source) >= panel_min_obs:
     panel_final = rk.rescale_panel(Z_panel, panel_source.mean().values, sd_prospectiva)
 
     mom_port = rk.portfolio_moments(w_final_vals, panel_final)
-    port_skew_final = mom_port["skew"]
-    port_kurt_exc_final = mom_port["exkurt"]
+    port_skew_final = mom_port["skew"]           # semanal
+    port_kurt_exc_final = mom_port["exkurt"]     # semanal
 
     mask_q = np.isfinite(mfis_final) & np.isfinite(mfik_final)
     if mask_q.sum() > 0 and w_final_vals[mask_q].sum() > 0:
@@ -1981,8 +2124,17 @@ if len(panel_source) >= panel_min_obs:
     port_sd_horizon = metrics_minvar["Risk_Horizon"]
     port_mu_horizon = metrics_minvar["Return_Horizon"]
 
+    # El panel es semanal; mu y sigma ya estan al horizonte. Asimetria y exceso
+    # de curtosis se llevan al horizonte con la regla iid (S/sqrt(h), K/h),
+    # la misma que usa el filtro por activo (A-4). Antes se mezclaban momentos
+    # semanales con sigma al horizonte y el CVaR quedaba sobreestimado.
+    esc_port = rk.scale_moments(rk.to_years(weeks=1), rk.to_years(weeks=horizon_weeks),
+                                skew=port_skew_final, exkurt=port_kurt_exc_final)
+    port_skew_horizon = esc_port["skew"]
+    port_kurt_exc_horizon = esc_port["exkurt"]
+
     cf_res = rk.var_cvar_cornish_fisher(
-        port_mu_horizon, port_sd_horizon, port_skew_final, port_kurt_exc_final,
+        port_mu_horizon, port_sd_horizon, port_skew_horizon, port_kurt_exc_horizon,
         confidence=cornish_fisher_confidence)
 
     var_cf_final = cf_res["var"]
@@ -1995,6 +2147,7 @@ if len(panel_source) >= panel_min_obs:
               f"CVaR {cf_res['cvar_gaussian'] * 100:.4f}%")
 else:
     port_skew_final, port_kurt_exc_final = np.nan, np.nan
+    port_skew_horizon, port_kurt_exc_horizon = np.nan, np.nan
     var_cf_final, cvar_cf_final = np.nan, np.nan
     print(f"  ADVERTENCIA: solo {len(panel_source)} semanas (<{panel_min_obs}) para el panel "
           "- VaR/CVaR Cornish-Fisher = NaN")
@@ -2006,7 +2159,7 @@ else:
 print("\n[INFO] Generando visualizaciones...")
 
 df_points = pd.DataFrame({
-    "Label": ["Minima Varianza"],
+    "Label": ["Minimo Riesgo de Cola"],
     "Risk": [metrics_minvar["Risk_Horizon"]],
     "Return": [metrics_minvar["Return_Horizon"]],
 })
@@ -2050,7 +2203,7 @@ fig.update_traces(marker=dict(size=6, opacity=0.5), selector=dict(name="Frontera
 fig.update_traces(marker=dict(size=9, opacity=0.75), selector=dict(name="Activos individuales"))
 fig.update_traces(marker=dict(size=16, line=dict(width=1.5, color="black")), selector=dict(name="Portafolio optimo"))
 fig.update_layout(
-    title=dict(text="Frontera Eficiente - Minima Varianza<br>"
+    title=dict(text="Frontera Eficiente - Minimo Riesgo de Cola (BKM, estacional)<br>"
                      f"<sup>Horizonte: {horizon_label} (~{horizon_weeks:.1f} sem) | Periodo datos: {start_date} -> "
                      f"{end_date:%Y-%m-%d} | {len(selected_tickers)} activos</sup>"),
     xaxis_tickformat=".1%", yaxis_tickformat=".1%",
@@ -2067,7 +2220,7 @@ def prepare_weights_with_cash(weights, total_weight, label):
     return df
 
 
-df_weights = prepare_weights_with_cash(metrics_minvar["Weights"], metrics_minvar["Total_Weight"], "Minima Varianza")
+df_weights = prepare_weights_with_cash(metrics_minvar["Weights"], metrics_minvar["Total_Weight"], "Minimo Riesgo de Cola")
 
 df_weights_plot = df_weights.sort_values("Weight", ascending=True)
 fig = px.bar(
@@ -2079,7 +2232,7 @@ fig = px.bar(
 fig.update_traces(textposition="outside", marker_line_width=0,
                    hovertemplate="%{y}: %{x:.2%}<extra></extra>")
 fig.update_layout(
-    title=dict(text="Asignacion Optima de Activos - Minima Varianza<br>"
+    title=dict(text="Asignacion Optima de Activos - Minimo Riesgo de Cola (estacional)<br>"
                      f"<sup>Horizonte: {horizon_label} | Peso max por activo: {max_weight_per_asset * 100:.0f}%</sup>"),
     xaxis_tickformat=".0%",
     template="plotly_white",
@@ -2116,7 +2269,7 @@ fig.show()
 # ==============================================================================
 
 print("\n" + "=" * 65)
-print("PORTAFOLIO OPTIMO - MINIMA VARIANZA")
+print("PORTAFOLIO OPTIMO - MINIMO RIESGO DE COLA (BKM + CORNISH-FISHER) - ESTACIONAL")
 print("=" * 65)
 print(f"    Entrenado con : {n_weeks} semanas ({start_date} -> {end_date:%Y-%m-%d})")
 print(f"    Horizonte     : {horizon_label} (~{horizon_weeks:.1f} semanas)")
@@ -2244,8 +2397,10 @@ for _, row in tail_attr_df.iterrows():
     mfik_str = "N/D" if pd.isna(row["MFIK"]) else f"{row['MFIK']:.3f}"
     print(f"  {row['Ticker']:<8} {row['Weight'] * 100:6.2f}% {mfis_str:>10} {mfik_str:>10}")
 print("  " + "-" * 40)
-print(f"  Asimetria del portafolio (P, co-momentos): {port_skew_final:+.4f}")
-print(f"  Exceso de curtosis del portafolio (P):     {port_kurt_exc_final:+.4f}")
+print(f"  Asimetria del portafolio (P, co-momentos, semanal): {port_skew_final:+.4f}"
+      f"  -> horizonte: {port_skew_horizon:+.4f}")
+print(f"  Exceso de curtosis del portafolio (P, semanal):     {port_kurt_exc_final:+.4f}"
+      f"  -> horizonte: {port_kurt_exc_horizon:+.4f}")
 if pd.notna(var_cf_final):
     print(f"  VaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%, horizonte):  {var_cf_final * 100:.4f}%")
     print(f"  CVaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%, horizonte): {cvar_cf_final * 100:.4f}%")
@@ -2312,13 +2467,32 @@ print(f"   Retorno esperado  : {metrics_minvar['Return_Horizon'] * 100:.2f}%")
 print(f"   Volatilidad       : {metrics_minvar['Risk_Horizon'] * 100:.2f}%")
 print(f"   Sharpe Ratio      : {metrics_minvar['Sharpe_Horizon']:.3f}")
 print(f"   Sortino Ratio     : {metrics_minvar['Sortino_Horizon']:.3f}")
-print(f"   VaR Cornish-Fisher (95%)  : {var_cf_final * 100:.4f}%" if pd.notna(var_cf_final) else "   VaR Cornish-Fisher (95%)  : N/D")
-print(f"   CVaR Cornish-Fisher (95%) : {cvar_cf_final * 100:.4f}%" if pd.notna(cvar_cf_final) else "   CVaR Cornish-Fisher (95%) : N/D")
+_cf_pct = f"{cornish_fisher_confidence * 100:.0f}%"
+print(f"   VaR Cornish-Fisher ({_cf_pct})  : " + (f"{var_cf_final * 100:.4f}%" if pd.notna(var_cf_final) else "N/D"))
+print(f"   CVaR Cornish-Fisher ({_cf_pct}) : " + (f"{cvar_cf_final * 100:.4f}%" if pd.notna(cvar_cf_final) else "N/D"))
 print("\n   -- Referencia anual --")
 print(f"   Retorno esperado  : {metrics_minvar['Return_Annual'] * 100:.2f}%")
 print(f"   Volatilidad       : {metrics_minvar['Risk_Annual'] * 100:.2f}%")
 print(f"   Sharpe Ratio      : {metrics_minvar['Sharpe_Annual']:.3f}")
 print(f"   Sortino Ratio     : {metrics_minvar['Sortino_Annual']:.3f}")
+print("=" * 65)
+
+# ==============================================================================
+# COBERTURA BKM: QUIEN CAYO AL ESTIMADOR HISTORICO Y POR QUE (A-1)
+# ==============================================================================
+print("\n" + "=" * 65)
+print("COBERTURA BKM (momentos implicitos vs fallback historico)")
+print("=" * 65)
+bkm_resumen_fallbacks(list(w_final.index), "Portafolio final")
+consultados = [t for t in bkm_moments_cache if t not in w_final.index]
+if consultados:
+    motivos_resto = pd.Series([bkm_motivo_fallback(t) or "BKM completo" for t in consultados])
+    motivos_resto = motivos_resto.str.replace(r" \(.*\)$", "", regex=True)
+    n_fb_resto = int((motivos_resto != "BKM completo").sum())
+    print(f"\n  Resto de tickers consultados ({len(consultados)}): {len(consultados) - n_fb_resto} con BKM completo | "
+          f"{n_fb_resto} con fallback historico")
+    for motivo, n in motivos_resto[motivos_resto != "BKM completo"].value_counts().items():
+        print(f"     {n:>3}  {motivo}")
 print("=" * 65)
 
 print("\nDiagnostico de llamadas a Polygon:")

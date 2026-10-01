@@ -13,14 +13,26 @@
 #      TTL para snapshots del dia.
 #   5. Diagnostico acumulado de llamadas.
 #   6. Descarga de la cadena OTM de un unico vencimiento para BKM.
+#   7. Formato de tickers para Polygon (BRK-B -> BRK.B), unico para todos
+#      los scripts.
 #
 # Configuracion por variables de entorno (.env):
-#   POLYGON_API_KEY           clave de la API
-#   POLYGON_CALLS_PER_MIN     tope de llamadas por minuto (vacio = sin tope;
-#                             5 = plan gratuito Stocks Basic)
+#   POLYGON_API_KEY           clave de la API. Sin clave, toda consulta
+#                             devuelve status "sin_api_key" de forma
+#                             DEFINITIVA (no se reintenta ni se trata como
+#                             fallo transitorio) y se emite un aviso una vez.
+#   POLYGON_CALLS_PER_MIN     tope de llamadas por minuto. Default
+#                             DEFAULT_CALLS_PER_MIN (300 = 5/s), un ritmo
+#                             conservador para los planes de pago (Starter o
+#                             superior), que no imponen tope duro pero si
+#                             devuelven 429 ante rafagas. Valores:
+#                               5                 plan gratuito
+#                               0 / none / unlimited   sin limitador
 #   POLYGON_SNAPSHOT_TTL_MIN  vigencia en minutos de la cache de snapshots
 #                             (default 60; 0 la desactiva)
 #   POLYGON_CACHE_DIR         carpeta de la cache (default .cache/polygon)
+#
+# El tope tambien puede cambiarse en tiempo de ejecucion con set_rate_limit().
 # ==============================================================================
 
 import hashlib
@@ -29,6 +41,7 @@ import os
 import re
 import threading
 import time
+import warnings
 from datetime import date
 
 import numpy as np
@@ -41,17 +54,32 @@ load_dotenv()
 __all__ = [
     "API_KEY",
     "CALLS_PER_MIN",
+    "DEFAULT_CALLS_PER_MIN",
+    "set_rate_limit",
+    "polygon_format_ticker",
+    "is_us_ticker",
+    "expiry_rank_columns",
+    "EXPIRY_SORT_COLS",
     "get_json",
     "get_all",
+    "es_transitorio",
     "cache_get",
     "cache_set",
     "estimate_minutes",
     "fetch_otm_chain",
     "diag",
     "print_diagnostics",
+    "n_fallos_transitorios",
 ]
 
 API_KEY = os.environ.get("POLYGON_API_KEY")
+
+# Ritmo por defecto para planes de pago. Polygon no publica un tope duro en
+# esos planes, pero responde 429 ante rafagas sostenidas; 5 llamadas/s cubre
+# una cadena de ~200 tickers (2 consultas por ticker) en poco mas de un
+# minuto sin provocarlos.
+DEFAULT_CALLS_PER_MIN = 300.0
+_SIN_TOPE = {"0", "none", "null", "unlimited", "inf", "sin_tope", "ilimitado"}
 
 
 def _env_float(nombre, default=None):
@@ -64,9 +92,26 @@ def _env_float(nombre, default=None):
         return default
 
 
-CALLS_PER_MIN = _env_float("POLYGON_CALLS_PER_MIN")
-if CALLS_PER_MIN is not None and CALLS_PER_MIN <= 0:
-    CALLS_PER_MIN = None
+def _parse_calls_per_min(valor, default=DEFAULT_CALLS_PER_MIN):
+    """Interpreta el tope de llamadas: None/float. Vacio -> default; 0 o
+    'unlimited' -> None (sin limitador); numero invalido -> default."""
+    if valor is None:
+        return default
+    if isinstance(valor, (int, float)):
+        return None if valor <= 0 or not np.isfinite(valor) else float(valor)
+    texto = str(valor).strip().lower()
+    if not texto:
+        return default
+    if texto in _SIN_TOPE:
+        return None
+    try:
+        num = float(texto)
+    except ValueError:
+        return default
+    return None if num <= 0 or not np.isfinite(num) else num
+
+
+CALLS_PER_MIN = _parse_calls_per_min(os.environ.get("POLYGON_CALLS_PER_MIN"))
 SNAPSHOT_TTL_SEC = _env_float("POLYGON_SNAPSHOT_TTL_MIN", 60.0) * 60.0
 CACHE_DIR = os.environ.get("POLYGON_CACHE_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".cache", "polygon")
@@ -84,9 +129,13 @@ STATUS_TRANSITORIOS = {429, 500, 502, 503, 504}
 
 class _Limitador:
     def __init__(self, llamadas_por_min):
-        self.intervalo = 60.0 / llamadas_por_min if llamadas_por_min else 0.0
-        self.proxima = 0.0
         self.lock = threading.Lock()
+        self.proxima = 0.0
+        self.configurar(llamadas_por_min)
+
+    def configurar(self, llamadas_por_min):
+        with self.lock:
+            self.intervalo = 60.0 / llamadas_por_min if llamadas_por_min else 0.0
 
     def esperar(self):
         if self.intervalo <= 0:
@@ -100,6 +149,18 @@ class _Limitador:
 
 
 _limitador = _Limitador(CALLS_PER_MIN)
+
+
+def set_rate_limit(calls_per_min):
+    """Cambia el tope de llamadas por minuto en tiempo de ejecucion.
+
+    Acepta lo mismo que la variable de entorno: un numero, 0/None/'unlimited'
+    para desactivar el limitador. Devuelve el tope efectivo (None = sin tope).
+    """
+    global CALLS_PER_MIN
+    CALLS_PER_MIN = _parse_calls_per_min(calls_per_min, default=None)
+    _limitador.configurar(CALLS_PER_MIN)
+    return CALLS_PER_MIN
 
 
 def estimate_minutes(n_llamadas):
@@ -205,6 +266,89 @@ def _con_api_key(url, api_key):
     return f"{url}{'&' if '?' in url else '?'}apiKey={api_key}"
 
 
+_aviso_api_key_emitido = False
+_aviso_403_emitido = False
+
+
+def _avisar_sin_api_key():
+    global _aviso_api_key_emitido
+    if _aviso_api_key_emitido:
+        return
+    _aviso_api_key_emitido = True
+    warnings.warn(
+        "POLYGON_API_KEY no esta definida: todas las consultas a Polygon fallaran "
+        "con status 'sin_api_key' y los scripts usaran sus estimadores historicos.",
+        RuntimeWarning, stacklevel=3)
+
+
+def _avisar_403(url):
+    """Un 403 de este plan no se reintenta: opciones y reference si, acciones no."""
+    global _aviso_403_emitido
+    if _aviso_403_emitido:
+        return
+    _aviso_403_emitido = True
+    ruta = _sin_api_key(url).split("?", 1)[0]
+    print(
+        "Polygon respondio 403: este plan solo incluye opciones y reference. "
+        "Los snapshots y agregados de acciones no estan habilitados; el spot y "
+        f"los precios salen de yfinance. No se reintenta. URL: {ruta}"
+    )
+
+
+def polygon_format_ticker(ticker):
+    """Ticker en el formato que espera Polygon para acciones de EE. UU.
+
+    Yahoo separa las clases de accion con guion (BRK-B, BF-B); Polygon usa
+    punto (BRK.B, BF.B). Antes esta traduccion solo existia en
+    quadratic_utility.py: en minimum_variance.py esos tickers no encontraban
+    cadena y caian al estimador historico sin aviso (M-14).
+    """
+    if ticker is None:
+        return ticker
+    return str(ticker).strip().replace("-", ".")
+
+
+# Sufijos de bolsa de Yahoo. Una letra que no este aqui es clase de accion
+# de EE. UU. (BRK.B). .L y .T si son bolsas. Un sufijo de varias letras que
+# no este en la lista tambien se trata como no estadounidense.
+_NON_US_EXCHANGE_SUFFIXES = {
+    "TO", "V", "CN", "NE",
+    "L", "IL", "IR",
+    "DE", "F", "BE", "DU", "HM", "HA", "MU",
+    "PA", "AS", "BR", "MC", "MI", "MA", "VI", "AT", "SW", "ST", "OL", "CO", "HE", "LS", "WA",
+    "T", "HK", "SS", "SZ", "TW", "TWO",
+    "KS", "KQ",
+    "AX", "NZ",
+    "SA", "MX",
+    "SI", "NS", "BO", "JK", "KL", "BK", "TA", "IS", "PR", "SR", "CR", "BA", "SN", "JO", "QA",
+}
+
+
+def is_us_ticker(ticker):
+    """True si el ticker cotiza en EE. UU. para consultar opciones en Polygon.
+
+    BRK-B y BRK.B son clases de accion estadounidenses. NG.L, SU.TO, ASML.AS,
+    y cualquier sufijo de bolsa conocido (o de varias letras desconocido) no.
+    """
+    if ticker is None:
+        return False
+    texto = str(ticker).strip().upper()
+    if not texto:
+        return False
+    if "-" in texto and "." not in texto:
+        base, suf = texto.rsplit("-", 1)
+        if base and len(suf) == 1 and suf.isalpha():
+            return True
+    if "." not in texto:
+        return True
+    _base, suf = texto.rsplit(".", 1)
+    if suf in _NON_US_EXCHANGE_SUFFIXES:
+        return False
+    if len(suf) == 1 and suf.isalpha():
+        return True
+    return False
+
+
 # ==============================================================================
 # 4. PETICIONES
 # ==============================================================================
@@ -227,6 +371,7 @@ def get_json(url, api_key=None, permanente=False, max_retries=5, timeout=20, bac
             return data, 200
     if not api_key:
         _registrar("sin_api_key")
+        _avisar_sin_api_key()
         return None, "sin_api_key"
 
     status = "red"
@@ -258,6 +403,8 @@ def get_json(url, api_key=None, permanente=False, max_retries=5, timeout=20, bac
                 pass
             time.sleep(espera if espera and espera > 0 else backoff * 2 ** (intento - 1))
             continue
+        if status == 403:
+            _avisar_403(clave)
         _registrar(status, resp.text)
         return None, status
 
@@ -288,7 +435,11 @@ def get_all(url, api_key=None, permanente=False, max_pages=40, **kwargs):
 
 
 def es_transitorio(status):
-    return status in STATUS_TRANSITORIOS or status in ("red", "max_pages", "sin_api_key")
+    """True si el fallo puede resolverse reintentando (429/5xx, red, paginas
+    truncadas). La ausencia de API key NO es transitoria: reintentar no la
+    resuelve y marcarla asi hacia que los scripts contaran esos fallos como
+    "limite de tasa o red" (B-11)."""
+    return status in STATUS_TRANSITORIOS or status in ("red", "max_pages")
 
 
 # ==============================================================================
@@ -296,15 +447,39 @@ def es_transitorio(status):
 # ==============================================================================
 # La integracion BKM supone un unico horizonte T. Mezclar vencimientos y
 # quedarse con el primer contrato de cada strike (drop_duplicates) combinaba
-# precios de plazos distintos. Aqui se toma el vencimiento mas cercano al DTE
-# objetivo que tenga calls OTM y puts OTM, y solo sus contratos.
+# precios de plazos distintos. Se prefiere un vencimiento con DTE >= min_dte
+# y >= objetivo (el mensual de ~50 dias, no el de 15 mas cercano a 30). Si
+# ninguno llega al minimo, se usa el mas cercano para no dejar el nombre fuera.
 # ==============================================================================
 
 _COLS_CADENA = ["strike", "iv", "type"]
+EXPIRY_SORT_COLS = ["_bajo_min", "_bajo_obj", "_dist", "_n"]
+
+
+def expiry_rank_columns(dte, target_dte, n_contracts, min_dte=21):
+    """Columnas para ordenar vencimientos de menor a mayor preferencia.
+
+    Orden: DTE >= min_dte, luego DTE >= objetivo, luego distancia al
+    objetivo, luego mas contratos. `min_dte=None` no exige un piso.
+    """
+    dte = np.asarray(dte, dtype=float)
+    n = np.asarray(n_contracts, dtype=float)
+    target = float(target_dte)
+    if min_dte is None:
+        bajo_min = np.zeros(np.size(dte), dtype=int)
+    else:
+        bajo_min = (dte < float(min_dte)).astype(int)
+    return {
+        "_bajo_min": bajo_min,
+        "_bajo_obj": (dte < target).astype(int),
+        "_dist": np.abs(dte - target),
+        "_n": -n,
+    }
 
 
 def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
-                    target_dte, api_key=None, strike_fmt="{:.2f}", max_pages=40):
+                    target_dte, api_key=None, strike_fmt="{:.2f}", max_pages=40,
+                    min_dte=21):
     """Cadena OTM (calls K >= S, puts K < S) de un unico vencimiento.
 
     Devuelve (calls_df, puts_df, info). info trae completo (False si la
@@ -356,9 +531,9 @@ def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
     if por_venc.empty:
         return vacio, vacio.copy(), info
     por_venc["dte"] = (pd.to_datetime(por_venc["expiracion"]) - hoy).dt.days
-    por_venc["_dist"] = (por_venc["dte"] - target_dte).abs()
-    por_venc["_n"] = -(por_venc["n_call"] + por_venc["n_put"])
-    elegido = por_venc.sort_values(["_dist", "_n"]).iloc[0]
+    por_venc = por_venc.assign(**expiry_rank_columns(
+        por_venc["dte"], target_dte, por_venc["n_call"] + por_venc["n_put"], min_dte))
+    elegido = por_venc.sort_values(EXPIRY_SORT_COLS).iloc[0]
 
     df = df[df["expiracion"] == elegido["expiracion"]]
     calls = df[df["type"] == "call"][_COLS_CADENA].drop_duplicates("strike").reset_index(drop=True)

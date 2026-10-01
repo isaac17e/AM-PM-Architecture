@@ -1,0 +1,25 @@
+# Dependencias que realmente importan los scripts del repositorio.
+# La integral BKM pasa por risk_estimators.trapezoid (np.trapezoid en
+# numpy >= 2, np.trapz en 1.x). Ningun script llama np.trapezoid directo.
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+requests>=2.28
+python-dotenv>=1.0
+python-dateutil>=2.8
+
+# Datos de mercado y scraping
+yfinance>=0.2.40
+pandas-datareader>=0.10
+beautifulsoup4>=4.12
+lxml>=4.9            # motor de pandas.read_html
+
+# Estadistica y optimizacion
+statsmodels>=0.14
+quadprog>=0.1.11
+
+# Visualizacion
+plotly>=5.18
+
+# Pruebas
+pytest>=7.0
