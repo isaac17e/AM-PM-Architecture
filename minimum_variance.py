@@ -166,6 +166,7 @@ annualization_factor = 52
 delta_strike_mode = "atm"
 target_dte_iv = 30
 dte_tol_iv = 21
+dte_min_iv = 21
 moneyness_tol_iv = 0.02
 
 # ------------------------------------------------------------------------------
@@ -450,16 +451,13 @@ ticker_currency_by_suffix = {
 # "BP": "GBP"} era incorrecto: ambos son ADRs de NYSE cotizados en USD (A-2).
 ticker_currency_override = {}
 
-# Bolsa (por sufijo) para decidir si los cierres son sincronicos con EE. UU.
-non_us_exchange_suffixes = tuple(ticker_currency_by_suffix.keys())
-
 # Se rellena tras la descarga con history_metadata["currency"] de yfinance.
 provider_currency = {}
 ticker_currency = {}
 
 
 def is_non_us_exchange(ticker):
-    return str(ticker).endswith(non_us_exchange_suffixes)
+    return not pc.is_us_ticker(ticker)
 
 
 def get_currency_for_ticker(ticker):
@@ -815,9 +813,10 @@ def get_polygon_option_snapshot(ticker):
         if len(df) == 0:
             raise ValueError("sin contratos en la ventana ~30 DTE")
 
-        df["_s1"] = (df["dte"] - target_dte_iv).abs()
-        df["_s2"] = (df["strike"] / S - 1).abs()
-        df = df.sort_values(["_s1", "_s2"])
+        rango = pc.expiry_rank_columns(df["dte"], target_dte_iv, np.ones(len(df)), dte_min_iv)
+        df = df.assign(**rango)
+        df["_moneyness"] = (df["strike"] / S - 1).abs()
+        df = df.sort_values(pc.EXPIRY_SORT_COLS + ["_moneyness"])
         elegido = df.iloc[0]
 
         spot_final = elegido.get("underlying_asset.price", np.nan)
@@ -870,7 +869,7 @@ def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_
     return pc.fetch_otm_chain(
         pc.polygon_format_ticker(ticker), S, fecha_min, fecha_max,
         round(S * moneyness_lo, 2), round(S * moneyness_hi, 2),
-        target_dte, api_key=POLYGON_API_KEY, strike_fmt="{:.2f}")
+        target_dte, api_key=POLYGON_API_KEY, strike_fmt="{:.2f}", min_dte=dte_min_iv)
 
 
 def bkm_iv_chain_to_prices(S, r, T, chain_df):
@@ -929,10 +928,14 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
     motivo = None
-    cap_mfik = rk.mfik_cap(n_c + n_p, base=bkm_mfik_max, hard=bkm_mfik_max_hard)
+    dte_chain = float(T) * rk.DAYS_PER_YEAR
+    cap_mfik = rk.mfik_cap_tenor(
+        n_c + n_p, dte_chain, ref_dte=float(target_dte_iv),
+        base=bkm_mfik_max, hard=bkm_mfik_max_hard)
     if not rk.higher_moments_admissible(mfis, mfik, cap_mfik):
         motivo = (f"momentos_inadmisibles (MFIS={mfis:.2f}, MFIK={mfik:.2f}, "
-                  f"tope={cap_mfik:.1f} con {n_c + n_p} strikes OTM; MFIV se conserva)")
+                  f"tope={cap_mfik:.1f} a {dte_chain:.0f}d vs ref {target_dte_iv}d "
+                  f"con {n_c + n_p} strikes OTM; MFIV se conserva)")
         mfis, mfik = np.nan, np.nan
 
     return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True, motivo=motivo)
@@ -1060,6 +1063,8 @@ else:
 # FILTRO DE TAIL RISK BKM: VaR Cornish-Fisher para rankear/filtrar candidatos
 # ==============================================================================
 print(f"\nAplicando filtro de Tail Risk BKM (VaR_CF a {tail_risk_filter_confidence * 100:.0f}% de confianza)...")
+print(f"  VaR_CF al horizonte de {target_dte_iv} dias. MFIS/MFIK de la tabla son los de la cadena; "
+      "la cola se calcula con esos momentos escalados al objetivo.")
 if tail_risk_hist_fallback:
     print("  Fallback historico ACTIVO: los activos sin BKM valido usan momentos historicos")
 
@@ -1096,19 +1101,21 @@ for ticker in selected_pre_seasonal:
     fila = dict(Symbol=ticker, MFIV=np.nan, MFIS=np.nan, MFIK=np.nan, VaR_CF=np.nan,
                 HV_Annual=hv_annual, N_Obs=n_obs, Fuente=None, DTE=np.nan)
     if mom["ok"] and np.isfinite(mom["mfis"]):
-        # sigma de la cadena (Q) al plazo REAL de los contratos; se lleva a P con
-        # la misma correccion Q->P que usa la covarianza (B-3). MFIS/MFIK siguen
-        # bajo Q: no hay un analogo robusto de la prima de riesgo para ellos.
-        dte_t = mom["dte"] if np.isfinite(mom.get("dte", np.nan)) else target_dte_iv
-        sigma_T_q = math.sqrt(mom["mfiv"])
+        # Momentos crudos de la cadena, escalados al DTE objetivo antes del VaR.
+        # La vol Q se lleva a P con la misma correccion que la covarianza (B-3),
+        # tambien al objetivo. La tabla guarda MFIS/MFIK sin escalar.
+        dte_chain = mom["dte"] if np.isfinite(mom.get("dte", np.nan)) else target_dte_iv
+        esc = rk.scale_bkm_moments(mom["mfiv"], mom["mfis"], mom["mfik"], dte_chain, target_dte_iv)
+        sigma_T_q = math.sqrt(esc["mfiv"])
         if use_q_to_p_vol and np.isfinite(hv_annual):
-            hv_T = hv_annual * math.sqrt(rk.to_years(dte=dte_t))
+            hv_T = hv_annual * math.sqrt(rk.to_years(dte=target_dte_iv))
             sigma_T = rk.q_to_p_vol(sigma_T_q, hv_T, ratio_bounds=vrp_ratio_bounds,
                                     fallback_ratio=vrp_fallback_ratio)[0]
         else:
             sigma_T = sigma_T_q
-        s_T, exk_T = mom["mfis"], mom["mfik"] - 3.0
-        fila.update(MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"], Fuente="BKM", DTE=dte_t)
+        s_T, exk_T = esc["mfis"], esc["mfik"] - 3.0
+        dte_t = target_dte_iv
+        fila.update(MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"], Fuente="BKM", DTE=dte_chain)
     elif tail_risk_hist_fallback and (hist := momentos_cola_historicos(r_t)) is not None:
         sigma_T, s_T, exk_T, dte_t = hist["sigma_T"], hist["skew"], hist["exkurt"], hist["dte"]
         fila.update(Fuente="Historico", DTE=dte_t)

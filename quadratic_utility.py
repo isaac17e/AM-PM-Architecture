@@ -51,6 +51,7 @@ if not POLYGON_API_KEY:
     print("             fallaran y cada activo caera a fallback historico (sin BKM real).")
 
 polygon_dte_tol = 21
+polygon_dte_min = 21
 atm_strike_band = 0.10
 
 # ------------------------------------------------------------------------------
@@ -314,7 +315,7 @@ def clean_symbol_table(tbl):
 # FUNCIONES AUXILIARES: Polygon.io
 # ==============================================================================
 def is_us_ticker(ticker):
-    return not re.search(r"\.(TO|DE|L|PA|MC|T)$", ticker)
+    return pc.is_us_ticker(ticker)
 
 
 def polygon_format_ticker(ticker):
@@ -359,9 +360,10 @@ def polygon_get_atm_option(ticker, target_dte, dte_tol=21, api_key=None, contrac
         if df.empty:
             return vacio
 
-        df["_score1"] = (df["greeks.delta"] - 0.50).abs()
-        df["_score2"] = (df["dte"] - target_dte).abs()
-        df = df.sort_values(["_score1", "_score2"])
+        rango = pc.expiry_rank_columns(df["dte"], target_dte, np.ones(len(df)), polygon_dte_min)
+        df = df.assign(**rango)
+        df["_delta"] = (df["greeks.delta"] - 0.50).abs()
+        df = df.sort_values(pc.EXPIRY_SORT_COLS + ["_delta"])
         c1 = df.iloc[0]
 
         return dict(
@@ -507,12 +509,16 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     mfik = (erT * X - 4 * mu * erT * W + 6 * erT * mu ** 2 * V - 3 * mu ** 4) / mfiv ** 2
 
     motivo = None
-    cap_mfik = rk.mfik_cap(len(calls_df) + len(puts_df), base=bkm_mfik_max, hard=bkm_mfik_max_hard)
+    n_otm = len(calls_df) + len(puts_df)
+    dte_chain = float(T) * rk.DAYS_PER_YEAR
+    cap_mfik = rk.mfik_cap_tenor(
+        n_otm, dte_chain, ref_dte=float(target_dte_polygon),
+        base=bkm_mfik_max, hard=bkm_mfik_max_hard)
     if not rk.higher_moments_admissible(mfis, mfik, cap_mfik):
-        mfis, mfik = np.nan, np.nan
         motivo = (f"momentos_inadmisibles (MFIS={mfis:.2f}, MFIK={mfik:.2f}, "
-                  f"tope={cap_mfik:.1f} con {len(calls_df) + len(puts_df)} strikes OTM; "
-                  f"MFIV se conserva)")
+                  f"tope={cap_mfik:.1f} a {dte_chain:.0f}d vs ref {target_dte_polygon}d "
+                  f"con {n_otm} strikes OTM; MFIV se conserva)")
+        mfis, mfik = np.nan, np.nan
 
     return dict(mfiv=mfiv, mfis=float(mfis), mfik=float(mfik), mu=mu, ok=True, motivo=motivo)
 
@@ -524,7 +530,8 @@ def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_
     fecha_max = (hoy + timedelta(days=target_dte + dte_tol)).strftime("%Y-%m-%d")
     return pc.fetch_otm_chain(
         polygon_format_ticker(ticker), S, fecha_min, fecha_max, S * moneyness_lo, S * moneyness_hi,
-        target_dte, api_key=api_key or POLYGON_API_KEY, strike_fmt="{:.4f}")
+        target_dte, api_key=api_key or POLYGON_API_KEY, strike_fmt="{:.4f}",
+        min_dte=polygon_dte_min)
 
 def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
     vacio = dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False,
@@ -558,13 +565,15 @@ def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
     return mom
 
 
-def bkm_clave_historia(ticker, fecha, target_dte, dte_tol, moneyness_lo, moneyness_hi):
-    """Cache v2: banda de moneyness de la cadena en vivo, spot sin ajustar, DTE real."""
-    return (f"mfis_hist_v2|{ticker}|{pd.Timestamp(fecha):%Y-%m-%d}|dte={target_dte}|tol={dte_tol}"
-            f"|m={float(moneyness_lo):.2f}-{float(moneyness_hi):.2f}|spot=unadj")
+def bkm_clave_historia(ticker, fecha, target_dte, dte_tol, moneyness_lo, moneyness_hi,
+                       min_dte=21):
+    """Cache v3: vencimiento >= min_dte y >= objetivo, spot sin ajustar, DTE real."""
+    return (f"mfis_hist_v3|{ticker}|{pd.Timestamp(fecha):%Y-%m-%d}|dte={target_dte}|tol={dte_tol}"
+            f"|min={int(min_dte)}|m={float(moneyness_lo):.2f}-{float(moneyness_hi):.2f}|spot=unadj")
 
 
-def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi):
+def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi,
+                   min_dte=21):
     """Strikes y precios OTM reales en una fecha historica (A-5).
 
     Misma seleccion que la cadena en vivo (qm.select_historical_otm): un
@@ -587,7 +596,7 @@ def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness
     if df_ct.empty:
         return vacio, definitivo
     elegido = qm.select_historical_otm(
-        df_ct, S_i, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi)
+        df_ct, S_i, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi, min_dte=min_dte)
     datos = {"S": S_i, "dte": elegido["dte"], "calls": [], "puts": []}
     if elegido["dte"] is None:
         return datos, definitivo
@@ -616,13 +625,15 @@ def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, 
         if min_validos is not None and validos + (len(sample_dates) - i) < min_validos:
             break
         fecha_i = pd.Timestamp(fecha_i)
-        clave = bkm_clave_historia(ticker, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi)
+        clave = bkm_clave_historia(
+            ticker, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi, polygon_dte_min)
         datos = pc.cache_get(clave)
         if datos is None:
             if spot_series is None:
                 continue
             datos, definitivo = bkm_datos_fecha(
-                ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi)
+                ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi,
+                min_dte=polygon_dte_min)
             if datos is None:
                 continue
             if definitivo:
@@ -634,10 +645,12 @@ def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, 
         calls_df = pd.DataFrame(datos["calls"], columns=["strike", "price"])
         puts_df = pd.DataFrame(datos["puts"], columns=["strike", "price"])
         mom = bkm_compute_moments(datos["S"], rf, rk.to_years(dte=float(dte_i)), calls_df, puts_df)
-        if mom["ok"]:
-            mfis_hist[i] = mom["mfis"]
-            if np.isfinite(mom["mfis"]):
-                validos += 1
+        if mom["ok"] and np.isfinite(mom["mfis"]):
+            # La cache guarda la cadena cruda. El z-score compara MFIS ya
+            # llevado al DTE objetivo, cada observacion desde su propio DTE.
+            mfis_hist[i] = rk.scale_bkm_moments(
+                mom["mfiv"], mom["mfis"], mom["mfik"], float(dte_i), float(target_dte))["mfis"]
+            validos += 1
     return np.array(mfis_hist)
 
 
@@ -1614,17 +1627,23 @@ def evaluar_bkm_activo(ticker):
     if sd_hist <= 0 or np.isnan(sd_hist):
         return _fila("mantener", "sd_hist_invalida")
 
-    z = (mom_actual["mfis"] - media_hist) / sd_hist
+    dte_now = mom_actual.get("dte", np.nan)
+    mfis_now = rk.scale_bkm_moments(
+        mom_actual["mfiv"], mom_actual["mfis"],
+        mom_actual["mfik"] if np.isfinite(mom_actual.get("mfik", np.nan)) else 3.0,
+        float(dte_now), float(target_dte_polygon))["mfis"]
+    z = (mfis_now - media_hist) / sd_hist
     decision, motivo = qm.mfis_tail_decision(z, bkm_z_threshold, bkm_tail_mode)
     return _fila(decision, motivo, z)
 
 
 def bkm_fechas_pendientes(ticker):
-    """Fechas de muestreo cuyos datos aun no estan en la cache de disco (clave v2)."""
+    """Fechas de muestreo cuyos datos aun no estan en la cache de disco (clave v3)."""
     return sum(
         1 for f in sample_dates_bkm
         if pc.cache_get(bkm_clave_historia(
-            ticker, f, target_dte_polygon, polygon_dte_tol, bkm_moneyness_lo, bkm_moneyness_hi)) is None
+            ticker, f, target_dte_polygon, polygon_dte_tol, bkm_moneyness_lo, bkm_moneyness_hi,
+            polygon_dte_min)) is None
     )
 
 
@@ -1640,7 +1659,7 @@ minutos_estimados = pc.estimate_minutes(llamadas_estimadas)
 omitir_historia_bkm = minutos_estimados is not None and minutos_estimados > bkm_hist_max_minutes
 print(f"   Cola MFIS: {bkm_tail_mode} | umbral |z|={bkm_z_threshold:.2f} "
       f"(upper=demanda de calls, lower=demanda de puts)")
-print(f"   Fechas pendientes (no cacheadas, clave v2): {n_fechas_pendientes} de "
+print(f"   Fechas pendientes (no cacheadas, clave v3): {n_fechas_pendientes} de "
       f"{len(sample_dates_bkm) * len(ticker_candidates)} | llamadas estimadas: ~{llamadas_estimadas}"
       f" (~{bkm_hist_contracts_estimate} contratos/fecha)"
       + (f" | tiempo minimo: ~{minutos_estimados:.0f} min a {pc.CALLS_PER_MIN:g}/min"
@@ -2664,7 +2683,8 @@ portfolio_hist = _mdd_base[
 ]
 
 _fmt_mdd = "%Y-%m-%d" if _mdd_fuente == "diaria" else "%Y-%m"
-print(f"  Datos historicos ({_mdd_fuente}): {len(portfolio_hist)} observaciones | "
+print(f"  Datos historicos ({_mdd_fuente}): {portfolio_hist['date'].nunique()} dias "
+      f"({len(portfolio_hist)} filas ticker-dia) | "
       f"{portfolio_hist['date'].min().strftime(_fmt_mdd)} a "
       f"{portfolio_hist['date'].max().strftime(_fmt_mdd)}")
 
@@ -2715,37 +2735,23 @@ median_mdd = np.nan
 if len(yearly_mdd_valid) >= 1:
     print("\n=== ESTADISTICAS DE MDD ===")
 
-    if len(yearly_mdd_valid) >= 3:
-        q1 = yearly_mdd_valid["mdd"].quantile(0.25)
-        q3 = yearly_mdd_valid["mdd"].quantile(0.75)
-        iqr = q3 - q1
-
-        yearly_mdd_clean = yearly_mdd_valid[
-            (yearly_mdd_valid["mdd"] >= (q1 - 1.5 * iqr)) & (yearly_mdd_valid["mdd"] <= (q3 + 1.5 * iqr))
-        ]
-        if len(yearly_mdd_clean) < 2:
-            yearly_mdd_clean = yearly_mdd_valid
-
-        median_mdd = yearly_mdd_clean["mdd"].median()
-        p90_mdd = yearly_mdd_clean["mdd"].quantile(0.90)
-        mean_mdd = yearly_mdd_clean["mdd"].mean()
-        min_mdd = yearly_mdd_clean["mdd"].min()
-        max_mdd = yearly_mdd_clean["mdd"].max()
-
-        print(f"  Peor escenario historico:    {min_mdd * 100:.2f}%")
-        print(f"  Escenario Conservador (P90): {p90_mdd * 100:.2f}%")
-        print(f"  Escenario Tipico (Mediana):  {median_mdd * 100:.2f}%")
-        print(f"  Promedio:                    {mean_mdd * 100:.2f}%")
-        print(f"  Mejor escenario historico:   {max_mdd * 100:.2f}%")
+    resumen_mdd = qm.summarize_yearly_mdd(yearly_mdd_valid["mdd"])
+    peor_mdd = resumen_mdd["peor"]
+    mejor_mdd = resumen_mdd["mejor"]
+    p10_mdd = resumen_mdd["conservador"]
+    median_mdd = resumen_mdd["mediana"]
+    mean_mdd = resumen_mdd["promedio"]
+    if resumen_mdd["n"] >= 3:
+        print(f"  Peor escenario historico (sin filtrar): {peor_mdd * 100:.2f}%")
+        print(f"  Escenario conservador (P10, sin filtrar): {p10_mdd * 100:.2f}%")
+        print(f"  Escenario tipico (mediana, IQR):  {median_mdd * 100:.2f}%")
+        print(f"  Promedio (IQR, {resumen_mdd['n_iqr']} de {resumen_mdd['n']} anos): "
+              f"{mean_mdd * 100:.2f}%")
+        print(f"  Mejor escenario historico (sin filtrar): {mejor_mdd * 100:.2f}%")
     else:
-        mean_mdd = yearly_mdd_valid["mdd"].mean()
-        min_mdd = yearly_mdd_valid["mdd"].min()
-        max_mdd = yearly_mdd_valid["mdd"].max()
-        median_mdd = mean_mdd
-        p90_mdd = max_mdd
-        print(f"  Peor escenario:   {max_mdd * 100:.2f}%")
+        print(f"  Peor escenario:   {peor_mdd * 100:.2f}%")
         print(f"  Promedio:         {mean_mdd * 100:.2f}%")
-        print(f"  Mejor escenario:  {min_mdd * 100:.2f}%")
+        print(f"  Mejor escenario:  {mejor_mdd * 100:.2f}%")
 
     last_year_data = yearly_mdd_valid.sort_values("year", ascending=False)
     if len(last_year_data) > 0:
@@ -2765,8 +2771,8 @@ if len(yearly_mdd_valid) >= 1:
         fig.add_hline(y=median_mdd * 100, line_dash="dash", line_color="blue",
                       annotation_text=f"Mediana: {median_mdd * 100:.2f}%", annotation_position="top left",
                       annotation_font_color="blue")
-        fig.add_hline(y=p90_mdd * 100, line_dash="dash", line_color="orange",
-                      annotation_text=f"P90: {p90_mdd * 100:.2f}%", annotation_position="bottom left",
+        fig.add_hline(y=p10_mdd * 100, line_dash="dash", line_color="orange",
+                      annotation_text=f"P10: {p10_mdd * 100:.2f}%", annotation_position="bottom left",
                       annotation_font_color="orange")
     fig.update_layout(
         title=dict(text="Maximum Drawdown Historico del Portafolio<br>"

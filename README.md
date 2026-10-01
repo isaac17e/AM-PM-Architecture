@@ -177,7 +177,7 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 **Black-Litterman** on a fixed ticker list (19 names).
 
 - Equilibrium returns `π = δ Σ w` from reverse CAPM. Market-cap weights are the reference. δ defaults to the historical estimate; see the methodology table.
-- Implied volatility from Polygon with an **SSVI** fit. The ATM vol is annual (`sqrt(total variance / T)`). Σ and the MFIV fallback are the horizon quantities (`bl_metrics`); an annual variance is not written into the Q→P regression when BKM fails.
+- Implied volatility from Polygon with an **SSVI** fit on `|k| <= 0.5` (`SSVI_K_ABS_MAX`), weighted by relative vega and open interest. The ATM vol is annual (`sqrt(total variance / T)`) and is **kept when the smile is rejected**; only an accepted smile feeds BKM wings. Σ and the MFIV fallback are the horizon quantities (`bl_metrics`). The Q→P vol ratio is applied only when the vol source is implied (`ssvi` or `atm`). A historical vol is left as the horizon variance.
 - **BKM** on the SSVI surface builds `Q` and `Ω`. Integration uses `risk_estimators.trapezoid`.
 - Q→P is a cross-sectional Mincer-Zarnowitz regression (n is the universe, about 19: low power; left as designed) plus an Esscher transform. `COTA_RATIO_VOL_P = (0.70, 1.00)` matches minimum variance and quadratic utility, so physical vol is not allowed above implied vol.
 - Correlation for `Σ_P` comes from daily returns with EWMA and Ledoit-Wolf.
@@ -190,14 +190,14 @@ Manager views are edited in **Block 6** of the file.
 Risk-free fallback `Rf` in this file stays at `0.046`. Minimum variance and quadratic utility use `0.047`.
 
 #### Seasonal versions
-`minimum_variance_(seasonal_version).py` and `quadratic_utility_(seasonal_version).py` mirror the pipelines above, but restrict part of the analysis to **specific months** (`execution_months` / `rebalance_months`, default `[9]`).
+`minimum_variance_(seasonal_version).py` and `quadratic_utility_(seasonal_version).py` mirror the pipelines above, but restrict part of the analysis to **specific months** (`execution_months` / `rebalance_months`, default `[9]`). `None` builds that list from the run date (`execution_n_months` / `rebalance_n_months` consecutive months). An explicit list that does not include the current month prints a warning and is left unchanged.
 
 What is seasonal:
 - The sample used for the seasonal volatility ratio, and the minimum observation count (`seasonal_min_weeks`).
 - In minimum variance, the drift `mu_T` inside the Cornish-Fisher filter, and the historical vol used as the Q→P reference for that filter, are computed on months in `execution_months`.
 
 What is not seasonal:
-- **BKM moments are the live chain** (about 30 DTE, the expiration nearest the target), not a September surface. The per-asset CVaR/VaR filter is seasonal only in that drift and in the historical vol reference.
+- **BKM moments are the live chain** (about 30 DTE; an expiry at or beyond the target, and at least `dte_min_iv` / `polygon_dte_min` days, is preferred over a nearer short-dated expiry), not a September surface. VaR scales those moments to the target tenor. The per-asset CVaR/VaR filter is seasonal only in that drift and in the historical vol reference.
 - Moments from the seasonal window replace BKM **only** when `tail_risk_hist_fallback=True` (default `False`).
 - The **covariance matrix uses the full sample**. Restricting Σ to one month of the year would leave a handful of observations per year.
 
@@ -219,7 +219,7 @@ Tests cover the shared modules and the extracted optimizer logic (FX and calenda
 
 - **BKM (Bakshi, Kapadia, and Madan, 2003)**: risk-neutral variance, skewness, and kurtosis (MFIV, MFIS, MFIK) from OTM option prices. MFIV is the variance integrated over the life of the contracts, not an annual variance. Annualize with the chain's real DTE, then scale to the portfolio horizon.
 - **Cornish-Fisher**: adjusts a normal quantile for skewness and kurtosis. The S and K in the expansion are parameters, not the moments of the resulting distribution. The scripts solve for the parameters that reproduce the observed moments (Maillard, 2012). Pairs that violate K ≥ 1 + S² or exceed the MFIK cap are rejected rather than clipped: MFIV is kept, and MFIS/MFIK become NaN (or the neutral 0/3 in Black-Litterman). The cap starts at `bkm_mfik_max` (20) on a thin chain and rises linearly to `bkm_mfik_max_hard` (80) as the number of OTM strikes goes from 8 to 60. A dense index chain (SPY) can sit above 20 and still be kept. Black-Litterman counts observed SSVI strikes, not the integration grid.
-- **DTE window**: `dte_tol_iv` (minimum variance) and `polygon_dte_tol` (quadratic utility) default to **21** days, so a monthly expiry at 15 or 50 DTE is inside a 30-day target. The chain still uses the real DTE of the chosen expiry. Quadratic utility prints that DTE per ticker.
+- **DTE window**: `dte_tol_iv` (minimum variance) and `polygon_dte_tol` (quadratic utility) default to **21** days, so a monthly expiry at 15 or 50 DTE is inside a 30-day target. The chosen expiry prefers DTE ≥ `dte_min_iv` / `polygon_dte_min` (21) and DTE ≥ the target, so 50 beats 15. The printed MFIS/MFIK stay on the chain's real DTE. Cornish-Fisher VaR and the MFIS z-score scale skewness and excess kurtosis to the target tenor. The MFIK cap's excess over 3 scales with `ref_dte / chain_dte`. US listings, including class shares such as `BRK-B` / `BRK.B`, are detected by `polygon_client.is_us_ticker`; exchange suffixes (`.L`, `.TO`, `.AS`, `.SW`, `.HK`, and the rest of the known list) are not sent to the options API.
 - **Polygon entitlements**: this plan includes options and reference only. A stock snapshot or stock aggregate returns 403, is not retried, and is printed once. Spot and prices come from Yahoo. Option aggregates stay on `O:` contract tickers. Non-US names in quadratic utility are labeled `sin_opciones_us` and are not sent to Polygon.
 - **Risk-neutral vs. physical measure (Q vs. P)**: implied variance and implied correlation embed risk premia. The scripts estimate a bounded ratio of realized to implied moments. The upper bound is 1, so physical vol does not exceed implied vol.
 - **EWMA + Ledoit-Wolf**: historical covariance from daily returns, weighted toward the recent regime, then shrunk toward a constant-correlation target.
