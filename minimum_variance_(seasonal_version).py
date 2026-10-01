@@ -131,6 +131,9 @@ tail_risk_min_survivors = 5
 # ------------------------------------------------------------------------------
 max_weight_per_asset = 0.12
 min_weight_per_asset = 0.001
+# En cada iteracion de la poda se sacan de una vez los activos por debajo de
+# este peso, si el resto sigue siendo factible. 0.0 lo desactiva.
+prune_below_weight = 0.01
 
 # ------------------------------------------------------------------------------
 # ESTRATEGIA DE PONDERACION
@@ -1944,11 +1947,26 @@ while True:
 
     print(f"  Iteracion {iteration}: {n_active} activos activos | Vol semanal (tail-adj): {vol_iter * 100:.4f}%")
 
+    bajo_umbral = [t for t in current_tickers if w_iter[t] < prune_below_weight]
+    if bajo_umbral:
+        remaining = [t for t in current_tickers if t not in bajo_umbral]
+        if (len(remaining) >= 3
+                and len(remaining) * max_weight_per_asset >= min_total_weight - 1e-9
+                and constraints_feasible(remaining)):
+            current_tickers = remaining
+            print(f"    -> Recortando {len(bajo_umbral)} activos con peso < "
+                  f"{prune_below_weight * 100:.1f}%: {', '.join(bajo_umbral)}")
+            continue
+        print(f"    (no se recortan en bloque los {len(bajo_umbral)} activos con peso < "
+              f"{prune_below_weight * 100:.1f}% - dejaria el portafolio infactible)")
+
     if n_active <= max_assets_in_portfolio:
         break
 
     mtr = compute_marginal_cvar_contrib(current_tickers, w_vec, cm_iter)
-    orden_poda = pq.prune_order(w_iter, mtr, tail_prune_rule)
+    # Solo se ordenan los activos por encima del piso de 0.1%: los que ya estan
+    # en el piso no reducen n_active y no aparecen en `active`.
+    orden_poda = pq.prune_order(active, mtr, tail_prune_rule)
 
     drop_ticker = None
     for candidate in orden_poda:
@@ -1967,7 +1985,7 @@ while True:
 
     current_tickers = [t for t in current_tickers if t != drop_ticker]
     print(f"    -> Eliminando '{drop_ticker}' ({tail_prune_rule}, "
-          f"MTR={mtr[drop_ticker]:.6f}, peso {active[drop_ticker] * 100:.3f}%)")
+          f"MTR={mtr[drop_ticker]:.6f}, peso {w_iter[drop_ticker] * 100:.3f}%)")
 
     if len(current_tickers) < 3:
         print("  ADVERTENCIA Quedan menos de 3 activos - deteniendo iteracion")
