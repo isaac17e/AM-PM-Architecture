@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 from scipy import integrate, stats
 from scipy.stats import norm
@@ -361,3 +362,72 @@ def test_implied_variance_to_horizon_arrays_and_nan():
                                          dte=np.array([30, 30, 0]), horizon_years=1 / 12)
     assert np.isfinite(out["annual_vol"][0])
     assert np.isnan(out["annual_vol"][1]) and np.isnan(out["horizon_vol"][2])
+
+
+def test_scale_moments_weekly_skew_to_optimizer_horizon():
+    """A-4: asimetria y exceso de curtosis semanales al horizonte de 13 semanas."""
+    semanas = 13
+    out = rk.scale_moments(rk.to_years(weeks=1), rk.to_years(weeks=semanas),
+                           skew=-0.8, exkurt=3.0)
+    assert out["h"] == pytest.approx(semanas)
+    assert out["skew"] == pytest.approx(-0.8 / np.sqrt(semanas))
+    assert out["exkurt"] == pytest.approx(3.0 / semanas)
+    assert abs(out["skew"]) < 0.8 and out["exkurt"] < 3.0
+
+
+# ------------------------------------------------------------------------------
+# 7. Drawdown y log-retorno del portafolio (B-1, B-2)
+# ------------------------------------------------------------------------------
+
+def test_max_drawdown_log_returns_known_path():
+    # Riqueza 1 -> e^0.5 -> e^{-0.5}. Pico e^0.5, dd = e^{-1} - 1.
+    assert rk.max_drawdown([0.5, -1.0], log_returns=True) == pytest.approx(np.exp(-1.0) - 1.0)
+
+
+def test_max_drawdown_simple_returns_known_path():
+    # 1 -> 1.5 -> 0.75. dd = (0.75 - 1.5) / 1.5 = -0.5.
+    assert rk.max_drawdown([0.5, -0.5], log_returns=False) == pytest.approx(-0.5)
+
+
+def test_max_drawdown_log_and_simple_differ():
+    r = [0.20, -0.30, 0.10]
+    assert rk.max_drawdown(r, log_returns=True) != pytest.approx(
+        rk.max_drawdown(r, log_returns=False))
+
+
+def test_max_drawdown_monotone_is_zero_and_short_series_is_nan():
+    assert rk.max_drawdown([0.01, 0.02, 0.01]) == pytest.approx(0.0)
+    assert np.isnan(rk.max_drawdown([0.01]))
+    assert np.isnan(rk.max_drawdown([np.nan, np.nan]))
+
+
+def test_portfolio_log_returns_matches_asset_when_assets_are_equal():
+    X = np.array([[0.10, 0.10], [-0.20, -0.20]])
+    out = rk.portfolio_log_returns(X, np.array([0.4, 0.6]))
+    assert out == pytest.approx(X[:, 0])
+
+
+def test_portfolio_log_returns_is_not_the_weighted_sum_of_logs():
+    X = np.array([[0.50, -0.40]])
+    w = np.array([0.5, 0.5])
+    exacto = rk.portfolio_log_returns(X, w)
+    assert exacto[0] != pytest.approx((X @ w)[0])
+    assert exacto[0] == pytest.approx(np.log1p((np.expm1(X) @ w)[0]))
+
+
+def test_portfolio_log_returns_cash_earns_zero():
+    X = np.array([[0.10, 0.10]])
+    pleno = rk.portfolio_log_returns(X, np.array([0.5, 0.5]))
+    mitad = rk.portfolio_log_returns(X, np.array([0.25, 0.25]))
+    assert pleno[0] == pytest.approx(0.10)
+    assert mitad[0] == pytest.approx(np.log1p(0.5 * np.expm1(0.10)))
+
+
+def test_portfolio_log_returns_dataframe_reindexes_weights():
+    df = pd.DataFrame({"A": [0.10, -0.05], "B": [0.0, 0.20]})
+    w = pd.Series({"B": 0.30, "A": 0.70})
+    out = rk.portfolio_log_returns(df, w)
+    assert isinstance(out, pd.Series)
+    assert list(out.index) == [0, 1]
+    manual = np.log1p(np.expm1(df.values) @ np.array([0.70, 0.30]))
+    assert out.to_numpy() == pytest.approx(manual)

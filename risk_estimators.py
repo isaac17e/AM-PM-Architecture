@@ -60,6 +60,8 @@ __all__ = [
     "scale_moments",
     "annualize",
     "implied_variance_to_horizon",
+    "max_drawdown",
+    "portfolio_log_returns",
 ]
 
 
@@ -862,3 +864,45 @@ def implied_variance_to_horizon(total_var_q, dte, horizon_years, days_per_year=D
     return {"annual_var": _s(annual_var), "annual_vol": _s(np.sqrt(annual_var)),
             "horizon_var": _s(horizon_var), "horizon_vol": _s(np.sqrt(horizon_var)),
             "years_chain": _s(years_chain), "h": _s(h)}
+
+
+# ==============================================================================
+# 7. RETORNOS DE PORTAFOLIO Y DRAWDOWN CON LOG-RETORNOS
+# ==============================================================================
+# Los optimizadores trabajan con log-retornos pero aplicaban (1+r).cumprod()
+# para el drawdown (B-1) y w'r para el retorno del portafolio (B-2). Ambas
+# son identidades de retornos SIMPLES: con logs la riqueza es exp(cumsum) y
+# el retorno del portafolio es log(1 + sum_i w_i (e^{r_i} - 1)).
+# ==============================================================================
+
+def max_drawdown(returns, log_returns=True):
+    """Maximo drawdown (negativo) de una serie de retornos.
+
+    log_returns=True : riqueza = exp(cumsum(r)).
+    log_returns=False: riqueza = cumprod(1 + r).
+    NaN si hay menos de 2 observaciones validas.
+    """
+    r = pd.Series(returns).dropna()
+    if len(r) < 2:
+        return np.nan
+    wealth = np.exp(r.cumsum()) if log_returns else (1.0 + r).cumprod()
+    peak = wealth.cummax()
+    return float(((wealth - peak) / peak).min())
+
+
+def portfolio_log_returns(asset_log_returns, weights):
+    """Log-retorno exacto del portafolio a partir de log-retornos por activo.
+
+    r_p = log(1 + sum_i w_i (exp(r_i) - 1)). El capital no invertido
+    (1 - sum w) se asume en efectivo con retorno cero. La aproximacion
+    w'r (suma ponderada de logs) solo coincide a primer orden.
+    """
+    if isinstance(asset_log_returns, pd.DataFrame):
+        if isinstance(weights, pd.Series):
+            weights = weights.reindex(asset_log_returns.columns)
+        w = np.asarray(weights, dtype=float)
+        simple = np.expm1(asset_log_returns.values) @ w
+        return pd.Series(np.log1p(simple), index=asset_log_returns.index)
+    X = np.asarray(asset_log_returns, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    return np.log1p(np.expm1(X) @ w)
