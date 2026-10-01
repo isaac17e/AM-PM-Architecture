@@ -423,6 +423,21 @@ def test_portfolio_log_returns_cash_earns_zero():
     assert mitad[0] == pytest.approx(np.log1p(0.5 * np.expm1(0.10)))
 
 
+def test_mfik_cap_tenor_loosens_a_short_chain():
+    assert rk.mfik_cap_tenor(5, 30) == pytest.approx(20.0)
+    assert rk.mfik_cap_tenor(5, 15) == pytest.approx(3.0 + 17.0 * 2.0)
+    assert rk.mfik_cap_tenor(5, 15) > rk.mfik_cap_tenor(5, 30)
+    assert rk.mfik_cap_tenor(5, 50) < rk.mfik_cap_tenor(5, 30)
+
+
+def test_scale_bkm_moments_from_15_to_30_days():
+    out = rk.scale_bkm_moments(0.02, 2.0, 11.0, 15, 30)
+    assert out["h"] == pytest.approx(2.0)
+    assert out["mfiv"] == pytest.approx(0.04)
+    assert out["mfis"] == pytest.approx(2.0 / np.sqrt(2.0))
+    assert out["mfik"] == pytest.approx(3.0 + 8.0 / 2.0)
+
+
 def test_mfik_cap_rises_with_chain_depth():
     assert rk.mfik_cap(5) == pytest.approx(20.0)
     assert rk.mfik_cap(8) == pytest.approx(20.0)

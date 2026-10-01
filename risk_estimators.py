@@ -58,6 +58,9 @@ __all__ = [
     "MONTHS_PER_YEAR",
     "to_years",
     "scale_moments",
+    "scale_bkm_moments",
+    "mfik_cap",
+    "mfik_cap_tenor",
     "annualize",
     "implied_variance_to_horizon",
     "max_drawdown",
@@ -558,6 +561,22 @@ def mfik_cap(n_otm, base=20.0, hard=80.0, strikes_at_base=8, strikes_at_hard=60)
     return base + (n - lo) / (hi - lo) * (hard - base)
 
 
+def mfik_cap_tenor(n_otm, dte, ref_dte=30.0, **cap_kwargs):
+    """Tope de MFIK (curtosis total) al plazo de la cadena.
+
+    El exceso sobre 3 escala como ref_dte/dte: una cadena corta tiene
+    curtosis mecanicamente alta y no se rechaza contra el tope de 30 dias.
+    Equivale a llevar el exceso al plazo de referencia y compararlo con
+    `mfik_cap` sin escalar.
+    """
+    cap = mfik_cap(n_otm, **cap_kwargs)
+    dte = float(dte)
+    ref = float(ref_dte)
+    if not (np.isfinite(dte) and dte > 0 and np.isfinite(ref) and ref > 0):
+        return cap
+    return 3.0 + (cap - 3.0) * (ref / dte)
+
+
 def cornish_fisher_z(z_alpha, s, k):
     """Transformacion de Cornish-Fisher con parametros (s, k); vectorizada en z."""
     z = np.asarray(z_alpha, dtype=float)
@@ -850,6 +869,21 @@ def scale_moments(from_years, to_years, mu=None, var=None, sd=None, skew=None, e
 def annualize(from_years, **moments):
     """Atajo: scale_moments(from_years, 1.0, **moments)."""
     return scale_moments(from_years, 1.0, **moments)
+
+
+def scale_bkm_moments(mfiv, mfis, mfik, from_dte, to_dte):
+    """Lleva MFIV, MFIS y MFIK del DTE de la cadena al DTE objetivo (iid).
+
+    MFIV es varianza integrada. MFIS es asimetria. MFIK es curtosis TOTAL:
+    se escala el exceso (MFIK - 3) y se vuelve a sumar 3. No escala MFIK/h.
+    """
+    exkurt = np.asarray(mfik, dtype=float) - 3.0
+    esc = scale_moments(
+        to_years(dte=from_dte), to_years(dte=to_dte),
+        var=mfiv, skew=mfis, exkurt=exkurt,
+    )
+    mfik_out = esc["exkurt"] + 3.0
+    return {"mfiv": esc["var"], "mfis": esc["skew"], "mfik": mfik_out, "h": esc["h"]}
 
 
 def implied_variance_to_horizon(total_var_q, dte, horizon_years, days_per_year=DAYS_PER_YEAR):

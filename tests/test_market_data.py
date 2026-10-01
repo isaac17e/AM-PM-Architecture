@@ -203,3 +203,18 @@ def test_drop_partial_last_week_empty_and_dataframe():
     df = semanal.to_frame("A")
     out_df, descartada = md.drop_partial_last_week(df, ultimo)
     assert descartada is True and isinstance(out_df, pd.DataFrame) and len(out_df) == len(df) - 1
+
+
+def test_resolve_execution_months_none_follows_the_run_date():
+    meses, aviso = md.resolve_execution_months(None, as_of="2026-10-01", n_months=1)
+    assert meses == [10] and aviso is None
+    meses, aviso = md.resolve_execution_months(None, as_of="2026-11-15", n_months=3)
+    assert meses == [11, 12, 1] and aviso is None
+
+
+def test_resolve_execution_months_keeps_an_explicit_list_and_warns():
+    meses, aviso = md.resolve_execution_months([9], as_of="2026-10-01")
+    assert meses == [9]
+    assert aviso and "10" in aviso and "9" in aviso
+    meses, aviso = md.resolve_execution_months([10, 11], as_of="2026-10-01")
+    assert meses == [10, 11] and aviso is None

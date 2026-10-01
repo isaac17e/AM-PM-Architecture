@@ -142,6 +142,67 @@ def test_fit_ssvi_is_deterministic_and_ignores_row_order():
     assert a["k_min"] == pytest.approx(-0.4) and a["k_max"] == pytest.approx(0.4)
 
 
+def test_fit_ssvi_drops_deep_wings_that_dominate_the_error():
+    theta = np.array([0.04])
+    rho, eta, gamma = -0.40, 0.70, 0.40
+    k_core = np.linspace(-0.45, 0.45, 16)
+    w_core = bm.ssvi_total_variance(k_core, 0.04, rho, eta, gamma)
+    k_wing = np.array([-5.0, -4.0, -3.0, 3.5, 4.5])
+    w_wing = np.full(len(k_wing), 2.0)
+    k = np.concatenate([k_core, k_wing])
+    w = np.concatenate([w_core, w_wing])
+    th = np.full(len(k), 0.04)
+    sl = np.zeros(len(k))
+    completo = bm.fit_ssvi(k, w, th, theta, sl, k_abs_max=None)
+    ventana = bm.fit_ssvi(k, w, th, theta, sl, k_abs_max=0.5)
+    assert not completo["aceptado"]
+    assert ventana["aceptado"]
+    assert ventana["n_strikes"] == len(k_core)
+    assert ventana["k_min"] == pytest.approx(-0.45)
+    assert ventana["k_max"] == pytest.approx(0.45)
+    assert ventana["rmse_rel"] < completo["rmse_rel"]
+    assert ventana["rho"] == pytest.approx(rho, abs=0.08)
+
+
+def test_ssvi_weights_downweight_the_wing_and_keep_missing_oi():
+    k = np.array([0.0, -5.0])
+    w = np.array([0.04, 0.04])
+    pesos = bm.ssvi_weights(k, w, open_interest=[100.0, np.nan])
+    assert pesos[0] > pesos[1] * 10
+    assert pesos[1] > 0
+
+
+def test_ssvi_row_mask_drops_dead_quotes_and_known_zero_oi():
+    mask = bm.ssvi_row_mask(precio=[1.0, 0.0, np.nan], open_interest=[10, np.nan, 0])
+    assert list(mask) == [True, False, False]
+
+
+def test_ssvi_surface_keeps_atm_when_the_smile_is_rejected():
+    rechazado = bm.ssvi_surface_decision({"aceptado": False}, 0.28)
+    assert rechazado["fuente"] == "atm" and not rechazado["usar_alas"]
+    assert rechazado["sigma_atm_annual"] == pytest.approx(0.28)
+    ok = bm.ssvi_surface_decision({"aceptado": True}, 0.22)
+    assert ok["fuente"] == "ssvi" and ok["usar_alas"]
+    historica = bm.ssvi_surface_decision({"aceptado": False}, np.nan)
+    assert historica["fuente"] == "historica" and not np.isfinite(historica["sigma_atm_annual"])
+
+
+def test_apply_vol_q_to_p_does_not_haircut_historical_vol():
+    var_p = np.array([0.03, 0.3513 ** 2])
+    mfiv = np.array([0.08, 0.4128 ** 2])
+    out, n_clip = bm.apply_vol_q_to_p(var_p, mfiv, [True, False])
+    assert out[1] == pytest.approx(mfiv[1])
+    assert out[0] == pytest.approx(0.70 ** 2 * mfiv[0])
+    assert n_clip == 1
+
+
+def test_clip_negligible_weights_drops_solver_dust():
+    out = bm.clip_negligible_weights(np.array([0.5, 0.5, 1e-6, 0.0]))
+    assert out[2] == 0.0
+    assert out.sum() == pytest.approx(1.0)
+    assert out[0] == pytest.approx(0.5)
+
+
 def test_fit_ssvi_rejects_a_surface_the_residual_cannot_explain():
     k = np.linspace(-0.5, 0.5, 30)
     w = np.full_like(k, 0.04)

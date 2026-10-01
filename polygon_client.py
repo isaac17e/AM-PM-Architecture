@@ -57,6 +57,9 @@ __all__ = [
     "DEFAULT_CALLS_PER_MIN",
     "set_rate_limit",
     "polygon_format_ticker",
+    "is_us_ticker",
+    "expiry_rank_columns",
+    "EXPIRY_SORT_COLS",
     "get_json",
     "get_all",
     "es_transitorio",
@@ -305,6 +308,47 @@ def polygon_format_ticker(ticker):
     return str(ticker).strip().replace("-", ".")
 
 
+# Sufijos de bolsa de Yahoo. Una letra que no este aqui es clase de accion
+# de EE. UU. (BRK.B). .L y .T si son bolsas. Un sufijo de varias letras que
+# no este en la lista tambien se trata como no estadounidense.
+_NON_US_EXCHANGE_SUFFIXES = {
+    "TO", "V", "CN", "NE",
+    "L", "IL", "IR",
+    "DE", "F", "BE", "DU", "HM", "HA", "MU",
+    "PA", "AS", "BR", "MC", "MI", "MA", "VI", "AT", "SW", "ST", "OL", "CO", "HE", "LS", "WA",
+    "T", "HK", "SS", "SZ", "TW", "TWO",
+    "KS", "KQ",
+    "AX", "NZ",
+    "SA", "MX",
+    "SI", "NS", "BO", "JK", "KL", "BK", "TA", "IS", "PR", "SR", "CR", "BA", "SN", "JO", "QA",
+}
+
+
+def is_us_ticker(ticker):
+    """True si el ticker cotiza en EE. UU. para consultar opciones en Polygon.
+
+    BRK-B y BRK.B son clases de accion estadounidenses. NG.L, SU.TO, ASML.AS,
+    y cualquier sufijo de bolsa conocido (o de varias letras desconocido) no.
+    """
+    if ticker is None:
+        return False
+    texto = str(ticker).strip().upper()
+    if not texto:
+        return False
+    if "-" in texto and "." not in texto:
+        base, suf = texto.rsplit("-", 1)
+        if base and len(suf) == 1 and suf.isalpha():
+            return True
+    if "." not in texto:
+        return True
+    _base, suf = texto.rsplit(".", 1)
+    if suf in _NON_US_EXCHANGE_SUFFIXES:
+        return False
+    if len(suf) == 1 and suf.isalpha():
+        return True
+    return False
+
+
 # ==============================================================================
 # 4. PETICIONES
 # ==============================================================================
@@ -403,15 +447,39 @@ def es_transitorio(status):
 # ==============================================================================
 # La integracion BKM supone un unico horizonte T. Mezclar vencimientos y
 # quedarse con el primer contrato de cada strike (drop_duplicates) combinaba
-# precios de plazos distintos. Aqui se toma el vencimiento mas cercano al DTE
-# objetivo que tenga calls OTM y puts OTM, y solo sus contratos.
+# precios de plazos distintos. Se prefiere un vencimiento con DTE >= min_dte
+# y >= objetivo (el mensual de ~50 dias, no el de 15 mas cercano a 30). Si
+# ninguno llega al minimo, se usa el mas cercano para no dejar el nombre fuera.
 # ==============================================================================
 
 _COLS_CADENA = ["strike", "iv", "type"]
+EXPIRY_SORT_COLS = ["_bajo_min", "_bajo_obj", "_dist", "_n"]
+
+
+def expiry_rank_columns(dte, target_dte, n_contracts, min_dte=21):
+    """Columnas para ordenar vencimientos de menor a mayor preferencia.
+
+    Orden: DTE >= min_dte, luego DTE >= objetivo, luego distancia al
+    objetivo, luego mas contratos. `min_dte=None` no exige un piso.
+    """
+    dte = np.asarray(dte, dtype=float)
+    n = np.asarray(n_contracts, dtype=float)
+    target = float(target_dte)
+    if min_dte is None:
+        bajo_min = np.zeros(np.size(dte), dtype=int)
+    else:
+        bajo_min = (dte < float(min_dte)).astype(int)
+    return {
+        "_bajo_min": bajo_min,
+        "_bajo_obj": (dte < target).astype(int),
+        "_dist": np.abs(dte - target),
+        "_n": -n,
+    }
 
 
 def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
-                    target_dte, api_key=None, strike_fmt="{:.2f}", max_pages=40):
+                    target_dte, api_key=None, strike_fmt="{:.2f}", max_pages=40,
+                    min_dte=21):
     """Cadena OTM (calls K >= S, puts K < S) de un unico vencimiento.
 
     Devuelve (calls_df, puts_df, info). info trae completo (False si la
@@ -463,9 +531,9 @@ def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
     if por_venc.empty:
         return vacio, vacio.copy(), info
     por_venc["dte"] = (pd.to_datetime(por_venc["expiracion"]) - hoy).dt.days
-    por_venc["_dist"] = (por_venc["dte"] - target_dte).abs()
-    por_venc["_n"] = -(por_venc["n_call"] + por_venc["n_put"])
-    elegido = por_venc.sort_values(["_dist", "_n"]).iloc[0]
+    por_venc = por_venc.assign(**expiry_rank_columns(
+        por_venc["dte"], target_dte, por_venc["n_call"] + por_venc["n_put"], min_dte))
+    elegido = por_venc.sort_values(EXPIRY_SORT_COLS).iloc[0]
 
     df = df[df["expiracion"] == elegido["expiracion"]]
     calls = df[df["type"] == "call"][_COLS_CADENA].drop_duplicates("strike").reset_index(drop=True)

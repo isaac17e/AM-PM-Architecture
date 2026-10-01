@@ -30,6 +30,11 @@ __all__ = [
     "log_portfolio_return",
     "ssvi_total_variance",
     "fit_ssvi",
+    "ssvi_weights",
+    "ssvi_row_mask",
+    "ssvi_surface_decision",
+    "apply_vol_q_to_p",
+    "clip_negligible_weights",
     "integration_strike_bounds",
     "mfiv_vs_atm",
 ]
@@ -167,8 +172,18 @@ def ssvi_total_variance(k, theta, rho, eta, gamma):
     )
 
 
+def _ssvi_vacio(n_strikes, k_min, k_max):
+    return {
+        "rho": np.nan, "eta": np.nan, "gamma": np.nan,
+        "rmse": np.nan, "rmse_rel": float("inf"), "gj_max": np.nan,
+        "aceptado": False, "success": False, "metodo": "ssvi_rechazado",
+        "n_strikes": int(n_strikes), "k_min": k_min, "k_max": k_max,
+    }
+
+
 def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
-             gtol=1e-5, maxiter=2000, rmse_rel_max=0.20):
+             gtol=1e-5, maxiter=2000, rmse_rel_max=0.20,
+             weights=None, k_abs_max=0.5):
     """Calibra (rho, eta, gamma) y acepta el ajuste por residuo, no por opt.success.
 
     L-BFGS-B con tolerancia laxa: BFGS a gtol=1e-10 marcaba 'precision loss' en
@@ -179,6 +194,11 @@ def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
     Las filas se ordenan por (vencimiento, k) antes de sumar el error, para que
     el mismo insumo de siempre el mismo parametro aunque la cadena llegue
     desordenada.
+
+    `k_abs_max` deja fuera las alas profundas (un put de $5 con k ~ -5). El
+    RMSE es ponderado: sqrt(sum(peso * e^2) / sum(peso)). `n_strikes`, `k_min`
+    y `k_max` son los de la ventana filtrada, que es la que usa BKM.
+    `k_abs_max=None` ajusta todo el rango.
     """
     k = np.asarray(k, dtype=float).ravel()
     w = np.asarray(w, dtype=float).ravel()
@@ -187,8 +207,11 @@ def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
     if slice_index is None:
         slice_index = np.zeros(len(k))
     slice_index = np.asarray(slice_index).ravel()
-    if not (len(k) == len(w) == len(theta_por_fila) == len(slice_index)):
-        raise ValueError("k, w, theta_por_fila y slice_index deben medir lo mismo")
+    if weights is None:
+        weights = np.ones(len(k))
+    weights = np.asarray(weights, dtype=float).ravel()
+    if not (len(k) == len(w) == len(theta_por_fila) == len(slice_index) == len(weights)):
+        raise ValueError("k, w, theta_por_fila, slice_index y weights deben medir lo mismo")
     if len(k) == 0 or len(theta_fijo) == 0:
         raise ValueError("SSVI sin observaciones")
 
@@ -196,6 +219,24 @@ def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
     k = np.ascontiguousarray(k[order])
     w = np.ascontiguousarray(w[order])
     theta_por_fila = np.ascontiguousarray(theta_por_fila[order])
+    weights = np.ascontiguousarray(weights[order])
+    if k_abs_max is not None:
+        dentro = np.abs(k) <= float(k_abs_max) + 1e-12
+        k = k[dentro]
+        w = w[dentro]
+        theta_por_fila = theta_por_fila[dentro]
+        weights = weights[dentro]
+    if len(k) == 0:
+        return _ssvi_vacio(0, np.nan, np.nan)
+    k_min = float(np.min(k))
+    k_max = float(np.max(k))
+    if len(k) < 4:
+        return _ssvi_vacio(len(k), k_min, k_max)
+
+    pesos = np.where(np.isfinite(weights) & (weights > 0), weights, 0.0)
+    if float(pesos.sum()) <= 0:
+        pesos = np.ones(len(k))
+    suma_pesos = float(pesos.sum())
 
     def _sigmoid(x):
         return 1.0 / (1.0 + math.exp(-float(x)))
@@ -209,7 +250,7 @@ def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
         eta = math.exp(u[1])
         gamma = _sigmoid(u[2]) * 0.9 + 0.05
         modelo = ssvi_total_variance(k, theta_por_fila, rho, eta, gamma)
-        error = float(np.sum((modelo - w) ** 2))
+        error = float(np.sum(pesos * (modelo - w) ** 2))
         phi = eta * np.power(theta_fijo, -gamma)
         gj = theta_fijo * phi * (1.0 + abs(rho))
         return error + float(np.sum(np.maximum(0.0, gj - 4.0) ** 2)) * 1e3
@@ -220,8 +261,8 @@ def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
     eta = float(math.exp(opt.x[1]))
     gamma = float(_sigmoid(opt.x[2]) * 0.9 + 0.05)
     modelo = ssvi_total_variance(k, theta_por_fila, rho, eta, gamma)
-    rmse = float(np.sqrt(np.mean((modelo - w) ** 2)))
-    escala = float(np.mean(np.abs(w)))
+    rmse = float(np.sqrt(np.sum(pesos * (modelo - w) ** 2) / suma_pesos))
+    escala = float(np.sum(pesos * np.abs(w)) / suma_pesos)
     rel = rmse / escala if escala > 0 else float("inf")
     phi = eta * np.power(theta_fijo, -gamma)
     gj_max = float(np.max(theta_fijo * phi * (1.0 + abs(rho))))
@@ -232,8 +273,105 @@ def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
         "aceptado": aceptado, "success": bool(opt.success),
         "metodo": "ssvi_conjunto" if aceptado else "ssvi_rechazado",
         "n_strikes": int(len(k)),
-        "k_min": float(np.min(k)), "k_max": float(np.max(k)),
+        "k_min": k_min, "k_max": k_max,
     }
+
+
+def ssvi_weights(k, total_var, open_interest=None):
+    """Peso de cada strike: vega relativa de Black-Scholes por sqrt(OI).
+
+    La vega relativa es phi(d1). Un strike con OI conocido y positivo se
+    multiplica por sqrt(OI); OI ausente no se tira, entra con liquidez 1.
+    """
+    k = np.asarray(k, dtype=float).ravel()
+    total = np.maximum(np.asarray(total_var, dtype=float).ravel(), 1e-12)
+    d1 = -k / np.sqrt(total) + 0.5 * np.sqrt(total)
+    vega = np.maximum(np.exp(-0.5 * d1 ** 2), 1e-6)
+    if open_interest is None:
+        return vega
+    oi = np.asarray(open_interest, dtype=float).ravel()
+    if len(oi) != len(vega):
+        raise ValueError("open_interest debe medir lo mismo que k")
+    liq = np.ones(len(vega))
+    conocido = np.isfinite(oi) & (oi > 0)
+    liq[conocido] = np.sqrt(oi[conocido])
+    return vega * liq
+
+
+def ssvi_row_mask(precio=None, open_interest=None, n=None):
+    """True en las filas que entran al ajuste.
+
+    Se tira un precio no positivo cuando el quote existe. OI conocido y <= 0
+    tambien se tira; OI ausente se conserva.
+    """
+    if n is None:
+        if precio is not None:
+            n = len(np.asarray(precio).ravel())
+        elif open_interest is not None:
+            n = len(np.asarray(open_interest).ravel())
+        else:
+            raise ValueError("ssvi_row_mask necesita precio, open_interest o n")
+    mask = np.ones(int(n), dtype=bool)
+    if precio is not None:
+        px = np.asarray(precio, dtype=float).ravel()
+        if len(px) != len(mask):
+            raise ValueError("precio debe medir n")
+        mask &= ~(np.isfinite(px) & (px <= 0))
+    if open_interest is not None:
+        oi = np.asarray(open_interest, dtype=float).ravel()
+        if len(oi) != len(mask):
+            raise ValueError("open_interest debe medir n")
+        mask &= ~(np.isfinite(oi) & (oi <= 0))
+    return mask
+
+
+def ssvi_surface_decision(ajuste, sigma_atm_annual):
+    """La vol ATM de theta se conserva aunque la sonrisa se rechace.
+
+    `fuente` es ssvi (alas usables), atm (theta sin alas) o historica.
+    """
+    atm = float(sigma_atm_annual) if sigma_atm_annual is not None else np.nan
+    atm_ok = bool(np.isfinite(atm) and atm > 0)
+    aceptado = bool(ajuste is not None and ajuste.get("aceptado"))
+    if aceptado and atm_ok:
+        return {"usar_alas": True, "sigma_atm_annual": atm, "fuente": "ssvi"}
+    if atm_ok:
+        return {"usar_alas": False, "sigma_atm_annual": atm, "fuente": "atm"}
+    return {"usar_alas": False, "sigma_atm_annual": np.nan, "fuente": "historica"}
+
+
+def apply_vol_q_to_p(var_p, mfiv, is_implied, bounds=(0.70, 1.00)):
+    """Aplica el ratio sigma_P/sigma_Q solo donde la vol es implicita.
+
+    Una vol historica no trae prima de varianza: recortarla con el ratio de
+    Mincer-Zarnowitz la baja dos veces. Esos nombres se quedan con `mfiv`
+    (la varianza al horizonte ya colocada ahi). El conteo de cotas solo
+    incluye nombres implicitos.
+    """
+    var_p = np.asarray(var_p, dtype=float).copy()
+    mfiv = np.asarray(mfiv, dtype=float)
+    implied = np.asarray(is_implied, dtype=bool)
+    if not (var_p.shape == mfiv.shape == implied.shape):
+        raise ValueError("var_p, mfiv e is_implied deben medir lo mismo")
+    lo, hi = float(bounds[0]), float(bounds[1])
+    ratio = np.sqrt(np.maximum(var_p, 1e-12) / np.maximum(mfiv, 1e-12))
+    fuera = implied & np.isfinite(ratio) & ((ratio < lo) | (ratio > hi))
+    ratio = np.clip(ratio, lo, hi)
+    ajustada = ratio ** 2 * mfiv
+    out = np.where(implied, ajustada, mfiv)
+    historica_inutil = (~implied) & ~(np.isfinite(mfiv) & (mfiv > 0))
+    out = np.where(historica_inutil, var_p, out)
+    return out, int(np.sum(fuera))
+
+
+def clip_negligible_weights(w, tol=1e-6):
+    """Pone en cero el residuo numerico de SLSQP/quadprog y renormaliza."""
+    w = np.clip(np.asarray(w, dtype=float).copy(), 0.0, None)
+    w[w <= float(tol)] = 0.0
+    total = float(w.sum())
+    if total <= 0:
+        return w
+    return w / total
 
 
 def integration_strike_bounds(forward, sigma_atm, horizon_years, n_std=3.0,

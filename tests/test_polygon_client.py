@@ -279,7 +279,7 @@ def _snapshot_grabado():
     return {"call": calls, "put": puts}
 
 
-def test_fetch_otm_chain_picks_nearest_expiry_with_both_sides(monkeypatch):
+def test_fetch_otm_chain_prefers_expiry_at_or_beyond_target(monkeypatch):
     grabado = _snapshot_grabado()
     urls = []
 
@@ -293,13 +293,55 @@ def test_fetch_otm_chain_picks_nearest_expiry_with_both_sides(monkeypatch):
     calls, puts, info = pc.fetch_otm_chain("BRK.B", S, "2026-01-01", "2026-12-31",
                                            70.0, 140.0, target_dte=30)
     assert info["completo"] and info["status"] == 200
-    assert info["dte"] == 25                        # el de 31 dias no tiene puts OTM
-    assert info["expiracion"] == (date.today() + timedelta(days=25)).strftime("%Y-%m-%d")
-    assert list(calls["strike"]) == [100, 105, 110]  # K >= S, iv valida, sin 95
-    assert sorted(puts["strike"]) == [80, 85, 90, 95]  # K < S, sin 100, sin duplicado
+    # 25 esta mas cerca de 30, pero 60 cumple DTE >= objetivo. 31 no tiene puts.
+    assert info["dte"] == 60
+    assert info["expiracion"] == (date.today() + timedelta(days=60)).strftime("%Y-%m-%d")
+    assert list(calls["strike"]) == [100, 110]
+    assert sorted(puts["strike"]) == [90, 95]
     assert (calls["type"] == "call").all() and (puts["type"] == "put").all()
     assert len(urls) == 2 and "BRK.B" in urls[0]
     assert "strike_price.gte=70.00" in urls[0] and "strike_price.lte=140.00" in urls[0]
+
+
+def test_fetch_otm_chain_falls_back_when_nothing_reaches_min_dte(monkeypatch):
+    hoy = date.today()
+    e15 = hoy + timedelta(days=15)
+    grabado = {
+        "call": [_contrato("call", 100, e15, 0.2), _contrato("call", 110, e15, 0.2)],
+        "put": [_contrato("put", 90, e15, 0.2), _contrato("put", 80, e15, 0.2)],
+    }
+    monkeypatch.setattr(pc, "get_all", lambda url, api_key=None, max_pages=40: (
+        grabado["call" if "contract_type=call" in url else "put"], True, 200))
+    _calls, _puts, info = pc.fetch_otm_chain(
+        "AAPL", 100.0, "2020-01-01", "2030-01-01", 50.0, 150.0, target_dte=30, min_dte=21)
+    assert info["dte"] == 15
+
+
+def test_expiry_rank_prefers_50_over_15_for_a_30_day_target():
+    cols = pc.expiry_rank_columns([15, 50], target_dte=30, n_contracts=[10, 4], min_dte=21)
+    # 15 queda por debajo del minimo y del objetivo; 50 cumple los dos.
+    assert cols["_bajo_min"][0] == 1 and cols["_bajo_obj"][0] == 1
+    assert cols["_bajo_min"][1] == 0 and cols["_bajo_obj"][1] == 0
+
+
+@pytest.mark.parametrize("ticker, es_us", [
+    ("AAPL", True),
+    ("BRK-B", True),
+    ("BRK.B", True),
+    ("BF-B", True),
+    ("NG.L", False),
+    ("SU.TO", False),
+    ("ASML.AS", False),
+    ("NESN.SW", False),
+    ("0700.HK", False),
+    ("BHP.AX", False),
+    ("VALE.SA", False),
+    ("AMXL.MX", False),
+    ("005930.KS", False),
+    ("FOO.ZZ", False),
+])
+def test_is_us_ticker(ticker, es_us):
+    assert pc.is_us_ticker(ticker) is es_us
 
 
 def test_fetch_otm_chain_incomplete_download_returns_empty(monkeypatch):

@@ -19,6 +19,7 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
+import polygon_client as pc
 import risk_estimators as rk
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "align_daily_panel",
     "stitch_covariance",
     "select_historical_otm",
+    "summarize_yearly_mdd",
     "estimate_bkm_history_calls",
     "mfiv_annual_vol",
 ]
@@ -321,14 +323,14 @@ def stitch_covariance(assets, daily_cov, daily_names, monthly_cov):
 
 
 def select_historical_otm(contracts, spot, as_of, target_dte, dte_tol,
-                          moneyness_lo, moneyness_hi):
+                          moneyness_lo, moneyness_hi, min_dte=21):
     """Cadena OTM historica con strikes y DTE reales (A-5).
 
     Misma regla que polygon_client.fetch_otm_chain, sobre el dataframe de
     contratos de referencia (no sobre una rejilla de moneyness sintetica):
 
-      * un solo vencimiento, el de DTE mas cercano a target_dte dentro de
-        +/- dte_tol (empate: el que tiene mas contratos);
+      * un solo vencimiento dentro de +/- dte_tol, prefiriendo DTE >= min_dte
+        y DTE >= target_dte (el mensual largo, no el de 15 dias mas cercano);
       * calls con K >= spot y puts con K < spot;
       * moneyness K/S dentro de [moneyness_lo, moneyness_hi], los mismos
         limites que la cadena en vivo.
@@ -370,9 +372,10 @@ def select_historical_otm(contracts, spot, as_of, target_dte, dte_tol,
     por_venc = por_venc[(por_venc["n_call"] > 0) & (por_venc["n_put"] > 0)]
     if por_venc.empty:
         return vacio
-    por_venc["_dist"] = (por_venc["dte"] - int(target_dte)).abs()
-    por_venc["_n"] = -(por_venc["n_call"] + por_venc["n_put"])
-    elegido = por_venc.sort_values(["_dist", "_n"]).iloc[0]
+    rango = pc.expiry_rank_columns(
+        por_venc["dte"], int(target_dte), por_venc["n_call"] + por_venc["n_put"], min_dte)
+    por_venc = por_venc.assign(**rango)
+    elegido = por_venc.sort_values(pc.EXPIRY_SORT_COLS).iloc[0]
     df = df[df["expiration_date"].dt.strftime("%Y-%m-%d") == elegido["expiration_date"]]
 
     def _lado(nombre):
@@ -385,6 +388,43 @@ def select_historical_otm(contracts, spot, as_of, target_dte, dte_tol,
         "puts": _lado("put"),
         "dte": int(elegido["dte"]),
         "expiracion": str(elegido["expiration_date"]),
+    }
+
+
+def summarize_yearly_mdd(yearly_mdd):
+    """Resumen de MDD anuales. Los valores son negativos (peor = mas chico).
+
+    El peor y el mejor ano salen de la serie completa. El escenario
+    conservador es el percentil 10 de esa serie (la cola mala), no el 90,
+    que en un MDD negativo es el ano mas suave. El filtro IQR solo entra
+    en la mediana y el promedio.
+    """
+    s = pd.Series(yearly_mdd, dtype=float).dropna()
+    s = s[np.isfinite(s.to_numpy(dtype=float))]
+    if len(s) == 0:
+        return None
+    peor = float(s.min())
+    mejor = float(s.max())
+    if len(s) >= 3:
+        conservador = float(s.quantile(0.10))
+        q1 = float(s.quantile(0.25))
+        q3 = float(s.quantile(0.75))
+        iqr = q3 - q1
+        filtrado = s[(s >= q1 - 1.5 * iqr) & (s <= q3 + 1.5 * iqr)]
+        clean = filtrado if len(filtrado) >= 2 else s
+        mediana = float(clean.median())
+    else:
+        conservador = peor
+        clean = s
+        mediana = float(s.mean())
+    return {
+        "peor": peor,
+        "mejor": mejor,
+        "conservador": conservador,
+        "mediana": mediana,
+        "promedio": float(clean.mean()),
+        "n": int(len(s)),
+        "n_iqr": int(len(clean)),
     }
 
 

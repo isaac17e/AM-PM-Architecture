@@ -257,6 +257,35 @@ def test_select_historical_otm_real_strikes_and_dte():
     assert all(k < 100 for k in strikes_put)
 
 
+def test_select_historical_otm_prefers_50_dte_over_15():
+    filas = []
+    for exp, dte_label in (("2024-06-18", "corto"), ("2024-07-23", "largo")):
+        filas.append((f"C-{dte_label}", "call", 110.0, exp))
+        filas.append((f"P-{dte_label}", "put", 90.0, exp))
+    contratos = pd.DataFrame(filas, columns=["ticker", "contract_type", "strike_price", "expiration_date"])
+    elegido = qm.select_historical_otm(
+        contratos, spot=100.0, as_of="2024-06-03", target_dte=30, dte_tol=21,
+        moneyness_lo=0.70, moneyness_hi=1.40, min_dte=21,
+    )
+    assert elegido["expiracion"] == "2024-07-23"
+    assert elegido["dte"] == 50
+
+
+def test_summarize_yearly_mdd_reports_the_unfiltered_worst_year():
+    serie = pd.Series([-0.10, -0.12, -0.08, -0.11, -0.09, -0.4423, -0.15, -0.07])
+    out = qm.summarize_yearly_mdd(serie)
+    assert out["peor"] == pytest.approx(-0.4423)
+    assert out["mejor"] == pytest.approx(serie.max())
+    assert out["conservador"] == pytest.approx(float(serie.quantile(0.10)))
+    assert out["conservador"] < float(serie.quantile(0.90))
+    assert out["n_iqr"] < out["n"]
+    assert out["mediana"] > out["peor"]
+    corto = qm.summarize_yearly_mdd(pd.Series([-0.40, -0.05]))
+    assert corto["peor"] == pytest.approx(-0.40)
+    assert corto["mejor"] == pytest.approx(-0.05)
+    assert corto["conservador"] == pytest.approx(-0.40)
+
+
 def test_select_historical_otm_empty_without_both_sides():
     solo_calls = _contratos()
     solo_calls = solo_calls[solo_calls["contract_type"] == "call"]

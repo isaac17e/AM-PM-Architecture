@@ -25,6 +25,7 @@ __all__ = [
     "resolve_currencies",
     "align_prices_to_calendar",
     "drop_partial_last_week",
+    "resolve_execution_months",
 ]
 
 # Codigos que yfinance usa para unidades menores (peniques, centimos de rand).
@@ -162,3 +163,29 @@ def drop_partial_last_week(weekly, last_daily_date, trading_days_per_week=5):
     if last_daily < friday:
         return weekly.iloc[:-1], True
     return weekly, False
+
+
+def resolve_execution_months(months, as_of=None, n_months=1):
+    """Meses de la corrida estacional.
+
+    `months=None` arma `n_months` meses consecutivos desde el mes de `as_of`
+    (octubre -> [10], o [10, 11] si n_months=2). Una lista explicita se
+    devuelve igual. Si esa lista no contiene el mes en curso, el segundo
+    valor es un aviso: el default no se reescribe solo.
+    """
+    as_of = pd.Timestamp.today() if as_of is None else pd.Timestamp(as_of)
+    n_months = int(n_months)
+    if n_months < 1:
+        raise ValueError("n_months debe ser >= 1")
+    if months is None:
+        start = int(as_of.month)
+        return [((start - 1 + i) % 12) + 1 for i in range(n_months)], None
+    out = [int(m) for m in months]
+    aviso = None
+    if int(as_of.month) not in out:
+        aviso = (
+            f"los meses configurados {out} no incluyen el mes en curso "
+            f"({int(as_of.month)}). El horizonte no cambia solo; "
+            f"pasa None para usar el mes de la corrida."
+        )
+    return out, aviso
