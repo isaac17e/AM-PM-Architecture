@@ -27,6 +27,7 @@ def entorno_aislado(monkeypatch, tmp_path):
     monkeypatch.setattr(pc, "API_KEY", None)
     monkeypatch.setattr(pc, "CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(pc, "_aviso_api_key_emitido", False)
+    monkeypatch.setattr(pc, "_aviso_403_emitido", False)
     monkeypatch.setattr(pc.time, "sleep", lambda s: None)
 
     def _sin_red(*a, **k):
@@ -170,6 +171,26 @@ def test_get_json_retries_on_429_respecting_retry_after(monkeypatch):
     assert esperas == pytest.approx([3.0, 2.0])         # Retry-After, luego backoff 1*2^1
     assert pc.diag["http_calls"] == 3
     assert pc.diag["status_counts"] == {"200": 1}        # los transitorios reintentados no se registran
+
+
+def test_get_json_403_is_not_retried_and_names_the_plan(monkeypatch, capsys):
+    llamadas = []
+
+    def _get(url, timeout):
+        llamadas.append(url)
+        return _RespuestaFalsa(403, text="not entitled")
+    monkeypatch.setattr(requests, "get", _get)
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/AAPL"
+    data, status = pc.get_json(url, api_key="K")
+    assert data is None and status == 403 and not pc.es_transitorio(403)
+    assert len(llamadas) == 1
+    aviso = capsys.readouterr().out
+    assert "403" in aviso and "yfinance" in aviso and "opciones" in aviso
+    data, status = pc.get_json(
+        "https://api.polygon.io/v2/aggs/ticker/AAPL/range/1/day/2024-01-01/2024-02-01",
+        api_key="K")
+    assert status == 403 and len(llamadas) == 2
+    assert capsys.readouterr().out == ""
 
 
 def test_get_json_non_transient_error_is_not_retried_nor_cached(monkeypatch):

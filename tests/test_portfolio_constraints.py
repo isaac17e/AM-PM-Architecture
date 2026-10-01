@@ -134,3 +134,14 @@ def test_frontier_feasible_target_respects_etf_band_and_fx_cap():
     with pytest.raises(ValueError):
         # Retorno solo alcanzable cargando el FX por encima del tope.
         _minvar(cov, cons, mu, target=0.016)
+
+
+def test_relax_group_band_lowers_an_unreachable_etf_floor():
+    # 2 ETFs x 12% no llegan al piso del 30%. El piso baja a 24% y la banda sigue.
+    lo, hi, nota = pq.relax_group_band(2, 30, max_weight=0.12, min_share=0.30, max_share=0.55)
+    assert lo == pytest.approx(0.24)
+    assert hi == pytest.approx(0.55)
+    assert "24.00%" in nota
+    assert pq.relax_group_band(0, 10, 0.12, 0.30, 0.55)[2].startswith("sin activos")
+    mismo = pq.relax_group_band(4, 20, 0.12, 0.30, 0.55)
+    assert mismo[0] == pytest.approx(0.30) and mismo[1] == pytest.approx(0.55) and mismo[2] == ""

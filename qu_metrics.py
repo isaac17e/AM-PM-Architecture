@@ -32,6 +32,10 @@ __all__ = [
     "covariance_min_history",
     "portfolio_returns_skipna",
     "dispersion_weights",
+    "dispersion_usable",
+    "clip_implied_correlation",
+    "align_daily_panel",
+    "stitch_covariance",
     "select_historical_otm",
     "estimate_bkm_history_calls",
     "mfiv_annual_vol",
@@ -229,7 +233,91 @@ def dispersion_weights(assets, has_iv, components, caps=None):
         total = float(sum(cap_vals))
         for t, c in zip(cesta, cap_vals):
             w[t] = c / total
+    conocidos = []
+    for nombre, c in caps.items():
+        if nombre in comps and c is not None and np.isfinite(c) and c > 0:
+            conocidos.append(float(c))
+    info["n_caps_conocidas"] = len(conocidos)
+    total_conocido = float(sum(conocidos))
+    cesta_conocida = 0.0
+    for t in cesta:
+        c = caps.get(t)
+        if c is not None and np.isfinite(c) and c > 0:
+            cesta_conocida += float(c)
+    info["cap_share"] = (cesta_conocida / total_conocido) if total_conocido > 0 else 0.0
     return w, info
+
+
+def dispersion_usable(info, min_cap_share=0.40, min_known_caps=50):
+    """True si la cesta cubre bastante capitalizacion conocida de SPY.
+
+    Una cesta de 13 nombres puede sumar el 100% de SUS caps y aun asi ser una
+    fraccion pequena del indice; `cap_share` es caps de la cesta / caps
+    conocidas de los componentes. El fallback de ~20 nombres no llega a
+    `min_known_caps`, asi que no se disfraza de cobertura total.
+    """
+    if not info or info.get("mode") == "insuficiente":
+        return False
+    if int(info.get("n_caps_conocidas") or 0) < int(min_known_caps):
+        return False
+    share = info.get("cap_share")
+    return bool(share is not None and np.isfinite(share) and float(share) >= float(min_cap_share))
+
+
+def clip_implied_correlation(rho, floor=0.0, ceiling=0.999):
+    """Recorta una correlacion implicita. El piso por defecto es 0.
+
+    Una cesta corta puede dar correlacion implicita negativa. Eso no es una
+    prima utilizable: se deja en `floor` (y nunca por encima de `ceiling`).
+    """
+    if rho is None or not np.isfinite(rho):
+        return float("nan")
+    return float(min(float(ceiling), max(float(floor), float(rho))))
+
+
+def align_daily_panel(price_wide, assets, spy_col="SPY", max_ffill=2, min_coverage=0.80):
+    """Alinea precios diarios al calendario de SPY y descarta colas cortas.
+
+    El calendario es la columna `spy_col` si existe. Si no, la serie con mas
+    observaciones, y `info["calendar"]` lo dice. Las columnas bajo
+    `min_coverage` salen de `info["dropped_low_coverage"]`; el resto se
+    conserva. No exige que sobrevivan todos los activos.
+    """
+    import market_data as md
+
+    assets = [a for a in list(assets) if a in price_wide.columns]
+    wide = price_wide.sort_index()
+    if spy_col in wide.columns and int(wide[spy_col].notna().sum()) >= 2:
+        calendar = wide.index[wide[spy_col].notna()]
+        calendar_name = spy_col
+    else:
+        sub = wide.reindex(columns=assets) if assets else wide
+        ref = sub.notna().sum().idxmax() if sub.shape[1] else None
+        calendar = sub.index[sub[ref].notna()] if ref is not None else sub.index[:0]
+        calendar_name = f"mas_largo:{ref}"
+    aligned, info = md.align_prices_to_calendar(
+        wide.reindex(columns=assets), calendar, max_ffill=max_ffill, min_coverage=min_coverage)
+    info = dict(info)
+    info["calendar"] = calendar_name
+    info["kept"] = list(aligned.columns)
+    return aligned, info
+
+
+def stitch_covariance(assets, daily_cov, daily_names, monthly_cov):
+    """Covarianzas diarias entre los nombres largos; el resto, de la mensual.
+
+    Parte de `monthly_cov` (todos los activos) y pisa el bloque de
+    `daily_names` con `daily_cov`. Un nombre de historia corta no tira
+    la matriz diaria entera: solo sus pares siguen en la mensual.
+    """
+    assets = list(assets)
+    out = monthly_cov.reindex(index=assets, columns=assets).astype(float).copy()
+    daily_names = [a for a in assets if a in set(daily_names)
+                   and a in daily_cov.index and a in daily_cov.columns]
+    if len(daily_names) >= 2:
+        bloque = np.asarray(daily_cov.loc[daily_names, daily_names], dtype=float)
+        out.loc[daily_names, daily_names] = bloque
+    return out
 
 
 def select_historical_otm(contracts, spot, as_of, target_dte, dte_tol,

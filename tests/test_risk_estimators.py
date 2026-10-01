@@ -423,6 +423,20 @@ def test_portfolio_log_returns_cash_earns_zero():
     assert mitad[0] == pytest.approx(np.log1p(0.5 * np.expm1(0.10)))
 
 
+def test_mfik_cap_rises_with_chain_depth():
+    assert rk.mfik_cap(5) == pytest.approx(20.0)
+    assert rk.mfik_cap(8) == pytest.approx(20.0)
+    assert rk.mfik_cap(60) == pytest.approx(80.0)
+    assert rk.mfik_cap(90) == pytest.approx(80.0)
+    medio = rk.mfik_cap(40)
+    assert 20 < medio < 80
+    # SPY 21.5 y BRK-B 48 entran con cadena densa y no con cinco strikes.
+    assert rk.higher_moments_admissible(0.0, 21.5, rk.mfik_cap(40))
+    assert rk.higher_moments_admissible(0.0, 48.2, rk.mfik_cap(40))
+    assert not rk.higher_moments_admissible(0.0, 21.5, rk.mfik_cap(5))
+    assert not rk.higher_moments_admissible(0.0, 90.0, rk.mfik_cap(80))
+
+
 def test_portfolio_log_returns_dataframe_reindexes_weights():
     df = pd.DataFrame({"A": [0.10, -0.05], "B": [0.0, 0.20]})
     w = pd.Series({"B": 0.30, "A": 0.70})

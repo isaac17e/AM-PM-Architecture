@@ -264,6 +264,7 @@ def _con_api_key(url, api_key):
 
 
 _aviso_api_key_emitido = False
+_aviso_403_emitido = False
 
 
 def _avisar_sin_api_key():
@@ -275,6 +276,20 @@ def _avisar_sin_api_key():
         "POLYGON_API_KEY no esta definida: todas las consultas a Polygon fallaran "
         "con status 'sin_api_key' y los scripts usaran sus estimadores historicos.",
         RuntimeWarning, stacklevel=3)
+
+
+def _avisar_403(url):
+    """Un 403 de este plan no se reintenta: opciones y reference si, acciones no."""
+    global _aviso_403_emitido
+    if _aviso_403_emitido:
+        return
+    _aviso_403_emitido = True
+    ruta = _sin_api_key(url).split("?", 1)[0]
+    print(
+        "Polygon respondio 403: este plan solo incluye opciones y reference. "
+        "Los snapshots y agregados de acciones no estan habilitados; el spot y "
+        f"los precios salen de yfinance. No se reintenta. URL: {ruta}"
+    )
 
 
 def polygon_format_ticker(ticker):
@@ -344,6 +359,8 @@ def get_json(url, api_key=None, permanente=False, max_retries=5, timeout=20, bac
                 pass
             time.sleep(espera if espera and espera > 0 else backoff * 2 ** (intento - 1))
             continue
+        if status == 403:
+            _avisar_403(clave)
         _registrar(status, resp.text)
         return None, status
 

@@ -121,6 +121,55 @@ def test_log_portfolio_return_is_not_the_weighted_sum_of_logs():
     assert exacto != pytest.approx(suma_logs)
 
 
+def test_fit_ssvi_is_deterministic_and_ignores_row_order():
+    theta = np.array([0.04, 0.06])
+    rho, eta, gamma = -0.35, 0.80, 0.40
+    filas = []
+    for sl, th in enumerate(theta):
+        k = np.linspace(-0.4, 0.4, 12)
+        w = bm.ssvi_total_variance(k, th, rho, eta, gamma)
+        filas.append(pd.DataFrame({"k": k, "w": w, "slice": sl, "theta": th}))
+    datos = pd.concat(filas, ignore_index=True)
+    revuelto = datos.sample(frac=1.0, random_state=1)
+    a = bm.fit_ssvi(datos["k"], datos["w"], datos["theta"], theta, datos["slice"])
+    b = bm.fit_ssvi(revuelto["k"], revuelto["w"], revuelto["theta"], theta, revuelto["slice"])
+    assert a["aceptado"] and b["aceptado"]
+    assert a["metodo"] == "ssvi_conjunto"
+    assert a["rho"] == pytest.approx(b["rho"], abs=1e-6)
+    assert a["eta"] == pytest.approx(b["eta"], abs=1e-6)
+    assert a["gamma"] == pytest.approx(b["gamma"], abs=1e-6)
+    assert a["rho"] == pytest.approx(rho, abs=0.05)
+    assert a["k_min"] == pytest.approx(-0.4) and a["k_max"] == pytest.approx(0.4)
+
+
+def test_fit_ssvi_rejects_a_surface_the_residual_cannot_explain():
+    k = np.linspace(-0.5, 0.5, 30)
+    w = np.full_like(k, 0.04)
+    w[::2] = 0.20
+    ajuste = bm.fit_ssvi(k, w, np.full(len(k), 0.04), np.array([0.04]), np.zeros(len(k)))
+    assert not ajuste["aceptado"]
+    assert ajuste["metodo"] == "ssvi_rechazado"
+
+
+def test_integration_stays_inside_three_sigma_and_the_observed_wing():
+    lo6, hi6 = bm.integration_strike_bounds(100.0, 0.40, 4 / 12, n_std=6)
+    lo3, hi3 = bm.integration_strike_bounds(100.0, 0.40, 4 / 12, n_std=3)
+    assert lo3 > lo6 and hi3 < hi6
+    lo, hi = bm.integration_strike_bounds(100.0, 0.40, 4 / 12, n_std=6, k_min=-0.25, k_max=0.20)
+    assert lo == pytest.approx(100.0 * np.exp(-0.25))
+    assert hi == pytest.approx(100.0 * np.exp(0.20))
+
+
+def test_mfiv_far_above_atm_falls_back_to_atm_variance():
+    # META en la corrida real: MFIV SSVI ~0.22 contra ~0.05 de la cadena.
+    fuera = bm.mfiv_vs_atm(0.2202, 0.050)
+    assert not fuera["ok"] and fuera["motivo"] == "mfiv_fuera_de_banda"
+    assert fuera["mfiv"] == pytest.approx(0.050)
+    assert fuera["mfis"] == 0.0 and fuera["mfik"] == 3.0
+    dentro = bm.mfiv_vs_atm(0.060, 0.050)
+    assert dentro["ok"] and dentro["mfiv"] == pytest.approx(0.060)
+
+
 def test_log_portfolio_return_renormalizes_missing_names():
     r = pd.Series({"A": np.log(1.10), "B": np.nan})
     w = pd.Series({"A": 0.25, "B": 0.75})

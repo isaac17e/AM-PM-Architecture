@@ -276,6 +276,58 @@ def test_estimate_bkm_history_calls_counts_the_chain_not_the_seven_point_grid():
     assert nuevo > rejilla_vieja
 
 
+def test_dispersion_cap_share_is_the_basket_over_known_spy_caps():
+    assets = ["AAPL", "MSFT"]
+    components = {"AAPL", "MSFT", "XOM", "BRK-B"}
+    caps = {"AAPL": 100.0, "MSFT": 100.0, "XOM": 800.0}
+    _, info = qm.dispersion_weights(assets, {"AAPL", "MSFT"}, components, caps)
+    assert info["mode"] == "cap"
+    assert info["n_caps_conocidas"] == 3
+    assert info["cap_share"] == pytest.approx(200 / 1000)
+    assert not qm.dispersion_usable(info, min_cap_share=0.40, min_known_caps=50)
+    info["n_caps_conocidas"] = 80
+    info["cap_share"] = 0.55
+    assert qm.dispersion_usable(info)
+
+
+def test_clip_implied_correlation_floors_at_zero():
+    assert qm.clip_implied_correlation(-0.133) == 0.0
+    assert qm.clip_implied_correlation(-0.080) == 0.0
+    assert qm.clip_implied_correlation(0.25) == pytest.approx(0.25)
+    assert qm.clip_implied_correlation(1.4) == pytest.approx(0.999)
+    assert np.isnan(qm.clip_implied_correlation(np.nan))
+
+
+def test_stitch_keeps_daily_block_and_monthly_for_the_short_name():
+    assets = ["LARGO", "OTRO", "CORTO"]
+    diaria = pd.DataFrame(
+        [[0.20, 0.05], [0.05, 0.30]],
+        index=["LARGO", "OTRO"], columns=["LARGO", "OTRO"])
+    mensual = pd.DataFrame(
+        [[0.40, 0.01, 0.01], [0.01, 0.40, 0.01], [0.01, 0.01, 0.40]],
+        index=assets, columns=assets)
+    out = qm.stitch_covariance(assets, diaria, ["LARGO", "OTRO"], mensual)
+    assert out.loc["LARGO", "OTRO"] == pytest.approx(0.05)
+    assert out.loc["LARGO", "LARGO"] == pytest.approx(0.20)
+    assert out.loc["CORTO", "CORTO"] == pytest.approx(0.40)
+    assert out.loc["CORTO", "LARGO"] == pytest.approx(0.01)
+
+
+def test_align_daily_panel_uses_spy_and_drops_the_short_name_only():
+    idx = pd.bdate_range("2024-01-02", periods=100)
+    corta = idx[:40]
+    wide = pd.DataFrame({
+        "A": np.linspace(10, 20, len(idx)),
+        "B": np.nan,
+        "SPY": np.linspace(100, 110, len(idx)),
+    }, index=idx)
+    wide.loc[corta, "B"] = np.linspace(5, 6, len(corta))
+    aligned, info = qm.align_daily_panel(wide, ["A", "B"], spy_col="SPY", min_coverage=0.80)
+    assert info["calendar"] == "SPY"
+    assert "A" in info["kept"] and "B" in info["dropped_low_coverage"]
+    assert "SPY" not in aligned.columns
+
+
 def test_mfiv_annual_vol_uses_real_dte():
     mfiv = 0.0036
     vol = qm.mfiv_annual_vol(mfiv, dte=32)
