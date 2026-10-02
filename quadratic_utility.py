@@ -90,7 +90,7 @@ lookback_months = None
 # ------------------------------------------------------------------------------
 # AVERSION AL RIESGO Y PONDERADORES DE SELECCION
 # ------------------------------------------------------------------------------
-lambda_ = 0.5
+lambda_ = 1.5
 # Opt-in (M-8). None conserva lambda_ tal cual, en unidades mensuales.
 # Si se fija, lambda_ = lambda_annual * 12. Ver qu_metrics.lambda_monthly_from_annual:
 # no es la conversion que preserva el ranking de una utilidad anual (esa seria
@@ -104,8 +104,8 @@ weight_decorr = 0.30
 # ------------------------------------------------------------------------------
 # TAMANO DE LOS FILTROS DE CANDIDATOS
 # ------------------------------------------------------------------------------
-n_pre_filter = 65
-n_filter_candidates = 40
+n_pre_filter = 45
+n_filter_candidates = 30
 
 # ------------------------------------------------------------------------------
 # SELECCION CONJUNTA QUBO/ISING
@@ -162,7 +162,7 @@ bkm_hist_anchor = "2020-01-05"
 bkm_hist_min_valid = 8
 bkm_hist_max_minutes = 60
 bkm_max_workers = 12
-bkm_z_threshold = 1.75
+bkm_z_threshold = 2.00
 # Cola del z de MFIS (M-9). "upper" es el comportamiento de siempre: descarta
 # z > umbral (sesgo implicito positivo, demanda de calls; antes etiquetado
 # cobertura_anomala). "lower" descarta z < -umbral (demanda de puts). "both"

@@ -57,7 +57,7 @@ benchmark = "SPY"
 # ------------------------------------------------------------------------------
 n_top_sp500 = 80
 n_top_nasdaq = 80
-n_top_international = 5
+n_top_international = 15
 target_total_tickers = 200
 
 # ------------------------------------------------------------------------------
@@ -88,7 +88,7 @@ bkm_mfik_max = 20.0
 # bkm_mfik_max_hard: SPY y otros indices superan 20 sin ser inadmisibles.
 bkm_mfik_max_hard = 80.0
 tail_risk_min_hist_weeks = 26
-tail_risk_filter_confidence = 0.99
+tail_risk_filter_confidence = 0.95
 cornish_fisher_confidence = 0.95
 
 # ------------------------------------------------------------------------------
@@ -109,15 +109,15 @@ risk_free_rate_weekly = risk_free_rate / 52
 # ------------------------------------------------------------------------------
 # TAMANO DE LOS FILTROS DE CANDIDATOS
 # ------------------------------------------------------------------------------
-n_pre_seasonal = 70
-n_divers_candidates = 35
+n_pre_seasonal = 45
+n_divers_candidates = 30
 
 # ------------------------------------------------------------------------------
 # PERCENTILES DE FILTRO Y NUMERO MAXIMO DE ACTIVOS
 # ------------------------------------------------------------------------------
-volatility_percentile = 0.55
-correlation_percentile = 0.60
-max_assets_in_portfolio = 15
+volatility_percentile = 0.97
+correlation_percentile = 0.90
+max_assets_in_portfolio = 6
 # Poda hasta max_assets. min_weight saca el peso chico. max_mtr es la regla
 # anterior (mayor contribucion marginal: poda defensivos en la cota del 12%).
 # min_weight_x_mtr ordena por peso * contribucion, de menor a mayor.
@@ -129,7 +129,7 @@ share_class_groups = (("GOOGL", "GOOG"),)
 # ------------------------------------------------------------------------------
 # RESTRICCIONES DE PONDERACION
 # ------------------------------------------------------------------------------
-max_weight_per_asset = 0.12
+max_weight_per_asset = 0.35
 min_weight_per_asset = 0.001
 # En cada iteracion de la poda se sacan de una vez los activos por debajo de
 # este peso, si el resto sigue siendo factible. 0.0 lo desactiva.
@@ -146,8 +146,8 @@ max_total_weight = 1.00
 # RESTRICCION DE PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL
 # ------------------------------------------------------------------------------
 use_etf_constraint = True
-etf_min_weight = 0.30
-etf_max_weight = 0.55
+etf_min_weight = 0.00
+etf_max_weight = 0.05
 
 # ------------------------------------------------------------------------------
 # ETFs EN EL PORTAFOLIO RESULTANTE
@@ -158,7 +158,7 @@ include_etfs_in_portfolio = True
 # RESTRICCION DE EXPOSICION CAMBIARIA
 # ------------------------------------------------------------------------------
 use_fx_factor = True
-max_fx_exposure = 0.35
+max_fx_exposure = 0.50
 
 # ------------------------------------------------------------------------------
 # ANUALIZACION
@@ -183,9 +183,9 @@ moneyness_tol_iv = 0.02
 # SHRINKAGE COVARIANZA: IMPLIED vs HISTORICA
 # ------------------------------------------------------------------------------
 use_iv_shrinkage = True
-shrinkage_max = 0.85
-shrinkage_min = 0.35
-ratio_band = 0.30
+shrinkage_max = 0.40
+shrinkage_min = 0.02
+ratio_band = 0.20
 
 # ------------------------------------------------------------------------------
 # COVARIANZA HISTORICA: EWMA + SHRINKAGE LEDOIT-WOLF

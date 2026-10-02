@@ -65,7 +65,7 @@ n_top_int = 50
 # ------------------------------------------------------------------------------
 # MESES DE REBALANCEO
 # ------------------------------------------------------------------------------
-rebalance_months = [9]
+rebalance_months = [10]
 rebalance_n_months = 1
 
 # ------------------------------------------------------------------------------
@@ -91,7 +91,7 @@ lookback_months = None
 # ------------------------------------------------------------------------------
 # AVERSION AL RIESGO Y PONDERADORES DE SELECCION
 # ------------------------------------------------------------------------------
-lambda_ = 0.8
+lambda_ = 1.5
 # Opt-in (M-8). None conserva lambda_ tal cual, en unidades mensuales.
 # Si se fija, lambda_ = lambda_annual * 12. Ver qu_metrics.lambda_monthly_from_annual.
 lambda_annual = None
@@ -120,11 +120,11 @@ correlation_percentile = 0.85
 # ------------------------------------------------------------------------------
 # FILTRO ESTACIONAL
 # ------------------------------------------------------------------------------
-seasonal_min_weeks = 35
+seasonal_min_weeks = 30
 
 seasonal_vol_ratio_max = 1.80
 
-seasonal_min_survivors = 18
+seasonal_min_survivors = 14
 
 # ------------------------------------------------------------------------------
 # PARAMETROS BKM
@@ -150,12 +150,12 @@ bkm_hist_anchor = "2020-01-05"
 bkm_hist_min_valid = 8
 bkm_hist_max_minutes = 60
 bkm_max_workers = 12
-bkm_z_threshold = 1.75
+bkm_z_threshold = 2.00
 # Cola del z de MFIS (M-9). "upper" conserva el comportamiento: descarta
 # z > umbral (demanda de calls; antes etiquetado cobertura_anomala).
 # "lower" descarta z < -umbral (demanda de puts). "both" usa las dos colas.
 bkm_tail_mode = "upper"
-bkm_min_survivors = 14
+bkm_min_survivors = 12
 cornish_fisher_confidence = 0.95
 
 # ------------------------------------------------------------------------------
