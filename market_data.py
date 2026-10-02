@@ -16,7 +16,11 @@
 #      si la semana no esta completa (B-6).
 # ==============================================================================
 
+import threading
+import time
+
 import pandas as pd
+import yfinance as yf
 
 __all__ = [
     "normalize_currency",
@@ -27,7 +31,17 @@ __all__ = [
     "drop_partial_last_week",
     "resolve_execution_months",
     "dedupe_share_classes",
+    "frames_from_yf_download",
+    "yfinance_spot_batch",
+    "yfinance_spot_single",
+    "default_spot_providers",
+    "get_spot_history",
+    "spot_series_for",
 ]
+
+# Un solo hilo toca el reintento de un ticker. La descarga en bloque va
+# aparte, antes de cualquier pool.
+_SPOT_SINGLE_LOCK = threading.Lock()
 
 # Codigos que yfinance usa para unidades menores (peniques, centimos de rand).
 _MINOR_UNITS = {"GBP": "GBP", "GBX": "GBP", "ZAC": "ZAR", "ILA": "ILS"}
@@ -212,3 +226,228 @@ def dedupe_share_classes(tickers, groups=(("GOOGL", "GOOG"),)):
         notas.append((se_queda, se_van))
     kept = [t for t in tickers if t not in drop]
     return kept, notas
+
+
+# ==============================================================================
+# CIERRES SIN AJUSTAR PARA EL FILTRO HISTORICO DE MFIS
+# ==============================================================================
+# yfinance, llamado desde varios hilos, responde "possibly delisted" y el
+# ticker pasa el filtro sin historia. La descarga es una sola llamada para
+# todos los tickers; lo que falte se reintenta en serie, bajo un lock.
+# Otro proveedor (FMP, mas adelante) entra como otro elemento de `providers`:
+# {"name", "batch", "single"}. No hay un segundo proveedor cableado ahora.
+# ==============================================================================
+
+def _naive_dates(values):
+    dt = pd.to_datetime(values)
+    tz = getattr(dt.dt, "tz", None) if isinstance(dt, pd.Series) else getattr(dt, "tz", None)
+    if tz is not None:
+        dt = dt.dt.tz_localize(None) if isinstance(dt, pd.Series) else dt.tz_localize(None)
+    return dt
+
+
+def _frame_from_close(close):
+    """Serie de cierres -> DataFrame con columnas date y close, o None."""
+    if close is None:
+        return None
+    serie = pd.Series(close).dropna()
+    if serie.empty:
+        return None
+    frame = serie.rename("close").reset_index()
+    frame.columns = ["date", "close"]
+    frame["date"] = _naive_dates(frame["date"])
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["date", "close"])
+    if frame.empty:
+        return None
+    return frame.reset_index(drop=True)
+
+
+def _usable_spot(frame, min_obs):
+    if frame is None or not isinstance(frame, pd.DataFrame):
+        return False
+    if "date" not in frame.columns or "close" not in frame.columns:
+        return False
+    cierres = pd.to_numeric(frame["close"], errors="coerce")
+    return int(cierres.notna().sum()) >= int(min_obs)
+
+
+def frames_from_yf_download(raw, tickers):
+    """Parte un `yf.download` (uno o varios tickers) en {ticker: frame}.
+
+    Acepta columnas planas (Close) y MultiIndex en los dos ordenes que ha
+    usado yfinance: (campo, ticker) o (ticker, campo). Un ticker ausente o
+    con el cierre vacio queda en None.
+    """
+    tickers = list(tickers)
+    vacio = {t: None for t in tickers}
+    if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+        return vacio
+    campos = {"Open", "High", "Low", "Close", "Adj Close", "Volume",
+              "open", "high", "low", "close", "adj close", "volume"}
+
+    def _cerrar(columna):
+        nombre = str(columna)
+        return nombre == "Close" or nombre.lower() == "close"
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        nivel0 = [str(v) for v in raw.columns.get_level_values(0)]
+        if any(v in campos for v in nivel0):
+            nivel_campo, nivel_ticker = 0, 1
+        else:
+            nivel_campo, nivel_ticker = 1, 0
+        presentes = set(raw.columns.get_level_values(nivel_ticker))
+        for ticker in tickers:
+            if ticker not in presentes:
+                continue
+            try:
+                bloque = raw.xs(ticker, axis=1, level=nivel_ticker)
+            except KeyError:
+                continue
+            if isinstance(bloque, pd.Series):
+                vacio[ticker] = _frame_from_close(bloque)
+                continue
+            col = next((c for c in bloque.columns if _cerrar(c)), None)
+            if col is None:
+                continue
+            vacio[ticker] = _frame_from_close(bloque[col])
+        return vacio
+
+    if len(tickers) == 1:
+        col = next((c for c in raw.columns if _cerrar(c)), None)
+        if col is not None:
+            vacio[tickers[0]] = _frame_from_close(raw[col])
+    return vacio
+
+
+def yfinance_spot_batch(tickers, start, end):
+    """Una descarga de cierres sin ajustar. Sin hilos internos de yfinance."""
+    tickers = list(dict.fromkeys(tickers))
+    if not tickers:
+        return {}
+    raw = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        group_by="column",
+    )
+    return frames_from_yf_download(raw, tickers)
+
+
+def yfinance_spot_single(ticker, start, end):
+    """Un ticker: primero `download`, y si no hay cierre, `Ticker.history`."""
+    try:
+        raw = yf.download(
+            ticker, start=start, end=end, auto_adjust=False,
+            progress=False, threads=False,
+        )
+        frame = frames_from_yf_download(raw, [ticker]).get(ticker)
+        if frame is not None and len(frame):
+            return frame
+    except Exception:
+        frame = None
+    try:
+        hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
+        return frames_from_yf_download(hist, [ticker]).get(ticker)
+    except Exception:
+        return None
+
+
+def default_spot_providers():
+    """Proveedor por defecto. Un respaldo futuro se agrega a esta lista."""
+    return [{
+        "name": "yfinance",
+        "batch": yfinance_spot_batch,
+        "single": yfinance_spot_single,
+    }]
+
+
+def _retry_spot_single(single, ticker, start, end, retries, backoff, sleep, min_obs, stats):
+    """Hasta `retries` intentos, en serie y bajo lock. Devuelve el frame o None."""
+    espera = float(backoff)
+    for intento in range(int(retries)):
+        if intento:
+            sleep(espera)
+            espera *= 2.0
+        with _SPOT_SINGLE_LOCK:
+            stats["single_calls"] += 1
+            try:
+                frame = single(ticker, start, end)
+            except Exception:
+                frame = None
+        if _usable_spot(frame, min_obs):
+            return frame
+    return None
+
+
+def get_spot_history(tickers, start, end, providers=None, min_obs=20,
+                     retries=3, backoff=1.0, sleep=None):
+    """Cierres sin ajustar para varios tickers.
+
+    El primer proveedor descarga el bloque entero una vez. Los tickers que
+    no vuelven con al menos `min_obs` cierres se reintentan uno por uno
+    (`retries` veces, espera `backoff` que se duplica). Si siguen vacios,
+    el siguiente proveedor de la lista hace lo mismo solo con esos tickers.
+    La lista por defecto es yfinance. FMP, si se agrega, es otro dict
+    `{"name", "batch", "single"}` al final.
+
+    Devuelve series (solo las utilizables), missing, recovered, batch_calls
+    y single_calls. `recovered` son los que no trajo el primer bloque y si
+    entro un reintento o un proveedor posterior.
+    """
+    if sleep is None:
+        sleep = time.sleep
+    if providers is None:
+        providers = default_spot_providers()
+    orden = list(dict.fromkeys(tickers))
+    series = {}
+    pending = list(orden)
+    from_first_batch = set()
+    stats = {"batch_calls": 0, "single_calls": 0}
+    primer_bloque = True
+
+    for provider in providers:
+        if not pending:
+            break
+        batch = provider.get("batch") if isinstance(provider, dict) else None
+        single = provider.get("single") if isinstance(provider, dict) else None
+        if batch is not None:
+            stats["batch_calls"] += 1
+            try:
+                obtenido = batch(list(pending), start, end) or {}
+            except Exception:
+                obtenido = {}
+            for ticker in list(pending):
+                frame = obtenido.get(ticker)
+                if _usable_spot(frame, min_obs):
+                    series[ticker] = frame
+                    pending.remove(ticker)
+                    if primer_bloque:
+                        from_first_batch.add(ticker)
+        primer_bloque = False
+        if single is None or not pending:
+            continue
+        for ticker in list(pending):
+            frame = _retry_spot_single(
+                single, ticker, start, end, retries, backoff, sleep, min_obs, stats)
+            if frame is not None:
+                series[ticker] = frame
+                pending.remove(ticker)
+
+    return {
+        "series": series,
+        "missing": [t for t in orden if t not in series],
+        "recovered": [t for t in orden if t in series and t not in from_first_batch],
+        "batch_calls": stats["batch_calls"],
+        "single_calls": stats["single_calls"],
+    }
+
+
+def spot_series_for(store, ticker):
+    """Lee una serie ya precargada. No descarga nada."""
+    if not store:
+        return None
+    return store.get(ticker)

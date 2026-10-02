@@ -227,3 +227,212 @@ def test_resolve_execution_months_keeps_an_explicit_list_and_warns():
     assert aviso and "10" in aviso and "9" in aviso
     meses, aviso = md.resolve_execution_months([10, 11], as_of="2026-10-01")
     assert meses == [10, 11] and aviso is None
+
+
+def _cierres(n, nivel, tz=None):
+    idx = pd.bdate_range("2024-01-02", periods=n, tz=tz)
+    return pd.DataFrame({"date": idx, "close": np.linspace(nivel, nivel + 1, n)})
+
+
+def test_frames_from_yf_download_reads_both_multiindex_orders():
+    idx = pd.bdate_range("2024-01-02", periods=25, tz="America/New_York")
+    por_campo = pd.DataFrame(
+        np.column_stack([np.arange(25) + 10.0, np.arange(25) + 20.0]),
+        index=idx,
+        columns=pd.MultiIndex.from_product([["Close"], ["AAA", "BBB"]]),
+    )
+    frames = md.frames_from_yf_download(por_campo, ["AAA", "BBB", "CCC"])
+    assert frames["CCC"] is None
+    assert list(frames["AAA"].columns) == ["date", "close"]
+    assert frames["AAA"]["date"].dt.tz is None
+    assert frames["AAA"]["close"].iloc[0] == pytest.approx(10.0)
+    assert frames["BBB"]["close"].iloc[-1] == pytest.approx(44.0)
+    por_ticker = pd.DataFrame(
+        np.column_stack([np.arange(25) + 3.0, np.arange(25) + 1.0]),
+        index=idx,
+        columns=pd.MultiIndex.from_product([["AAA"], ["Open", "Close"]]),
+    )
+    uno = md.frames_from_yf_download(por_ticker, ["AAA"])
+    assert uno["AAA"]["close"].iloc[0] == pytest.approx(1.0)
+    plano = pd.DataFrame({"Close": np.arange(25) + 7.0}, index=idx)
+    solo = md.frames_from_yf_download(plano, ["MSFT"])
+    assert solo["MSFT"]["close"].iloc[0] == pytest.approx(7.0)
+
+
+def test_get_spot_history_downloads_the_batch_once_and_workers_only_read():
+    from concurrent.futures import ThreadPoolExecutor
+
+    llamadas = {"batch": 0, "single": 0}
+
+    def batch(tickers, start, end):
+        llamadas["batch"] += 1
+        assert list(tickers) == ["AAA", "BBB", "CCC"]
+        assert start == "2024-01-01" and end == "2024-06-01"
+        return {t: _cierres(30, 10 + i) for i, t in enumerate(tickers)}
+
+    def single(*_a, **_k):
+        llamadas["single"] += 1
+        raise AssertionError("yfinance no se llama desde un worker")
+
+    out = md.get_spot_history(
+        ["AAA", "BBB", "CCC"], "2024-01-01", "2024-06-01",
+        providers=[{"name": "yfinance", "batch": batch, "single": single}],
+    )
+    assert llamadas["batch"] == 1 and llamadas["single"] == 0
+    assert out["missing"] == [] and out["recovered"] == []
+
+    def worker(ticker):
+        serie = md.spot_series_for(out["series"], ticker)
+        return float(serie["close"].iloc[0])
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        leidos = list(pool.map(worker, ["AAA", "BBB", "CCC"]))
+    assert leidos == pytest.approx([10.0, 11.0, 12.0])
+    assert llamadas["single"] == 0
+
+
+def test_get_spot_history_retries_the_missing_ticker_then_reports_the_rest():
+    intentos = {"BBB": 0}
+    esperas = []
+
+    def batch(tickers, start, end):
+        return {"AAA": _cierres(30, 10.0), "BBB": _cierres(5, 1.0), "CCC": None}
+
+    def single(ticker, start, end):
+        intentos[ticker] = intentos.get(ticker, 0) + 1
+        if ticker == "BBB" and intentos[ticker] == 3:
+            return _cierres(30, 8.0)
+        return None
+
+    out = md.get_spot_history(
+        ["AAA", "BBB", "CCC"], "2024-01-01", "2024-06-01",
+        providers=[{"name": "yfinance", "batch": batch, "single": single}],
+        retries=3, backoff=0.5, sleep=esperas.append,
+    )
+    assert intentos["BBB"] == 3
+    assert intentos["CCC"] == 3
+    assert esperas == [0.5, 1.0, 0.5, 1.0]
+    assert "BBB" in out["series"] and out["series"]["BBB"]["close"].iloc[0] == pytest.approx(8.0)
+    assert out["recovered"] == ["BBB"]
+    assert out["missing"] == ["CCC"]
+    assert out["batch_calls"] == 1
+    assert out["single_calls"] == 6
+
+
+def test_get_spot_history_falls_through_to_the_next_provider():
+    vistos = []
+
+    def yf_batch(tickers, start, end):
+        vistos.append(("yf-batch", list(tickers)))
+        return {"AAA": _cierres(30, 1.0)}
+
+    def yf_single(ticker, start, end):
+        vistos.append(("yf-single", ticker))
+        return None
+
+    def fmp_batch(tickers, start, end):
+        vistos.append(("fmp-batch", list(tickers)))
+        return {"BBB": _cierres(30, 4.0)}
+
+    def fmp_single(ticker, start, end):
+        vistos.append(("fmp-single", ticker))
+        return None
+
+    out = md.get_spot_history(
+        ["AAA", "BBB"], "2024-01-01", "2024-06-01",
+        providers=[
+            {"name": "yfinance", "batch": yf_batch, "single": yf_single},
+            {"name": "fmp", "batch": fmp_batch, "single": fmp_single},
+        ],
+        retries=2, backoff=0.0, sleep=lambda _s: None,
+    )
+    assert out["missing"] == []
+    assert out["recovered"] == ["BBB"]
+    assert ("fmp-batch", ["BBB"]) in vistos
+    assert ("fmp-single", "AAA") not in vistos
+    assert out["batch_calls"] == 2
+
+
+def test_yfinance_batch_is_one_unadjusted_download(monkeypatch):
+    capturado = {}
+
+    def download(tickers, **kwargs):
+        capturado["tickers"] = list(tickers)
+        capturado["kwargs"] = kwargs
+        idx = pd.bdate_range("2024-01-02", periods=22)
+        cols = pd.MultiIndex.from_product([["Close"], ["AAA", "BBB"]])
+        return pd.DataFrame(
+            np.column_stack([np.arange(22) + 10.0, np.arange(22) + 30.0]),
+            index=idx, columns=cols,
+        )
+
+    monkeypatch.setattr(md.yf, "download", download)
+
+    def _sin_ticker(*_a, **_k):
+        raise AssertionError("el bloque no usa Ticker")
+
+    monkeypatch.setattr(md.yf, "Ticker", _sin_ticker)
+    frames = md.yfinance_spot_batch(["AAA", "BBB"], "2024-01-01", "2024-03-01")
+    assert capturado["tickers"] == ["AAA", "BBB"]
+    assert capturado["kwargs"]["auto_adjust"] is False
+    assert capturado["kwargs"]["threads"] is False
+    assert capturado["kwargs"]["group_by"] == "column"
+    assert len(frames["AAA"]) == 22
+    assert frames["BBB"]["close"].iloc[0] == pytest.approx(30.0)
+
+
+def test_yfinance_single_uses_history_when_download_is_empty(monkeypatch):
+    llamadas = []
+
+    def download(*_a, **_k):
+        llamadas.append("download")
+        return pd.DataFrame()
+
+    class _Ticker:
+        def __init__(self, ticker):
+            llamadas.append(ticker)
+
+        def history(self, **_k):
+            llamadas.append("history")
+            idx = pd.bdate_range("2024-01-02", periods=21)
+            return pd.DataFrame({"Close": np.arange(21) + 5.0}, index=idx)
+
+    monkeypatch.setattr(md.yf, "download", download)
+    monkeypatch.setattr(md.yf, "Ticker", _Ticker)
+    frame = md.yfinance_spot_single("CCC", "2024-01-01", "2024-03-01")
+    assert llamadas == ["download", "CCC", "history"]
+    assert frame["close"].iloc[0] == pytest.approx(5.0)
+
+
+def test_single_retries_do_not_overlap():
+    import threading
+    import time
+
+    en_vuelo = {"n": 0, "max": 0}
+    guarda = threading.Lock()
+
+    def batch(_tickers, _start, _end):
+        return {}
+
+    def single(_ticker, _start, _end):
+        with guarda:
+            en_vuelo["n"] += 1
+            en_vuelo["max"] = max(en_vuelo["max"], en_vuelo["n"])
+        time.sleep(0.05)
+        with guarda:
+            en_vuelo["n"] -= 1
+        return None
+
+    def correr():
+        md.get_spot_history(
+            ["ZZZ"], "2024-01-01", "2024-02-01",
+            providers=[{"name": "t", "batch": batch, "single": single}],
+            retries=1, sleep=lambda _s: None,
+        )
+
+    hilos = [threading.Thread(target=correr) for _ in range(4)]
+    for hilo in hilos:
+        hilo.start()
+    for hilo in hilos:
+        hilo.join()
+    assert en_vuelo["max"] == 1

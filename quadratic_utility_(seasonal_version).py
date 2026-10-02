@@ -1598,6 +1598,7 @@ reponer_pool_bkm = (
 )
 
 bkm_current_moments = {}
+bkm_spot_series = {}
 _bkm_presupuesto = {"usadas": 0.0}
 
 
@@ -1611,20 +1612,46 @@ def bkm_fechas_pendientes(ticker):
     )
 
 
+def _ventana_spot_bkm():
+    """Lookback del MFIS mas un mes de colchon. `end` es exclusivo para yfinance."""
+    start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
+    end_sk = hoy_ts.strftime("%Y-%m-%d")
+    return start_sk, end_sk
+
+
+def _precargar_spots_bkm(tickers):
+    """Una descarga para todos los tickers que aun necesitan historia.
+
+    Los hilos solo leen `bkm_spot_series`. Lo que el bloque no trae se
+    reintenta en serie dentro de get_spot_history, antes del pool.
+    """
+    faltan = []
+    for ticker in tickers:
+        if ticker in bkm_spot_series:
+            continue
+        if bkm_fechas_pendientes(ticker) <= 0:
+            continue
+        faltan.append(ticker)
+    if not faltan:
+        return
+    start_sk, end_sk = _ventana_spot_bkm()
+    print(f"   Precios spot sin ajustar de {len(faltan)} ticker(s), una descarga "
+          f"({start_sk} a {end_sk})...")
+    paquete = md.get_spot_history(faltan, start_sk, end_sk)
+    bkm_spot_series.update(paquete["series"])
+    for ticker in paquete["missing"]:
+        bkm_spot_series[ticker] = None
+    if paquete["recovered"]:
+        print(f"   Recuperados en reintento secuencial ({len(paquete['recovered'])}): "
+              f"{', '.join(paquete['recovered'])}")
+    print(f"   Sin precio historico tras reintentos: {len(paquete['missing'])}")
+    if paquete["missing"]:
+        print("   Tickers sin spot: " + ", ".join(paquete["missing"]))
+
+
 def _spot_series_bkm(ticker):
-    """Cierre sin ajustar. El strike de la opcion no esta ajustado por dividendos."""
-    try:
-        start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
-        end_sk = hoy_ts.strftime("%Y-%m-%d")
-        hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=False)
-        if hist is None or hist.empty or len(hist) < 20:
-            return None
-        spot_series_tk = hist[["Close"]].rename(columns={"Close": "close"}).reset_index()
-        spot_series_tk = spot_series_tk.rename(columns={"Date": "date"})
-        spot_series_tk["date"] = pd.to_datetime(spot_series_tk["date"]).dt.tz_localize(None)
-        return spot_series_tk
-    except Exception:
-        return None
+    """Cierre sin ajustar ya descargado. No llama a yfinance."""
+    return md.spot_series_for(bkm_spot_series, ticker)
 
 
 def _fila_bkm(ticker, mom, decision, motivo, z=np.nan):
@@ -1761,6 +1788,10 @@ while por_evaluar:
             "no_procesado", info["motivo"]))
 
     resultados = []
+    a_precargar = list(plan["procesar"])
+    if calentar:
+        a_precargar.append(calentar["ticker"])
+    _precargar_spots_bkm(a_precargar)
     if plan["procesar"]:
         with ThreadPoolExecutor(max_workers=bkm_max_workers) as executor:
             for k, r in enumerate(executor.map(evaluar_historia_bkm, plan["procesar"]), start=1):
