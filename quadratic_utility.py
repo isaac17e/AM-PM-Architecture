@@ -144,11 +144,13 @@ iv_min_survivors = 10
 bkm_moneyness_lo = 0.70
 bkm_moneyness_hi = 1.40
 # La historia de MFIS usa la cadena OTM completa de un vencimiento (A-5), no
-# una rejilla de 7 puntos. El presupuesto de tiempo cuenta ~estos contratos
-# con precio por fecha, y polygon_client lo pasa a minutos con
-# POLYGON_CALLS_PER_MIN (default 300). Si la estimacion supera
-# bkm_hist_max_minutes se omite la comparacion historica en esa corrida.
-bkm_hist_contracts_estimate = 40
+# una rejilla de 7 puntos. El presupuesto cuenta ~estos contratos con precio
+# por fecha (el agregado de cada contrato se pide una vez, en rango).
+# polygon_client pasa las llamadas a minutos con POLYGON_CALLS_PER_MIN
+# (default 1200). bkm_hist_max_minutes es un presupuesto: se procesan tickers
+# de EE. UU. con MFIS actual finito, en el orden de los candidatos, hasta
+# agotarlo. El que no entra queda marcado, no se da por evaluado.
+bkm_hist_contracts_estimate = 26
 bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
 # Cadena corta: tope 20. Cadena densa (muchos strikes OTM): hasta este techo.
@@ -159,7 +161,7 @@ bkm_hist_sample_freq = "2W"
 bkm_hist_anchor = "2020-01-05"
 bkm_hist_min_valid = 8
 bkm_hist_max_minutes = 60
-bkm_max_workers = 6
+bkm_max_workers = 12
 bkm_z_threshold = 1.75
 # Cola del z de MFIS (M-9). "upper" es el comportamiento de siempre: descarta
 # z > umbral (sesgo implicito positivo, demanda de calls; antes etiquetado
@@ -432,21 +434,11 @@ def polygon_contract_close_near(contract_ticker, target_date, window_days=5, api
     target_d = pd.Timestamp(target_date)
     from_d = (target_d - timedelta(days=window_days)).strftime("%Y-%m-%d")
     to_d = (target_d + timedelta(days=window_days)).strftime("%Y-%m-%d")
-    url_aggs = (
-        f"https://api.polygon.io/v2/aggs/ticker/{contract_ticker}/range/1/day/"
-        f"{from_d}/{to_d}?adjusted=true&sort=asc&limit=50"
-    )
-    permanente = (target_d + timedelta(days=window_days)).date() < date.today()
-    data, status = pc.get_json(url_aggs, api_key=api_key or POLYGON_API_KEY, permanente=permanente)
-    if data is None:
-        return np.nan, not pc.es_transitorio(status)
-    results = data.get("results")
-    if not results:
-        return np.nan, True
-    df = pd.json_normalize(results)
-    df["fecha"] = pd.to_datetime(df["t"], unit="ms").dt.normalize()
-    df["d_dias"] = (df["fecha"] - target_d.normalize()).abs().dt.days
-    return df.sort_values("d_dias").iloc[0]["c"], True
+    barras, definitivo = pc.fetch_option_aggs(
+        contract_ticker, from_d, to_d, api_key=api_key or POLYGON_API_KEY)
+    if not barras:
+        return np.nan, definitivo
+    return qm.close_near_from_bars(barras, target_d, window_days), definitivo
 
 
 def get_spot_safe_bkm(ticker):
@@ -580,14 +572,12 @@ def bkm_clave_historia(ticker, fecha, target_dte, dte_tol, moneyness_lo, moneyne
             f"|min={int(min_dte)}|m={float(moneyness_lo):.2f}-{float(moneyness_hi):.2f}|spot=unadj")
 
 
-def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi,
-                   min_dte=21):
-    """Strikes y precios OTM reales en una fecha historica (A-5).
+def bkm_seleccion_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi,
+                       min_dte=21):
+    """Contratos OTM de una fecha, sin precios. Devuelve (seleccion, definitivo).
 
-    Misma seleccion que la cadena en vivo (qm.select_historical_otm): un
-    vencimiento, calls K>=S y puts K<S, moneyness en [lo, hi]. El spot es el
-    cierre sin ajustar, en las mismas unidades que el strike. Devuelve
-    (datos, definitivo) con datos = {"S", "dte", "calls": [[K, precio]], "puts"}.
+    seleccion trae S, dte y las listas calls/puts de {strike, ticker}. El spot
+    es el cierre sin ajustar. Los precios se piden despues, un rango por contrato.
     """
     spot_row = spot_series[spot_series["date"] <= fecha_i].sort_values("date", ascending=False)
     if spot_row.empty:
@@ -605,17 +595,48 @@ def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness
         return vacio, definitivo
     elegido = qm.select_historical_otm(
         df_ct, S_i, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi, min_dte=min_dte)
-    datos = {"S": S_i, "dte": elegido["dte"], "calls": [], "puts": []}
-    if elegido["dte"] is None:
-        return datos, definitivo
-    if (len(elegido["calls"]) < bkm_min_options_per_side
-            or len(elegido["puts"]) < bkm_min_options_per_side):
-        return datos, definitivo
+    return {
+        "S": S_i,
+        "dte": elegido["dte"],
+        "calls": list(elegido["calls"]),
+        "puts": list(elegido["puts"]),
+    }, definitivo
 
+
+def bkm_precios_en_rango(needed, window_days=5):
+    """Un agregado por contrato para todas las fechas en `needed`.
+
+    needed es (ticker_opcion, fecha). Devuelve (precios, ok_por_contrato)
+    con precios[(contrato, YYYY-MM-DD)] = cierre ±window_days.
+    """
+    rangos = qm.contract_agg_ranges(needed, window_days=window_days)
+    barras = {}
+    ok = {}
+    for contrato, (desde, hasta) in rangos.items():
+        series, definitivo = pc.fetch_option_aggs(contrato, desde, hasta, api_key=POLYGON_API_KEY)
+        barras[contrato] = series
+        ok[contrato] = definitivo
+    precios = {}
+    for contrato, fecha in needed:
+        iso = pd.Timestamp(fecha).strftime("%Y-%m-%d")
+        precios[(contrato, iso)] = qm.close_near_from_bars(barras.get(contrato), fecha, window_days)
+    return precios, ok
+
+
+def _datos_con_precios(seleccion, fecha_i, precios, ok_contrato, definitivo):
+    """Arma {S, dte, calls:[[K, px]], puts} recortando el rango ya descargado."""
+    datos = {"S": seleccion["S"], "dte": seleccion["dte"], "calls": [], "puts": []}
+    if seleccion["dte"] is None:
+        return datos, definitivo
+    if (len(seleccion["calls"]) < bkm_min_options_per_side
+            or len(seleccion["puts"]) < bkm_min_options_per_side):
+        return datos, definitivo
+    iso = pd.Timestamp(fecha_i).strftime("%Y-%m-%d")
     for lado in ("calls", "puts"):
-        for contrato in elegido[lado]:
-            px, ok_def = polygon_contract_close_near(contrato["ticker"], fecha_i)
-            definitivo = definitivo and ok_def
+        for contrato in seleccion[lado]:
+            ticker_op = contrato["ticker"]
+            definitivo = definitivo and ok_contrato.get(ticker_op, True)
+            px = precios.get((ticker_op, iso), np.nan)
             if pd.isna(px) or px <= 0:
                 continue
             datos[lado].append([float(contrato["strike"]), float(px)])
@@ -623,30 +644,71 @@ def bkm_datos_fecha(ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness
 
 
 def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, dte_tol,
-                                 moneyness_lo, moneyness_hi, rf, min_validos=None):
-    """MFIS historico. Cada fecha usa el DTE real de su vencimiento, no target_dte/365."""
+                                 moneyness_lo, moneyness_hi, rf, min_validos=None,
+                                 max_fechas_nuevas=None):
+    """MFIS historico. Cada contrato OTM se descarga una vez para todo el tramo.
+
+    La cache (clave v3) sigue siendo por fecha y solo guarda dias anteriores
+    a hoy. max_fechas_nuevas limita cuantas fechas sin cache se bajan (para
+    dejar la cache tibia cuando el presupuesto no alcanza al ticker entero).
+    """
     if not is_us_ticker(ticker):
         return np.full(len(sample_dates), np.nan)
-    mfis_hist = [np.nan] * len(sample_dates)
-    validos = 0
+    n_fechas = len(sample_dates)
+    slots = []
+    faltan = []
     for i, fecha_i in enumerate(sample_dates):
-        if min_validos is not None and validos + (len(sample_dates) - i) < min_validos:
-            break
         fecha_i = pd.Timestamp(fecha_i)
         clave = bkm_clave_historia(
             ticker, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi, polygon_dte_min)
         datos = pc.cache_get(clave)
-        if datos is None:
-            if spot_series is None:
-                continue
-            datos, definitivo = bkm_datos_fecha(
+        if datos is not None:
+            slots.append(("cache", datos, clave, fecha_i, True))
+        else:
+            slots.append(("miss", None, clave, fecha_i, True))
+            faltan.append(i)
+
+    if max_fechas_nuevas is not None:
+        permitidas = set(faltan[:int(max_fechas_nuevas)])
+    else:
+        permitidas = set(faltan)
+
+    if spot_series is not None and permitidas:
+        necesarias = []
+        selecciones = {}
+        for i in permitidas:
+            _tipo, _datos, clave, fecha_i, _ok = slots[i]
+            seleccion, definitivo = bkm_seleccion_fecha(
                 ticker, spot_series, fecha_i, target_dte, dte_tol, moneyness_lo, moneyness_hi,
                 min_dte=polygon_dte_min)
-            if datos is None:
+            if seleccion is None:
+                slots[i] = ("vacio", None, clave, fecha_i, True)
                 continue
-            if definitivo:
-                pc.cache_set(clave, datos)
+            selecciones[i] = (seleccion, definitivo, clave, fecha_i)
+            if seleccion["dte"] is None:
+                continue
+            if (len(seleccion["calls"]) < bkm_min_options_per_side
+                    or len(seleccion["puts"]) < bkm_min_options_per_side):
+                continue
+            for lado in ("calls", "puts"):
+                for contrato in seleccion[lado]:
+                    necesarias.append((contrato["ticker"], fecha_i))
+        precios, ok_contrato = bkm_precios_en_rango(necesarias) if necesarias else ({}, {})
+        for i, (seleccion, definitivo, clave, fecha_i) in selecciones.items():
+            datos, definitivo = _datos_con_precios(
+                seleccion, fecha_i, precios, ok_contrato, definitivo)
+            slots[i] = ("nuevo", datos, clave, fecha_i, definitivo)
 
+    mfis_hist = [np.nan] * n_fechas
+    validos = 0
+    for i in range(n_fechas):
+        if min_validos is not None and validos + (n_fechas - i) < min_validos:
+            break
+        tipo, datos, clave, _, definitivo = slots[i]
+        if tipo == "miss" or datos is None:
+            continue
+        if tipo == "nuevo" and definitivo:
+            pc.cache_set(clave, datos)
         dte_i = datos.get("dte")
         if dte_i is None or not np.isfinite(dte_i) or dte_i <= 0:
             continue
@@ -1587,46 +1649,101 @@ reponer_pool_bkm = (
 )
 
 bkm_current_moments = {}
+_bkm_presupuesto = {"usadas": 0.0}
 
 
-def evaluar_bkm_activo(ticker):
-    mom_actual = bkm_get_current_moments(ticker, target_dte_polygon, polygon_dte_tol, rf_rate)
-    bkm_current_moments[ticker] = mom_actual
+def bkm_fechas_pendientes(ticker):
+    """Fechas de muestreo cuyos datos aun no estan en la cache de disco (clave v3)."""
+    return sum(
+        1 for f in sample_dates_bkm
+        if pc.cache_get(bkm_clave_historia(
+            ticker, f, target_dte_polygon, polygon_dte_tol, bkm_moneyness_lo, bkm_moneyness_hi,
+            polygon_dte_min)) is None
+    )
+
+
+def _spot_series_bkm(ticker):
+    """Cierre sin ajustar. El strike de la opcion no esta ajustado por dividendos."""
+    try:
+        start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
+        end_sk = hoy_ts.strftime("%Y-%m-%d")
+        hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=False)
+        if hist is None or hist.empty or len(hist) < 20:
+            return None
+        spot_series_tk = hist[["Close"]].rename(columns={"Close": "close"}).reset_index()
+        spot_series_tk = spot_series_tk.rename(columns={"Date": "date"})
+        spot_series_tk["date"] = pd.to_datetime(spot_series_tk["date"]).dt.tz_localize(None)
+        return spot_series_tk
+    except Exception:
+        return None
+
+
+def _fila_bkm(ticker, mom, decision, motivo, z=np.nan):
+    mom = mom or {}
+    return dict(symbol=ticker, decision=decision, motivo=motivo, z=z, dte=mom.get("dte", np.nan))
+
+
+def _momento_actual_bkm(ticker):
+    bkm_current_moments[ticker] = bkm_get_current_moments(
+        ticker, target_dte_polygon, polygon_dte_tol, rf_rate)
+
+
+def _asegurar_momentos_actuales(tickers):
+    """Cadena de hoy solo para tickers de EE. UU. que aun no se consultaron.
+
+    El snapshot no se cachea. Cuesta 2 llamadas (call y put) y se descuenta
+    del mismo presupuesto que la historia.
+    """
+    nuevos_us = [t for t in tickers if is_us_ticker(t) and t not in bkm_current_moments]
+    for t in tickers:
+        if not is_us_ticker(t) and t not in bkm_current_moments:
+            bkm_current_moments[t] = dict(
+                mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False,
+                spot=np.nan, dte=np.nan, motivo="sin_opciones_us", transitorio=False)
+    if not nuevos_us:
+        return
+    print(f"   Momento BKM actual de {len(nuevos_us)} ticker(s) de EE. UU. "
+          f"({bkm_max_workers} en paralelo)...")
+    with ThreadPoolExecutor(max_workers=bkm_max_workers) as executor:
+        list(executor.map(_momento_actual_bkm, nuevos_us))
+    _bkm_presupuesto["usadas"] += 2 * len(nuevos_us)
+
+
+def _rank_bkm(ticker):
+    mom = bkm_current_moments.get(ticker) or {}
+    us = is_us_ticker(ticker)
+    mfis_ok = us and bool(mom.get("ok")) and np.isfinite(mom.get("mfis", np.nan))
+    return {
+        "ticker": ticker,
+        "us": us,
+        "mfis_ok": mfis_ok,
+        "n_pending": bkm_fechas_pendientes(ticker) if mfis_ok else 0,
+        "motivo": None if mfis_ok else (mom.get("motivo") or "sin_mfis_actual"),
+    }
+
+
+def evaluar_historia_bkm(ticker, max_fechas_nuevas=None, solo_cache=False):
+    mom_actual = bkm_current_moments[ticker]
 
     def _fila(decision, motivo, z=np.nan):
-        return dict(symbol=ticker, decision=decision, motivo=motivo, z=z,
-                    dte=mom_actual.get("dte", np.nan))
-
-    if not mom_actual["ok"]:
-        return _fila("mantener", mom_actual.get("motivo") or "sin_mfis_actual")
-    if not np.isfinite(mom_actual["mfis"]):
-        return _fila("mantener", mom_actual.get("motivo") or "mfis_inadmisible")
-
-    if omitir_historia_bkm:
-        return _fila("mantener", "historia_omitida_por_tiempo")
+        return _fila_bkm(ticker, mom_actual, decision, motivo, z)
 
     spot_series_tk = None
     if bkm_fechas_pendientes(ticker) > 0:
-        try:
-            start_sk = (hoy_ts - relativedelta(months=bkm_lookback_months + 1)).strftime("%Y-%m-%d")
-            end_sk = hoy_ts.strftime("%Y-%m-%d")
-            # Cierre sin ajustar: el strike de la opcion no esta ajustado por dividendos (A-5).
-            hist = yf.Ticker(ticker).history(start=start_sk, end=end_sk, auto_adjust=False)
-            if hist is None or hist.empty or len(hist) < 20:
-                return _fila("mantener", "sin_precio_historico")
-            spot_series_tk = hist[["Close"]].rename(columns={"Close": "close"}).reset_index()
-            spot_series_tk = spot_series_tk.rename(columns={"Date": "date"})
-            spot_series_tk["date"] = pd.to_datetime(spot_series_tk["date"]).dt.tz_localize(None)
-        except Exception:
+        spot_series_tk = _spot_series_bkm(ticker)
+        if spot_series_tk is None and not solo_cache:
             return _fila("mantener", "sin_precio_historico")
 
     hist_mfis = bkm_reconstruct_mfis_history(
         ticker, spot_series_tk, sample_dates_bkm, target_dte_polygon, polygon_dte_tol,
         bkm_moneyness_lo, bkm_moneyness_hi, rf_rate,
-        min_validos=bkm_hist_min_valid,
+        min_validos=None if solo_cache else bkm_hist_min_valid,
+        max_fechas_nuevas=max_fechas_nuevas,
     )
-    hist_mfis_validos = hist_mfis[~np.isnan(hist_mfis)]
+    if solo_cache:
+        return _fila("no_procesado", "historia_no_procesada_presupuesto")
 
+    hist_mfis_validos = hist_mfis[~np.isnan(hist_mfis)]
     if len(hist_mfis_validos) < bkm_hist_min_valid:
         return _fila("mantener", "muestra_insuficiente")
 
@@ -1645,60 +1762,70 @@ def evaluar_bkm_activo(ticker):
     return _fila(decision, motivo, z)
 
 
-def bkm_fechas_pendientes(ticker):
-    """Fechas de muestreo cuyos datos aun no estan en la cache de disco (clave v3)."""
-    return sum(
-        1 for f in sample_dates_bkm
-        if pc.cache_get(bkm_clave_historia(
-            ticker, f, target_dte_polygon, polygon_dte_tol, bkm_moneyness_lo, bkm_moneyness_hi,
-            polygon_dte_min)) is None
+def _plan_ronda_bkm(tickers):
+    ranked = [_rank_bkm(t) for t in tickers]
+    plan = qm.plan_bkm_history_budget(
+        ranked,
+        contracts_per_date=bkm_hist_contracts_estimate,
+        calls_per_min=pc.CALLS_PER_MIN,
+        max_minutes=bkm_hist_max_minutes,
+        spent_calls=_bkm_presupuesto["usadas"],
     )
+    _bkm_presupuesto["usadas"] += plan["llamadas"]
+    return plan
 
 
-# Presupuesto (A-5): 2 llamadas de cadena actual por ticker, mas 1 lista de
-# contratos y ~bkm_hist_contracts_estimate cierres por fecha pendiente.
-# pc.estimate_minutes usa POLYGON_CALLS_PER_MIN. La rejilla de 7 puntos
-# subestimaba este costo; con la cadena completa una cache fria puede superar
-# bkm_hist_max_minutes y omitir el z-score (el momento actual se calcula igual).
-n_fechas_pendientes = sum(bkm_fechas_pendientes(t) for t in ticker_candidates)
-llamadas_estimadas = qm.estimate_bkm_history_calls(
-    len(ticker_candidates), n_fechas_pendientes, bkm_hist_contracts_estimate)
-minutos_estimados = pc.estimate_minutes(llamadas_estimadas)
-omitir_historia_bkm = minutos_estimados is not None and minutos_estimados > bkm_hist_max_minutes
 print(f"   Cola MFIS: {bkm_tail_mode} | umbral |z|={bkm_z_threshold:.2f} "
       f"(upper=demanda de calls, lower=demanda de puts)")
-print(f"   Fechas pendientes (no cacheadas, clave v3): {n_fechas_pendientes} de "
-      f"{len(sample_dates_bkm) * len(ticker_candidates)} | llamadas estimadas: ~{llamadas_estimadas}"
-      f" (~{bkm_hist_contracts_estimate} contratos/fecha)"
-      + (f" | tiempo minimo: ~{minutos_estimados:.0f} min a {pc.CALLS_PER_MIN:g}/min"
-         if minutos_estimados is not None and pc.CALLS_PER_MIN
-         else " | sin tope de llamadas, no se convierte a minutos"))
-if omitir_historia_bkm:
-    print(f"   ADVERTENCIA: la estimacion supera bkm_hist_max_minutes ({bkm_hist_max_minutes} min) - se omite")
-    print("   la comparacion historica del MFIS en esta corrida (los momentos BKM actuales si se calculan).")
-    print("   Sube POLYGON_CALLS_PER_MIN si el plan lo permite, o bkm_hist_max_minutes; la cache v2")
-    print("   hace que la corrida siguiente solo pague las fechas nuevas.")
+print(f"   Cache historica clave v3 en {pc.CACHE_DIR}")
+print(f"   Presupuesto: {bkm_hist_max_minutes:g} min"
+      + (f" a {pc.CALLS_PER_MIN:g} llamadas/min" if pc.CALLS_PER_MIN else " (sin tope de llamadas)")
+      + f" | ~{bkm_hist_contracts_estimate} contratos/fecha | {bkm_max_workers} hilos")
 
 full_set = list(ticker_candidates)
 resultados_log = []
 i_reponer = 0
 por_evaluar = list(ticker_candidates)
 ronda_bkm = 1
+t0_bkm = time.perf_counter()
 
-while True:
-    print(f"   [Ronda {ronda_bkm}] Evaluando MFIS de {len(por_evaluar)} activo(s) "
-          f"({bkm_max_workers} en paralelo)...")
+while por_evaluar:
+    print(f"   [Ronda {ronda_bkm}] {len(por_evaluar)} activo(s) en el orden de candidatos...")
+    _asegurar_momentos_actuales(por_evaluar)
+    plan = _plan_ronda_bkm(por_evaluar)
+    n_pend = sum(_rank_bkm(t)["n_pending"] for t in plan["procesar"])
+    print(f"      EE. UU. con MFIS finito: {plan['n_us_mfis']} | "
+          f"historia completa: {len(plan['procesar'])} | "
+          f"sin presupuesto: {len(plan['omitidos'])} | "
+          f"fechas pendientes de los que entran: {n_pend} | "
+          f"llamadas de historia de esta ronda: ~{plan['llamadas']}")
+
+    for info in plan["fuera_de_historia"]:
+        resultados_log.append(_fila_bkm(
+            info["ticker"], bkm_current_moments.get(info["ticker"]), "mantener", info["motivo"]))
+    calentar = plan.get("calentar") or {}
+    for info in plan["omitidos"]:
+        if info["ticker"] == calentar.get("ticker"):
+            continue
+        resultados_log.append(_fila_bkm(
+            info["ticker"], bkm_current_moments.get(info["ticker"]),
+            "no_procesado", info["motivo"]))
 
     resultados = []
-    with ThreadPoolExecutor(max_workers=bkm_max_workers) as executor:
-        for k, r in enumerate(executor.map(evaluar_bkm_activo, por_evaluar), start=1):
-            resultados.append(r)
-            if k % 10 == 0 or k == len(por_evaluar):
-                print(f"      ... {k}/{len(por_evaluar)}")
+    if plan["procesar"]:
+        with ThreadPoolExecutor(max_workers=bkm_max_workers) as executor:
+            for k, r in enumerate(executor.map(evaluar_historia_bkm, plan["procesar"]), start=1):
+                resultados.append(r)
+                if k % 10 == 0 or k == len(plan["procesar"]):
+                    print(f"      ... {k}/{len(plan['procesar'])}")
+    if calentar:
+        print(f"      Cache tibia: {calentar['n_fechas']} fecha(s) de {calentar['ticker']} "
+              f"(no alcanza para el z-score; queda como no procesado)")
+        resultados.append(evaluar_historia_bkm(
+            calentar["ticker"], max_fechas_nuevas=calentar["n_fechas"], solo_cache=True))
 
     resultados_log.extend(resultados)
     descartados = [r for r in resultados if r["decision"] == "descartar"]
-
     if not descartados:
         break
 
@@ -1719,9 +1846,14 @@ while True:
     por_evaluar = list(dict.fromkeys(reemplazos_nuevos))
     ronda_bkm += 1
 
+_elapsed_bkm = time.perf_counter() - t0_bkm
 bkm_log_df = pd.DataFrame(resultados_log)
 n_descartados_bkm = (bkm_log_df["decision"] == "descartar").sum() if len(bkm_log_df) else 0
-print(f"\n   Evaluados: {len(bkm_log_df)} | Descartados por MFIS: {n_descartados_bkm} | Repuestos: {i_reponer}")
+n_sin_presupuesto = (bkm_log_df["decision"] == "no_procesado").sum() if len(bkm_log_df) else 0
+n_con_z = int(np.isfinite(pd.to_numeric(bkm_log_df["z"], errors="coerce")).sum()) if len(bkm_log_df) else 0
+print(f"\n   Procesados con z-score: {n_con_z} | No procesados por presupuesto: {n_sin_presupuesto} | "
+      f"Descartados por MFIS: {n_descartados_bkm} | Repuestos: {i_reponer} | "
+      f"Tiempo real: {_elapsed_bkm:.1f} s | clave v3")
 if len(bkm_log_df):
     print("\n   COBERTURA BKM POR TICKER (A-1)")
     conteo = bkm_log_df["motivo"].fillna("(sin motivo)").value_counts()
@@ -2482,7 +2614,7 @@ print(top_griegas.rename(columns={"symbol": "Symbol"})[["Symbol", "Peso", "Delta
 # ==============================================================================
 # FRONTERA EFICIENTE
 # ==============================================================================
-print("\nGenerando frontera eficiente...")
+print("\nGenerando frontera eficiente restringida (barrido de lambda)...")
 
 
 def solve_qp_portfolio(lambda_val):
@@ -2498,78 +2630,50 @@ def solve_qp_portfolio(lambda_val):
         return None
 
 
-rng = np.random.default_rng(seed)
-random_weights_mat = np.zeros((n_sim, n))
-valid_count = 0
-attempt = 0
+lambdas_frontera = qm.frontier_lambda_grid(lambda_, n=60, lo=0.1, hi=200.0)
+frontier_df = qm.frontier_curve(
+    solve_qp_portfolio, cov_mat, mu_final, lambdas_frontera, lambda_utility=lambda_)
 
-while valid_count < n_sim and attempt < n_sim * 10:
-    attempt += 1
-
-    if attempt % 2 == 0:
-        n_active = rng.integers(4, min(10, n) + 1)
-        idx = rng.choice(n, n_active, replace=False)
-        w_raw = np.zeros(n)
-        w_raw[idx] = rng.uniform(size=n_active)
-        w_raw = w_raw / w_raw.sum()
-    else:
-        w_raw = rng.uniform(size=n)
-        w_raw = w_raw / w_raw.sum()
-
-    w_raw[excluded_etf_assets] = 0.0
-    w_raw = np.minimum(w_raw, max_weight)
-    if w_raw.sum() == 0:
-        continue
-    w_raw = w_raw / w_raw.sum()
-
-    if np.all(w_raw >= 0) and abs(w_raw.sum() - 1) < 1e-6:
-        random_weights_mat[valid_count, :] = w_raw
-        valid_count += 1
-
-random_weights_mat = random_weights_mat[:valid_count, :]
-
-returns_vals = random_weights_mat @ mu
-risk_vals = np.sqrt(np.einsum("ij,jk,ik->i", random_weights_mat, cov_mat, random_weights_mat))
-utility_vals = returns_vals - (lambda_ / 2) * (risk_vals ** 2)
-
-frontier_df = pd.DataFrame({"risk": risk_vals, "ret": returns_vals, "utility": utility_vals}).dropna()
-
-fv = frontier_df.sort_values("risk").reset_index(drop=True)
-efficient_points = fv.iloc[[0]].copy()
-running_max_ret = efficient_points["ret"].max()
-for i in range(1, len(fv)):
-    if fv.loc[i, "ret"] > running_max_ret:
-        efficient_points = pd.concat([efficient_points, fv.iloc[[i]]], ignore_index=True)
-        running_max_ret = fv.loc[i, "ret"]
-
-opt_point = pd.DataFrame({"risk": [sd_opt], "ret": [ret_opt], "utility": [utility_opt]})
-
-x_max = max(risk_vals.max(), sd_opt) * 1.15
-y_min = min(returns_vals.min(), ret_opt) * 0.95
-y_max = max(returns_vals.max(), ret_opt) * 1.10
-
-fig = px.scatter(
-    frontier_df, x="risk", y="ret", color="utility", opacity=0.35,
-    color_continuous_scale="RdYlGn",
-    labels={"risk": f"Riesgo ({periodo_label})", "ret": f"Retorno Esperado ({periodo_label})",
-            "utility": f"Utilidad<br>(lambda={lambda_:.1f})"},
-)
-fig.update_traces(marker=dict(size=6), hovertemplate="Riesgo: %{x:.4f}<br>Retorno: %{y:.4f}<br>Utilidad: %{marker.color:.4f}<extra></extra>")
-fig.add_trace(go.Scatter(x=efficient_points["risk"], y=efficient_points["ret"], mode="lines",
-                          line=dict(color="darkgreen", dash="dash", width=1.5),
-                          name="Frontera eficiente"))
-fig.add_trace(go.Scatter(x=[opt_point["risk"][0]], y=[opt_point["ret"][0]], mode="markers",
-                          marker=dict(color="red", size=14, symbol="diamond", line=dict(width=1, color="black")),
-                          name=f"Optimo (U={opt_point['utility'][0]:.4f})",
-                          hovertemplate=f"Optimo<br>Riesgo: %{{x:.4f}}<br>Retorno: %{{y:.4f}}<br>"
-                                        f"U={opt_point['utility'][0]:.4f}<extra></extra>"))
-fig.update_layout(
-    title=dict(text="Frontera Eficiente - Utilidad Cuadratica<br>"
-                     f"<sup>Horizonte: {horizon_desc} | lambda={lambda_:.2f} | {min(target_years)}-{max(target_years)}</sup>"),
-    xaxis_range=[0, x_max], yaxis_range=[y_min, y_max],
-    template="plotly_white",
-)
-fig.show()
+if frontier_df.empty:
+    print("  No hubo soluciones factibles para trazar la frontera restringida.")
+else:
+    frontier_df = frontier_df.sort_values("risk")
+    opt_idx = (frontier_df["lambda_"] - float(lambda_)).abs().idxmin()
+    opt_point = frontier_df.loc[opt_idx]
+    x_max = float(frontier_df["risk"].max()) * 1.15
+    y_min = float(min(frontier_df["ret"].min(), opt_point["ret"]))
+    y_max = float(max(frontier_df["ret"].max(), opt_point["ret"]))
+    y_pad = max((y_max - y_min) * 0.08, 1e-6)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=frontier_df["risk"], y=frontier_df["ret"], mode="lines+markers",
+        name="Frontera restringida",
+        line=dict(color="darkgreen", width=2),
+        marker=dict(size=5),
+        customdata=np.column_stack([frontier_df["lambda_"], frontier_df["utility"]]),
+        hovertemplate=("λ=%{customdata[0]:.2f}<br>Riesgo: %{x:.4f}<br>"
+                       "Retorno μ_final: %{y:.4f}<br>U(λ ref): %{customdata[1]:.4f}<extra></extra>"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=[opt_point["risk"]], y=[opt_point["ret"]], mode="markers",
+        name=f"Optimo (λ={lambda_:.2f})",
+        marker=dict(color="red", size=14, symbol="diamond", line=dict(width=1, color="black")),
+        hovertemplate=(f"Optimo λ={lambda_:.2f}<br>Riesgo: %{{x:.4f}}<br>"
+                       f"Retorno μ_final: %{{y:.4f}}<extra></extra>"),
+    ))
+    fig.update_layout(
+        title=dict(text="Frontera eficiente restringida<br>"
+                        f"<sup>Mismas restricciones del QP | μ_final | λ={lambda_:.2f} | "
+                        f"{horizon_desc} | {min(target_years)}-{max(target_years)}</sup>"),
+        xaxis_title=f"Riesgo ({periodo_label}): σ = sqrt(w'Σw)",
+        yaxis_title=f"Retorno esperado ({periodo_label}): w'μ_final",
+        xaxis_range=[0, x_max],
+        yaxis_range=[y_min - y_pad, y_max + y_pad],
+        template="plotly_white",
+    )
+    fig.show()
+    print(f"  {len(frontier_df)} puntos. El optimo (λ={lambda_:.2f}) es uno de ellos: "
+          f"σ={opt_point['risk']:.4f}, w'μ_final={opt_point['ret']:.4f}.")
 
 # ==============================================================================
 # COMPARACION DE LAMBDAS
@@ -2578,27 +2682,26 @@ print("\n" + "=" * 70)
 print("ANALISIS COMPARATIVO: Portafolios por nivel de lambda")
 print("=" * 70 + "\n")
 
-lambda_values = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0]
-results_comparison_rows = []
+print(f"Cada portafolio se resuelve con su lambda, pero la utilidad se mide con el "
+      f"lambda configurado ({lambda_:.2f}) y con w'μ_final. El libro no cambia.")
+lambda_values = qm.comparison_lambdas(lambda_)
+candidatos_lambda = []
 
 for lambda_test in lambda_values:
-    print(f"  Optimizando lambda={lambda_test:.1f}... ", end="")
+    print(f"  Optimizando lambda={lambda_test:.2f}... ", end="")
     w = solve_qp_portfolio(lambda_test)
     if w is not None and w.sum() > 0.9:
-        wv = w.values
-        ret = float(np.sum(wv * mu))
-        vol = float(np.sqrt(wv @ cov_mat @ wv))
-        sharpe = (ret - rf_rate_period) / vol
-        utility = ret - (lambda_test / 2) * (vol ** 2)
-        results_comparison_rows.append(dict(
-            lambda_=lambda_test, retorno=ret * 100, volatilidad=vol * 100,
-            sharpe=sharpe, utilidad=utility, n_activos=int((w > 0.01).sum()), max_peso=w.max() * 100
-        ))
-        print(f"R={ret * 100:.2f}% | sigma={vol * 100:.2f}% | U={utility:.4f}")
+        candidatos_lambda.append((lambda_test, w.values))
+        print("solucion factible")
     else:
+        candidatos_lambda.append((lambda_test, None))
         print("No se encontro solucion feasible")
 
-results_comparison = pd.DataFrame(results_comparison_rows)
+results_comparison = qm.score_candidate_portfolios(
+    candidatos_lambda, mu_final, cov_mat, lambda_, rf=rf_rate_period)
+for _, fila in results_comparison.iterrows():
+    print(f"    λ={fila['lambda_']:.2f} | R(μ_final)={fila['retorno']:.2f}% | "
+          f"σ={fila['volatilidad']:.2f}% | U(λ={lambda_:.2f})={fila['utilidad']:.4f}")
 
 if len(results_comparison) > 0:
     print("\n" + "=" * 70)
@@ -2617,7 +2720,8 @@ if len(results_comparison) > 0:
         results_comparison, x="volatilidad", y="retorno", color="utilidad", size="lambda_",
         color_continuous_scale="RdYlGn", size_max=22,
         text=results_comparison["lambda_"].map(lambda x: f"{x:.1f}"),
-        labels={"volatilidad": "Volatilidad (%)", "retorno": "Retorno Esperado (%)", "utilidad": "Utilidad"},
+        labels={"volatilidad": "Volatilidad (%)", "retorno": "Retorno w'μ_final (%)",
+                "utilidad": f"Utilidad al λ={lambda_:.2f}"},
         hover_data={"lambda_": ":.1f", "sharpe": ":.3f", "n_activos": True, "max_peso": ":.1f",
                     "volatilidad": ":.2f", "retorno": ":.2f", "utilidad": ":.4f"},
     )
@@ -2626,29 +2730,27 @@ if len(results_comparison) > 0:
         fig.add_trace(trace)
     fig.update_layout(bubble_fig.layout)
     fig.update_layout(
-        title=dict(text="Frontera de Portafolios por Nivel de Aversion al Riesgo<br>"
+        title=dict(text="Portafolios por nivel de aversion al riesgo<br>"
                          f"<sup>Horizonte: {horizon_desc} | {min(target_years)}-{max(target_years)} | "
-                         "lambda bajo = Agresivo, lambda alto = Conservador</sup>"),
+                         f"utilidad de todos los candidatos al λ configurado ({lambda_:.2f}), retorno w'μ_final</sup>"),
         template="plotly_white",
     )
     fig.show()
 
     best_row = results_comparison.loc[results_comparison["utilidad"].idxmax()]
     print("\n" + "=" * 70)
-    print("RECOMENDACION BASADA EN UTILIDAD MAXIMA")
+    print(f"COMPARACION AL LAMBDA CONFIGURADO ({lambda_:.2f})")
     print("=" * 70 + "\n")
-    print(f"  lambda optimo para estos datos: {best_row['lambda_']:.1f}")
+    print(f"  Mayor utilidad de la rejilla, medida con λ={lambda_:.2f} y w'μ_final: "
+          f"{best_row['lambda_']:.2f}")
     _ann_best = qm.annualize_monthly(mu=best_row["retorno"] / 100.0, sd=best_row["volatilidad"] / 100.0)
-    print(f"  - Retorno esperado ({periodo_label}): {best_row['retorno']:.2f}% ({_ann_best['mu'] * 100:.1f}% anual)")
+    print(f"  - Retorno w'μ_final ({periodo_label}): {best_row['retorno']:.2f}% ({_ann_best['mu'] * 100:.1f}% anual)")
     print(f"  - Volatilidad ({periodo_label}): {best_row['volatilidad']:.2f}% ({_ann_best['sd'] * 100:.1f}% anual)")
-    print(f"  - Sharpe Ratio: {best_row['sharpe']:.3f}")
-    print(f"  - Utilidad: {best_row['utilidad']:.4f} (maxima)")
-    print(f"  - Activos en portafolio: {int(best_row['n_activos'])}")
-    if abs(best_row["lambda_"] - lambda_) > 0.5:
-        print(f"\n  El lambda actual ({lambda_:.1f}) difiere del optimo ({best_row['lambda_']:.1f})")
-        print(f"     Considera ajustar lambda <- {best_row['lambda_']:.1f}")
-    else:
-        print(f"\n  El lambda actual ({lambda_:.1f}) esta cerca del optimo")
+    print(f"  - Sharpe (sobre μ_final): {best_row['sharpe']:.3f}")
+    print(f"  - Utilidad al λ configurado: {best_row['utilidad']:.4f}")
+    print(f"  - Activos en ese candidato: {int(best_row['n_activos'])}")
+    print(f"\n  El portafolio publicado sigue siendo el QP a λ={lambda_:.2f}. "
+          "Esta tabla no lo reemplaza.")
 
 print("\nOptimizacion completada exitosamente")
 

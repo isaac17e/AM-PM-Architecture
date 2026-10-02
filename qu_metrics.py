@@ -42,6 +42,14 @@ __all__ = [
     "select_historical_otm",
     "summarize_yearly_mdd",
     "estimate_bkm_history_calls",
+    "close_near_from_bars",
+    "contract_agg_ranges",
+    "plan_bkm_history_budget",
+    "frontier_lambda_grid",
+    "portfolio_mu_final_metrics",
+    "frontier_curve",
+    "comparison_lambdas",
+    "score_candidate_portfolios",
     "mfiv_annual_vol",
 ]
 
@@ -473,16 +481,258 @@ def summarize_yearly_mdd(yearly_mdd):
     }
 
 
-def estimate_bkm_history_calls(n_tickers, n_pending_dates, contracts_per_date):
+def estimate_bkm_history_calls(n_tickers, n_pending_dates, contracts_per_date,
+                               n_unique_contracts=None):
     """Llamadas Polygon aproximadas del bloque MFIS.
 
-    2 por ticker para la cadena actual (call y put) mas, por fecha pendiente,
-    1 consulta de contratos y `contracts_per_date` cierres. El minuto lo pone
-    polygon_client.estimate_minutes con POLYGON_CALLS_PER_MIN: si el producto
-    supera bkm_hist_max_minutes el script omite la historia y solo calcula el
-    momento actual. La rejilla vieja de 7 puntos subestimaba este costo.
+    2 por ticker para la cadena actual (call y put), 1 lista de contratos por
+    fecha pendiente y los cierres. Sin `n_unique_contracts` cada fecha paga
+    `contracts_per_date` agregados (techo). Con el rango por contrato unico
+    el agregado se cuenta una sola vez.
     """
-    return int(2 * n_tickers + (1 + int(contracts_per_date)) * int(n_pending_dates))
+    actuales = 2 * int(n_tickers)
+    listas = int(n_pending_dates)
+    if n_unique_contracts is None:
+        aggs = int(contracts_per_date) * int(n_pending_dates)
+    else:
+        aggs = int(n_unique_contracts)
+    return actuales + listas + aggs
+
+
+def close_near_from_bars(results, target_date, window_days=5):
+    """Cierre del dia mas cercano a `target_date` dentro de ±window_days.
+
+    `results` es la lista de agregados de Polygon (`t` en milisegundos, `c`
+    el cierre). La misma regla sirve para la consulta de un solo dia y para
+    recortar el rango largo de un contrato: una barra fuera de la ventana
+    no entra, aunque el rango descargado la traiga.
+    """
+    if not results:
+        return np.nan
+    target = pd.Timestamp(target_date).normalize()
+    limite = int(window_days)
+    mejor = None
+    mejor_dist = None
+    for barra in results:
+        t = barra.get("t")
+        cierre = barra.get("c")
+        if t is None or cierre is None:
+            continue
+        try:
+            fecha = pd.to_datetime(t, unit="ms").normalize()
+            dist = abs(int((fecha - target).days))
+            precio = float(cierre)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if dist > limite or not np.isfinite(precio):
+            continue
+        if mejor_dist is None or dist < mejor_dist:
+            mejor_dist = dist
+            mejor = precio
+    return np.nan if mejor is None else mejor
+
+
+def contract_agg_ranges(needed, window_days=5):
+    """Un rango de agregados por contrato, cubriendo todas las fechas en que se usa.
+
+    `needed` es una lista de (ticker_opcion, fecha). El rango va de la primera
+    fecha menos la ventana a la ultima mas la ventana, que es lo que pedia
+    cada consulta diaria de ±window_days. Recortar despues con
+    close_near_from_bars deja el mismo precio.
+    """
+    tramo = {}
+    for contrato, fecha in needed:
+        if not contrato:
+            continue
+        ts = pd.Timestamp(fecha).normalize()
+        previo = tramo.get(contrato)
+        if previo is None:
+            tramo[contrato] = (ts, ts)
+        else:
+            tramo[contrato] = (min(previo[0], ts), max(previo[1], ts))
+    ventana = pd.Timedelta(days=int(window_days))
+    return {
+        contrato: (
+            (lo - ventana).strftime("%Y-%m-%d"),
+            (hi + ventana).strftime("%Y-%m-%d"),
+        )
+        for contrato, (lo, hi) in tramo.items()
+    }
+
+
+def plan_bkm_history_budget(ranked, contracts_per_date=26, calls_per_min=1200.0,
+                            max_minutes=60.0, spent_calls=0):
+    """Que tickers entran a la historia de MFIS con el presupuesto de llamadas.
+
+    `ranked` va en orden de prioridad (el de los candidatos). Cada fila trae
+    ticker, us, mfis_ok y n_pending (fechas que no estan en cache). Solo un
+    ticker de EE. UU. con MFIS actual finito gasta historia. El costo es
+    (1 + contratos por fecha) * fechas pendientes: la lista de contratos por
+    fecha y el techo de agregados. Un acierto de cache (n_pending 0) no gasta.
+
+    No es todo o nada. Se recorre el ranking y entra el que cabe. El que no
+    cabe queda con motivo historia_no_procesada_presupuesto. Si sobran
+    llamadas para alguna fecha de ese ticker, `calentar` dice cuantas fechas
+    bajar para dejar la cache tibia; el ticker sigue marcado como no procesado.
+    """
+    elegibles = []
+    fuera = []
+    for row in ranked:
+        ticker = row["ticker"]
+        if not row.get("us"):
+            fuera.append({"ticker": ticker, "motivo": "sin_opciones_us"})
+            continue
+        if not row.get("mfis_ok"):
+            fuera.append({
+                "ticker": ticker,
+                "motivo": row.get("motivo") or "sin_mfis_actual",
+            })
+            continue
+        elegibles.append(row)
+
+    if not calls_per_min or max_minutes is None:
+        presupuesto = None
+    else:
+        presupuesto = float(max_minutes) * float(calls_per_min) - float(spent_calls)
+        if presupuesto < 0:
+            presupuesto = 0.0
+
+    unit = 1 + int(contracts_per_date)
+    procesar = []
+    omitidos = []
+    usadas = 0.0
+    calentar = None
+    calentado = False
+    for row in elegibles:
+        n_pend = int(row.get("n_pending") or 0)
+        costo = unit * n_pend
+        cabe = presupuesto is None or usadas + costo <= presupuesto + 1e-9
+        if cabe:
+            procesar.append(row["ticker"])
+            usadas += costo
+            continue
+        omitidos.append({
+            "ticker": row["ticker"],
+            "motivo": "historia_no_procesada_presupuesto",
+        })
+        if calentado or presupuesto is None or n_pend <= 0:
+            calentado = True
+            continue
+        restante = presupuesto - usadas
+        n_fechas = int(restante // unit)
+        if n_fechas > 0:
+            n_fechas = min(n_pend, n_fechas)
+            calentar = {"ticker": row["ticker"], "n_fechas": int(n_fechas)}
+            usadas += unit * n_fechas
+        calentado = True
+
+    minutos = None
+    if calls_per_min:
+        minutos = (float(spent_calls) + usadas) / float(calls_per_min)
+    return {
+        "procesar": procesar,
+        "omitidos": omitidos,
+        "fuera_de_historia": fuera,
+        "calentar": calentar,
+        "llamadas": int(round(usadas)),
+        "minutos": minutos,
+        "n_us_mfis": len(elegibles),
+    }
+
+
+def frontier_lambda_grid(lambda_ref=None, n=60, lo=0.1, hi=200.0):
+    """Lambdas del barrido de la frontera. Incluye el lambda del portafolio."""
+    rejilla = np.logspace(np.log10(float(lo)), np.log10(float(hi)), int(n))
+    if lambda_ref is not None and np.isfinite(lambda_ref) and float(lambda_ref) > 0:
+        rejilla = np.append(rejilla, float(lambda_ref))
+    return np.unique(np.sort(rejilla.astype(float)))
+
+
+def portfolio_mu_final_metrics(weights, mu_final, cov, lambda_ref, rf=0.0):
+    """Riesgo, retorno w'μ_final y utilidad con un unico lambda de referencia."""
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    mu_v = np.asarray(mu_final, dtype=float).reshape(-1)
+    cov_m = np.asarray(cov, dtype=float)
+    ret = float(w @ mu_v)
+    var = float(w @ cov_m @ w)
+    if not np.isfinite(var) or var < 0:
+        var = 0.0
+    vol = float(np.sqrt(var))
+    utilidad = ret - (float(lambda_ref) / 2.0) * var
+    sharpe = (ret - float(rf)) / vol if vol > 0 else np.nan
+    return {"ret": ret, "vol": vol, "var": var, "utilidad": utilidad, "sharpe": sharpe}
+
+
+def frontier_curve(solve_fn, cov, mu_final, lambdas, lambda_utility=None):
+    """Frontera exacta: cada punto es el QP a ese lambda, medido con μ_final.
+
+    risk = sqrt(w'Σw), ret = w'μ_final. La utilidad del color usa
+    lambda_utility (el lambda configurado) para que los puntos se comparen
+    entre si. El optimo del libro es el punto cuyo lambda es el configurado.
+    """
+    cov_m = np.asarray(cov, dtype=float)
+    mu_v = np.asarray(mu_final, dtype=float).reshape(-1)
+    filas = []
+    for lam in lambdas:
+        w = solve_fn(float(lam))
+        if w is None:
+            continue
+        w = np.asarray(w, dtype=float).reshape(-1)
+        if w.shape[0] != mu_v.shape[0] or not np.isfinite(w).all() or float(np.nansum(w)) <= 0:
+            continue
+        ref = float(lam if lambda_utility is None else lambda_utility)
+        met = portfolio_mu_final_metrics(w, mu_v, cov_m, ref)
+        filas.append({
+            "lambda_": float(lam),
+            "risk": met["vol"],
+            "ret": met["ret"],
+            "utility": met["utilidad"],
+        })
+    return pd.DataFrame(filas)
+
+
+def comparison_lambdas(lambda_ref, base=None):
+    """Rejilla de la figura de lambdas, con el lambda configurado incluido."""
+    if base is None:
+        base = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0]
+    valores = [float(v) for v in base]
+    if lambda_ref is not None and np.isfinite(lambda_ref) and float(lambda_ref) > 0:
+        valores.append(float(lambda_ref))
+    ordenados = []
+    for valor in sorted(valores):
+        if not any(abs(valor - previo) < 1e-9 for previo in ordenados):
+            ordenados.append(valor)
+    return ordenados
+
+
+def score_candidate_portfolios(solved, mu_final, cov, lambda_ref, rf=0.0):
+    """Puntua cada portafolio candidato con el mismo lambda y con μ_final.
+
+    `solved` es una lista de (lambda_con_el_que_se_resolvio, pesos). La
+    utilidad no usa el lambda de esa fila: si lo hiciera, el lambda mas
+    chico ganaria siempre. El retorno es w'μ_final, el mismo vector que ve
+    el optimizador.
+    """
+    filas = []
+    for lam, w in solved:
+        if w is None:
+            continue
+        w = np.asarray(w, dtype=float).reshape(-1)
+        if not np.isfinite(w).all() or float(np.nansum(w)) <= 0.9:
+            continue
+        met = portfolio_mu_final_metrics(w, mu_final, cov, lambda_ref, rf=rf)
+        filas.append({
+            "lambda_": float(lam),
+            "retorno": met["ret"] * 100.0,
+            "volatilidad": met["vol"] * 100.0,
+            "sharpe": met["sharpe"],
+            "utilidad": met["utilidad"],
+            "ret": met["ret"],
+            "risk": met["vol"],
+            "n_activos": int(np.sum(w > 0.01)),
+            "max_peso": float(np.max(w) * 100.0) if w.size else np.nan,
+        })
+    return pd.DataFrame(filas)
 
 
 def mfiv_annual_vol(mfiv, dte):

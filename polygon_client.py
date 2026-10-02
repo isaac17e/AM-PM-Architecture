@@ -9,8 +9,9 @@
 #      Retry-After.
 #   3. Paginacion completa via next_url, con indicador de completitud: una
 #      cadena a la que le falta una pagina NUNCA se devuelve como completa.
-#   4. Cache en disco: permanente para datos historicos (no cambian) y con
-#      TTL para snapshots del dia.
+#   4. Cache en disco, fuera del repo: solo datos historicos inmutables
+#      (listas de contratos y agregados con fecha estrictamente anterior a
+#      hoy). Un snapshot o cualquier respuesta del dia en curso no se guarda.
 #   5. Diagnostico acumulado de llamadas.
 #   6. Descarga de la cadena OTM de un unico vencimiento para BKM.
 #   7. Formato de tickers para Polygon (BRK-B -> BRK.B), unico para todos
@@ -22,15 +23,17 @@
 #                             DEFINITIVA (no se reintenta ni se trata como
 #                             fallo transitorio) y se emite un aviso una vez.
 #   POLYGON_CALLS_PER_MIN     tope de llamadas por minuto. Default
-#                             DEFAULT_CALLS_PER_MIN (300 = 5/s), un ritmo
-#                             conservador para los planes de pago (Starter o
-#                             superior), que no imponen tope duro pero si
-#                             devuelven 429 ante rafagas. Valores:
+#                             DEFAULT_CALLS_PER_MIN (1200 = 20/s). El plan de
+#                             opciones de pago no trae tope duro; se recomienda
+#                             quedar por debajo de 100 req/s. La variable sigue
+#                             mandando. Valores:
 #                               5                 plan gratuito
 #                               0 / none / unlimited   sin limitador
-#   POLYGON_SNAPSHOT_TTL_MIN  vigencia en minutos de la cache de snapshots
-#                             (default 60; 0 la desactiva)
-#   POLYGON_CACHE_DIR         carpeta de la cache (default .cache/polygon)
+#   POLYGON_SNAPSHOT_TTL_MIN  se conserva por compatibilidad. Los snapshots
+#                             y la cadena del dia no se cachean.
+#   POLYGON_CACHE_DIR         carpeta de la cache. Default
+#                             ~/.cache/am-pm/polygon (fuera del repo y de la
+#                             carpeta de la corrida).
 #
 # El tope tambien puede cambiarse en tiempo de ejecucion con set_rate_limit().
 # ==============================================================================
@@ -65,7 +68,10 @@ __all__ = [
     "es_transitorio",
     "cache_get",
     "cache_set",
+    "cache_permitida",
+    "default_cache_dir",
     "estimate_minutes",
+    "fetch_option_aggs",
     "fetch_otm_chain",
     "diag",
     "print_diagnostics",
@@ -74,11 +80,10 @@ __all__ = [
 
 API_KEY = os.environ.get("POLYGON_API_KEY")
 
-# Ritmo por defecto para planes de pago. Polygon no publica un tope duro en
-# esos planes, pero responde 429 ante rafagas sostenidas; 5 llamadas/s cubre
-# una cadena de ~200 tickers (2 consultas por ticker) en poco mas de un
-# minuto sin provocarlos.
-DEFAULT_CALLS_PER_MIN = 300.0
+# Ritmo por defecto para el plan de opciones de pago (llamadas sin tope duro).
+# 1200/min son 20 req/s, por debajo de los 100 req/s que conviene no pasar.
+# POLYGON_CALLS_PER_MIN lo reemplaza; 0 o "unlimited" apaga el limitador.
+DEFAULT_CALLS_PER_MIN = 1200.0
 _SIN_TOPE = {"0", "none", "null", "unlimited", "inf", "sin_tope", "ilimitado"}
 
 
@@ -113,8 +118,14 @@ def _parse_calls_per_min(valor, default=DEFAULT_CALLS_PER_MIN):
 
 CALLS_PER_MIN = _parse_calls_per_min(os.environ.get("POLYGON_CALLS_PER_MIN"))
 SNAPSHOT_TTL_SEC = _env_float("POLYGON_SNAPSHOT_TTL_MIN", 60.0) * 60.0
-CACHE_DIR = os.environ.get("POLYGON_CACHE_DIR") or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".cache", "polygon")
+
+
+def default_cache_dir():
+    """Cache compartida entre corridas, fuera del repositorio."""
+    return os.path.join(os.path.expanduser("~"), ".cache", "am-pm", "polygon")
+
+
+CACHE_DIR = os.environ.get("POLYGON_CACHE_DIR") or default_cache_dir()
 
 BASE_URL = "https://api.polygon.io"
 STATUS_TRANSITORIOS = {429, 500, 502, 503, 504}
@@ -223,11 +234,48 @@ def n_fallos_transitorios():
 # ==============================================================================
 # 3. CACHE EN DISCO
 # ==============================================================================
-# Cada entrada es un JSON {"ts": epoch, "data": ...}. Las entradas
-# permanentes ignoran la antiguedad; las de snapshot vencen tras
-# SNAPSHOT_TTL_SEC. La escritura es atomica (archivo temporal + replace), de
-# modo que varios hilos pueden escribir sin corromper la cache.
+# Cada entrada es un JSON {"ts": epoch, "data": ...}. Solo se guarda lo
+# inmutable: listas de contratos y agregados cuya fecha es anterior a hoy,
+# y referencia sin fecha cuando el llamador pide cache permanente (el SIC).
+# Un snapshot (/snapshot/) o cualquier clave con la fecha de hoy o una
+# posterior no se lee ni se escribe. La escritura es atomica.
 # ==============================================================================
+
+_FECHA_ISO = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def fechas_en_clave(clave):
+    """Fechas ISO encontradas en una URL o en una clave de cache."""
+    encontradas = []
+    for texto in _FECHA_ISO.findall(str(clave)):
+        anio, mes, dia = (int(p) for p in texto.split("-"))
+        try:
+            encontradas.append(date(anio, mes, dia))
+        except ValueError:
+            continue
+    return encontradas
+
+
+def es_snapshot(clave):
+    return "/snapshot/" in str(clave)
+
+
+def cache_permitida(clave, permanente=False):
+    """True si la clave puede vivir en la cache de disco.
+
+    Con fechas: todas tienen que ser estrictamente anteriores a hoy.
+    Sin fechas: solo la referencia permanente (no un snapshot).
+    """
+    if es_snapshot(clave):
+        return False
+    fechas = fechas_en_clave(clave)
+    hoy = date.today()
+    if any(f >= hoy for f in fechas):
+        return False
+    if fechas:
+        return True
+    return bool(permanente)
+
 
 def _ruta_cache(clave):
     h = hashlib.sha1(clave.encode("utf-8")).hexdigest()
@@ -235,18 +283,30 @@ def _ruta_cache(clave):
 
 
 def cache_get(clave, permanente=True):
+    if es_snapshot(clave) or any(f >= date.today() for f in fechas_en_clave(clave)):
+        return None
     ruta = _ruta_cache(clave)
     try:
         with open(ruta, "r", encoding="utf-8") as fh:
             entrada = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not permanente and time.time() - entrada.get("ts", 0) > SNAPSHOT_TTL_SEC:
+    historica = bool(fechas_en_clave(clave))
+    if not permanente and not historica and time.time() - entrada.get("ts", 0) > SNAPSHOT_TTL_SEC:
         return None
     return entrada.get("data")
 
 
-def cache_set(clave, data):
+def cache_set(clave, data, permanente=False):
+    """Escribe la entrada. Devuelve False si la clave es de hoy o un snapshot.
+
+    Una clave sin fecha se escribe: get_json solo llega aqui si
+    cache_permitida lo autorizo, y la referencia (SIC) se guarda a mano.
+    `permanente` documenta esa llamada; el veto es la fecha y el snapshot.
+    """
+    del permanente
+    if es_snapshot(clave) or any(f >= date.today() for f in fechas_en_clave(clave)):
+        return False
     ruta = _ruta_cache(clave)
     try:
         os.makedirs(os.path.dirname(ruta), exist_ok=True)
@@ -255,7 +315,8 @@ def cache_set(clave, data):
             json.dump({"ts": time.time(), "data": data}, fh)
         os.replace(tmp, ruta)
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _sin_api_key(url):
@@ -363,7 +424,7 @@ def get_json(url, api_key=None, permanente=False, max_retries=5, timeout=20, bac
     """
     api_key = api_key or API_KEY
     clave = _sin_api_key(url)
-    usar_cache = permanente or SNAPSHOT_TTL_SEC > 0
+    usar_cache = cache_permitida(clave, permanente=permanente)
     if usar_cache:
         data = cache_get(clave, permanente=permanente)
         if data is not None:
@@ -393,7 +454,7 @@ def get_json(url, api_key=None, permanente=False, max_retries=5, timeout=20, bac
                 _registrar("json_invalido")
                 return None, "json_invalido"
             if usar_cache:
-                cache_set(clave, data)
+                cache_set(clave, data, permanente=permanente)
             return data, 200
         if status in STATUS_TRANSITORIOS:
             espera = None
@@ -432,6 +493,26 @@ def get_all(url, api_key=None, permanente=False, max_pages=40, **kwargs):
             return resultados, True, 200
     _sumar("truncadas_max_pages")
     return resultados, False, "max_pages"
+
+
+def fetch_option_aggs(contract_ticker, from_date, to_date, api_key=None, limit=50000):
+    """Agregados diarios de un contrato de opcion (O:...) en un rango.
+
+    Una sola llamada cubre todas las fechas de muestreo en las que ese
+    contrato hace falta. Devuelve (results, definitivo). No guarda la
+    respuesta si `to_date` es hoy o posterior. Un ticker que no empieza
+    por O: no se consulta: el agregado de la accion devuelve 403 en este plan.
+    """
+    if not str(contract_ticker).startswith("O:"):
+        return [], True
+    url = (
+        f"{BASE_URL}/v2/aggs/ticker/{contract_ticker}/range/1/day/"
+        f"{from_date}/{to_date}?adjusted=true&sort=asc&limit={int(limit)}"
+    )
+    data, status = get_json(url, api_key=api_key, permanente=True)
+    if data is None:
+        return [], not es_transitorio(status)
+    return list(data.get("results") or []), True
 
 
 def es_transitorio(status):

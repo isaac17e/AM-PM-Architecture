@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import date, timedelta
 
 import numpy as np
@@ -74,7 +75,14 @@ def test_parse_calls_per_min(valor, esperado):
 
 
 def test_default_rate_limit_is_documented_constant():
-    assert pc.DEFAULT_CALLS_PER_MIN == 300.0
+    assert pc.DEFAULT_CALLS_PER_MIN == 1200.0
+
+
+def test_default_cache_dir_lives_outside_the_repo():
+    destino = pc.default_cache_dir()
+    assert destino.endswith("/.cache/am-pm/polygon")
+    repo = os.path.dirname(os.path.abspath(pc.__file__))
+    assert not destino.startswith(repo)
 
 
 def test_set_rate_limit_updates_limiter_and_estimate():
@@ -135,6 +143,42 @@ def test_get_json_without_api_key_is_definitive_and_warns_once():
         data, status = pc.get_json("https://api.polygon.io/v3/b?limit=1")   # no vuelve a avisar
     assert status == "sin_api_key"
     assert pc.diag["http_calls"] == 0
+
+
+def test_cache_never_stores_current_date_or_snapshot(monkeypatch):
+    """La cache de disco no guarda la cadena de hoy ni un agregado con fecha de hoy."""
+    monkeypatch.setattr(pc, "API_KEY", "K")
+    monkeypatch.setattr(requests, "get", lambda url, timeout: _RespuestaFalsa(200, {"results": [{"c": 1}]}))
+    hoy = date.today().isoformat()
+    ayer = (date.today() - timedelta(days=2)).isoformat()
+
+    snap = "https://api.polygon.io/v3/snapshot/options/AAPL?limit=250"
+    data, status = pc.get_json(snap, permanente=True)
+    assert status == 200 and data["results"]
+    assert pc.cache_set(snap, {"results": [1]}) is False
+    assert pc.cache_get(snap) is None
+
+    aggs_hoy = f"https://api.polygon.io/v2/aggs/ticker/O:ABC/range/1/day/{ayer}/{hoy}"
+    pc.get_json(aggs_hoy, permanente=True)
+    assert pc.cache_set(aggs_hoy, {"results": []}) is False
+    assert pc.cache_get(aggs_hoy) is None
+    assert pc.cache_set(f"mfis_hist_v3|AAPL|{hoy}|dte=30", {"S": 1}) is False
+
+    contratos_hoy = f"https://api.polygon.io/v3/reference/options/contracts?as_of={hoy}&limit=10"
+    assert pc.cache_set(contratos_hoy, {"results": []}) is False
+
+    viejo = f"https://api.polygon.io/v2/aggs/ticker/O:ABC/range/1/day/{ayer}/{ayer}"
+    data, status = pc.get_json(viejo, permanente=True)
+    assert status == 200 and pc.cache_get(viejo)["results"][0]["c"] == 1
+    antes = pc.diag["http_calls"]
+    otra, status = pc.get_json(viejo, permanente=True)
+    assert status == 200 and otra["results"][0]["c"] == 1
+    assert pc.diag["http_calls"] == antes
+    assert pc.diag["cache_hits"] >= 1
+
+    clave_ayer = f"mfis_hist_v3|AAPL|{ayer}|dte=30"
+    assert pc.cache_set(clave_ayer, {"S": 2}) is True
+    assert pc.cache_get(clave_ayer) == {"S": 2}
 
 
 def test_get_json_serves_from_cache_without_key_or_network():

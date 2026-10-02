@@ -383,3 +383,127 @@ def test_mfiv_annual_vol_uses_real_dte():
     vol = qm.mfiv_annual_vol(mfiv, dte=32)
     assert vol == pytest.approx(np.sqrt(mfiv * 365 / 32))
     assert vol != pytest.approx(np.sqrt(mfiv / (2 / 12)))
+
+
+def _barra(dia, precio):
+    ms = int(pd.Timestamp(dia).value // 10**6)
+    return {"t": ms, "c": precio}
+
+
+def test_range_fetch_matches_per_date_close():
+    """Un rango por contrato, recortado a ±5 dias, da el mismo cierre que la consulta de esa fecha."""
+    barras = [_barra(f"2024-01-{d:02d}", 10.0 + d) for d in range(1, 32)]
+    # 16 de enero cae a 6 dias del 10: la consulta de un solo dia (±5) no la trae.
+    barras.append(_barra("2024-01-16", 99.0))
+    fechas = [pd.Timestamp("2024-01-10"), pd.Timestamp("2024-01-20")]
+    needed = [("O:AAA", f) for f in fechas] + [("O:BBB", fechas[0])]
+    rangos = qm.contract_agg_ranges(needed, window_days=5)
+    assert set(rangos) == {"O:AAA", "O:BBB"}
+    assert rangos["O:AAA"] == ("2024-01-05", "2024-01-25")
+    assert rangos["O:BBB"] == ("2024-01-05", "2024-01-15")
+    # 2 contratos, no 3 consultas (AAA en dos fechas + BBB).
+    assert len(rangos) == 2
+    assert len(rangos) < len(needed)
+
+    for fecha in fechas:
+        ventana = []
+        for barra in barras:
+            dia = pd.to_datetime(barra["t"], unit="ms").normalize()
+            if abs((dia - fecha).days) <= 5:
+                ventana.append(barra)
+        assert qm.close_near_from_bars(barras, fecha, 5) == qm.close_near_from_bars(ventana, fecha, 5)
+    # El 10 de enero tiene barra propia (precio 20). La del 16 no la pisa.
+    assert qm.close_near_from_bars(barras, "2024-01-10", 5) == pytest.approx(20.0)
+    # Sin barra el 12: la mas cercana dentro de ±5, no la de fuera.
+    solo = [_barra("2024-01-14", 1.0), _barra("2024-01-18", 9.0)]
+    assert qm.close_near_from_bars(solo, "2024-01-12", 5) == pytest.approx(1.0)
+
+
+def test_plan_bkm_history_budget_keeps_a_ranked_prefix():
+    ranked = [
+        {"ticker": "AAA", "us": True, "mfis_ok": True, "n_pending": 10},
+        {"ticker": "BBB.L", "us": False, "mfis_ok": False, "n_pending": 10},
+        {"ticker": "CCC", "us": True, "mfis_ok": False, "n_pending": 10, "motivo": "mfis_inadmisible"},
+        {"ticker": "DDD", "us": True, "mfis_ok": True, "n_pending": 0},
+        {"ticker": "EEE", "us": True, "mfis_ok": True, "n_pending": 10},
+        {"ticker": "FFF", "us": True, "mfis_ok": True, "n_pending": 10},
+    ]
+    # 1 + 26 = 27 por fecha. 2 min * 300/min = 600 llamadas.
+    # AAA 270, DDD 0, EEE 270, FFF no cabe (810).
+    plan = qm.plan_bkm_history_budget(
+        ranked, contracts_per_date=26, calls_per_min=300, max_minutes=2, spent_calls=0)
+    assert plan["procesar"] == ["AAA", "DDD", "EEE"]
+    assert [o["ticker"] for o in plan["omitidos"]] == ["FFF"]
+    assert plan["omitidos"][0]["motivo"] == "historia_no_procesada_presupuesto"
+    assert plan["n_us_mfis"] == 4
+    fuera = {f["ticker"]: f["motivo"] for f in plan["fuera_de_historia"]}
+    assert fuera["BBB.L"] == "sin_opciones_us"
+    assert fuera["CCC"] == "mfis_inadmisible"
+    assert "BBB.L" not in plan["procesar"] and "CCC" not in plan["procesar"]
+
+    # Con todo en cache el presupuesto chico igual procesa a los elegibles.
+    en_cache = [
+        {"ticker": "AAA", "us": True, "mfis_ok": True, "n_pending": 0},
+        {"ticker": "EEE", "us": True, "mfis_ok": True, "n_pending": 0},
+    ]
+    plan_cache = qm.plan_bkm_history_budget(
+        en_cache, contracts_per_date=26, calls_per_min=5, max_minutes=1, spent_calls=0)
+    assert plan_cache["procesar"] == ["AAA", "EEE"]
+    assert plan_cache["omitidos"] == []
+    assert plan_cache["llamadas"] == 0
+
+    # No es todo o nada: el que cabe entra, aunque el total no quepa.
+    justo = [
+        {"ticker": "AAA", "us": True, "mfis_ok": True, "n_pending": 1},
+        {"ticker": "EEE", "us": True, "mfis_ok": True, "n_pending": 10},
+    ]
+    # 81 llamadas: AAA (27) entra entero y sobran 54, que calientan 2 fechas de EEE.
+    plan_justo = qm.plan_bkm_history_budget(
+        justo, contracts_per_date=26, calls_per_min=81, max_minutes=1, spent_calls=0)
+    assert plan_justo["procesar"] == ["AAA"]
+    assert plan_justo["omitidos"][0]["ticker"] == "EEE"
+    assert plan_justo["calentar"]["ticker"] == "EEE"
+    assert plan_justo["calentar"]["n_fechas"] == 2
+
+
+def test_constrained_frontier_passes_through_the_optimum():
+    import quadprog
+
+    cov = np.array([[0.04, 0.01, 0.00],
+                    [0.01, 0.09, 0.00],
+                    [0.00, 0.00, 0.02]])
+    mu = np.array([0.01, 0.03, 0.015])
+    lambda_ref = 2.5
+
+    def solve(lam):
+        n = 3
+        g = cov + np.eye(n) * 1e-8
+        a = mu / float(lam)
+        c = np.column_stack([np.ones(n), np.eye(n)])
+        b = np.array([1.0, 0.0, 0.0, 0.0])
+        return quadprog.solve_qp(g, a, c, b, meq=1)[0]
+
+    w_opt = solve(lambda_ref)
+    curva = qm.frontier_curve(solve, cov, mu, qm.frontier_lambda_grid(lambda_ref), lambda_utility=lambda_ref)
+    fila = curva.iloc[(curva["lambda_"] - lambda_ref).abs().argmin()]
+    assert fila["lambda_"] == pytest.approx(lambda_ref)
+    assert fila["risk"] == pytest.approx(float(np.sqrt(w_opt @ cov @ w_opt)))
+    assert fila["ret"] == pytest.approx(float(w_opt @ mu))
+
+
+def test_lambda_scores_use_the_reference_lambda_and_mu_final():
+    mu_final = np.array([0.02, 0.01])
+    cov = np.array([[0.04, 0.0], [0.0, 0.01]])
+    w_agresivo = np.array([1.0, 0.0])
+    w_conservador = np.array([0.2, 0.8])
+    scored = qm.score_candidate_portfolios(
+        [(0.1, w_agresivo), (10.0, w_conservador)],
+        mu_final, cov, lambda_ref=10.0)
+    # Al lambda 0.1 la utilidad del agresivo seria mayor. Al lambda de
+    # referencia 10 gana el conservador, y el retorno es w'mu_final.
+    mejor = scored.loc[scored["utilidad"].idxmax(), "lambda_"]
+    assert mejor == pytest.approx(10.0)
+    agresivo = scored.loc[np.isclose(scored["lambda_"], 0.1)].iloc[0]
+    assert agresivo["ret"] == pytest.approx(0.02)
+    assert agresivo["utilidad"] == pytest.approx(0.02 - 5.0 * 0.04)
+    assert 0.8 in qm.comparison_lambdas(0.8)

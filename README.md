@@ -103,17 +103,17 @@ Create a `.env` file in the repository root (it is covered by `.gitignore`):
 
 ```env
 POLYGON_API_KEY=your_api_key_here
-POLYGON_CALLS_PER_MIN=300
+POLYGON_CALLS_PER_MIN=1200
 ```
 
 | Variable | Role |
 |---|---|
 | `POLYGON_API_KEY` | Polygon key. Without it, every options call returns `sin_api_key` and is not retried. `black_litterman.py` with `USAR_IV_POLYGON = True` stops at startup. The other optimizers continue on the historical fallback and print why each ticker missed the chain. |
-| `POLYGON_CALLS_PER_MIN` | Rate cap. Default **300** (5 calls/second), meant for paid plans that still answer 429 under bursts. Use `5` on the free tier. `0`, `none`, or `unlimited` turns the limiter off. |
-| `POLYGON_SNAPSHOT_TTL_MIN` | Snapshot cache TTL in minutes (default 60; `0` disables it). |
-| `POLYGON_CACHE_DIR` | Cache directory (default `.cache/polygon`). |
+| `POLYGON_CALLS_PER_MIN` | Rate cap. Default **1200** (20 calls/second). The paid options plan does not publish a hard cap; stay under 100 requests/second. Use `5` on the free tier. `0`, `none`, or `unlimited` turns the limiter off. |
+| `POLYGON_SNAPSHOT_TTL_MIN` | Kept for compatibility. Live snapshots and anything dated today are not written to the cache. |
+| `POLYGON_CACHE_DIR` | Cache directory, shared across runs. Default `~/.cache/am-pm/polygon` (outside the repo and the run folder). |
 
-`bkm_hist_max_minutes` (default **60**, top of `quadratic_utility.py` and its seasonal copy) is not an environment variable. Before rebuilding historical MFIS, the script estimates minutes as pending contract calls divided by `POLYGON_CALLS_PER_MIN`. Above that budget it skips the historical z-score and still computes the live moments. A cold `mfis_hist_v2` cache on the full OTM chain is expected to hit the cap; later runs only pay uncached dates. The estimate assumes about `bkm_hist_contracts_estimate` (40) priced contracts per date.
+`bkm_hist_max_minutes` (default **60**, top of `quadratic_utility.py` and its seasonal copy) is a budget, not a switch that skips the whole historical z-score. The script counts only US tickers with a finite current MFIS, charges about `bkm_hist_contracts_estimate` (26) priced contracts per uncached date, and walks the candidate ranking until the call budget is used. Names that do not fit are logged as `historia_no_procesada_presupuesto` (they stay in the book, and the log says they were not scored). Each OTM contract's daily aggregates are requested once for the span of sample dates, then sliced with the same ±5 day rule. The on-disk key is `mfis_hist_v3`. Only dates strictly before today are stored, so the next run pays the uncached dates. `bkm_max_workers` defaults to 12; the rate limiter is still global.
 
 **Parameters are edited in the configuration block at the top of each file.** There is no CLI. Run a script with `python script_name.py`. Plotly charts open in the browser.
 
@@ -159,7 +159,7 @@ Pipeline:
 3. **Joint candidate selection via QUBO/Ising**: brute force when the search space is small, simulated annealing otherwise.
 4. Filters: recent volatility, IV vs. realized volatility, and a **BKM MFIS** z-score. The historical MFIS series uses the same OTM rule and moneyness bounds as the live chain (real strikes, real DTE, unadjusted prices).
 5. Covariance is a **shrinkage between implied (BKM) and historical covariance**. The historical leg uses daily returns, bounded calendar alignment, EWMA, and Ledoit-Wolf. Implied vols use each chain's real DTE, then Q→P. A sector implied correlation needs at least `sector_implied_min_names` names (default 4); a two-name sector keeps the global correlation. Call deltas scale expected returns with `delta_scale_mode = "direct"` (the delta itself, clipped to `[delta_min, 1]`). `"minmax"` restores the old cross-sectional stretch. The script prints delta and multiplier per name.
-6. Optimizes with `quadprog`. Output: efficient frontier, lambda comparison, Greeks, maximum drawdown, and an executive summary. Annualization is return ×12 and vol ×√12 from the monthly figures (`qu_metrics.annualize_monthly`).
+6. Optimizes with `quadprog`. Output: the constrained efficient frontier (a lambda sweep of the same QP, plotted as σ = sqrt(w′Σw) against w′μ_final, so the optimum sits on the curve), a lambda comparison scored entirely at the configured lambda on μ_final, Greeks, maximum drawdown, and an executive summary. Annualization is return ×12 and vol ×√12 from the monthly figures (`qu_metrics.annualize_monthly`). The printed book return can still show raw μ; the frontier and the lambda figure use μ_final.
 
 Key parameters: `lambda_`, `lambda_annual`, `max_weight`, `horizon_months`, `target_total_tickers`, `bkm_z_threshold`, `bkm_tail_mode`, `bkm_hist_max_minutes`, `cornish_fisher_confidence`, `cov_halflife_days`, `use_q_to_p_vol`, `use_q_to_p_correlation`.
 
@@ -231,11 +231,11 @@ Tests cover the shared modules and the extracted optimizer logic (FX and calenda
 
 ## Notes on the Polygon API
 
-- The free *Stocks Basic* tier allows **5 calls per minute**. Set `POLYGON_CALLS_PER_MIN=5`. The default 300 assumes a paid plan.
+- The free *Stocks Basic* tier allows **5 calls per minute**. Set `POLYGON_CALLS_PER_MIN=5`. The default 1200 assumes the paid options plan (unlimited calls, keep the pace under 100 requests/second).
 - A full optimizer run walks hundreds of tickers. Lower `n_top_sp500`, `n_top_nasdaq`, and `target_total_tickers` for a short test.
-- `bkm_max_workers` is the BKM thread pool. Raise it only if the plan allows; the rate limiter is still global.
+- `bkm_max_workers` (default 12) is the BKM thread pool. The rate limiter is still global, so the threads share `POLYGON_CALLS_PER_MIN`.
 - When an options query fails, the ticker falls back to a historical estimate and the summary lists the reason. Read that table before trusting an "implied" book.
-- Historical MFIS in quadratic utility and a cold cache can exceed `bkm_hist_max_minutes`. The script says so and skips the z-score rather than running for hours.
+- Historical MFIS in quadratic utility spends `bkm_hist_max_minutes` on the highest-ranked US names that already have a finite current MFIS. The log prints how many received a z-score, how many were left unprocessed, and the elapsed seconds. The cache directory is `~/.cache/am-pm/polygon` unless `POLYGON_CACHE_DIR` is set. Today's option chain is not stored there.
 
 ---
 
