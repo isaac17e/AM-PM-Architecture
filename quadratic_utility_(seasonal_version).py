@@ -81,7 +81,6 @@ rf_rate = 0.047
 seed = 123
 max_weight = 0.30
 n_sim = 5000
-target_total_tickers = 500
 
 # ------------------------------------------------------------------------------
 # VENTANA DE ENTRENAMIENTO
@@ -936,23 +935,9 @@ all_tickers = [
     if not re.search(r"\^|\$", t) and 1 <= len(t) <= 5 and not re.match(r"^[0-9]", t) and t != ""
 ]
 
-if len(all_tickers) < target_total_tickers:
-    shortage = target_total_tickers - len(all_tickers)
-    if len(international_tickers_full) > n_top_int:
-        additional_int_available = international_tickers_full[n_top_int:]
-        additional_int_unique = [t for t in dict.fromkeys(x.upper() for x in additional_int_available)
-                                  if t not in all_tickers]
-        if additional_int_unique:
-            to_add_int = additional_int_unique[: shortage]
-            all_tickers = all_tickers + to_add_int
-            shortage -= len(to_add_int)
-    if shortage > 0 and nasdaq_tbl_clean is not None and len(nasdaq_tbl_clean) > len(nasdaq_tickers):
-        additional_nasdaq_available = nasdaq_tbl_clean["symbol"].iloc[len(nasdaq_tickers):].unique().tolist()
-        additional_nasdaq_unique = [t for t in additional_nasdaq_available if t not in all_tickers]
-        if additional_nasdaq_unique:
-            to_add_nasdaq = additional_nasdaq_unique[: shortage]
-            all_tickers = all_tickers + to_add_nasdaq
-
+# Sin relleno hasta un total objetivo: el universo es exactamente el top N por
+# market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
+# mid-caps ($10-50B) que el optimizador terminaba favoreciendo.
 all_tickers = list(dict.fromkeys(all_tickers))
 print(f"Total tickers FINAL (unicos): {len(all_tickers)}")
 

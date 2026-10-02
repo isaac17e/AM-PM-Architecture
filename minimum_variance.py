@@ -58,7 +58,6 @@ benchmark = "SPY"
 n_top_sp500 = 80
 n_top_nasdaq = 80
 n_top_international = 15
-target_total_tickers = 200
 
 # ------------------------------------------------------------------------------
 # HORIZONTE DE DATOS HISTORICOS
@@ -409,32 +408,9 @@ tickers_domesticos_ok = [
 
 all_tickers = list(dict.fromkeys(tickers_domesticos_ok + international_tickers_clean))
 
-if target_total_tickers > 0 and len(all_tickers) < target_total_tickers:
-    shortage = target_total_tickers - len(all_tickers)
-    print(f"[INFO] Poblacion ({len(all_tickers)}) por debajo del objetivo ({target_total_tickers}) "
-          f"- completando {shortage} tickers...")
-
-    if len(international_tickers_full) > n_top_international:
-        extra_intl = [t for t in dict.fromkeys(x.upper() for x in international_tickers_full[n_top_international:])
-                      if t not in all_tickers]
-        if extra_intl:
-            to_add = extra_intl[:shortage]
-            all_tickers = list(dict.fromkeys(all_tickers + to_add))
-            shortage -= len(to_add)
-            print(f"  + {len(to_add)} internacionales adicionales")
-
-    if shortage > 0 and nasdaq_tbl_clean is not None and len(nasdaq_tbl_clean) > len(nasdaq_tickers):
-        extra_nasdaq = [t for t in nasdaq_tbl_clean["symbol"].iloc[len(nasdaq_tickers):].unique().tolist()
-                         if t not in all_tickers]
-        if extra_nasdaq:
-            to_add = extra_nasdaq[:shortage]
-            all_tickers = list(dict.fromkeys(all_tickers + to_add))
-            shortage -= len(to_add)
-            print(f"  + {len(to_add)} NASDAQ adicionales")
-
-    if shortage > 0:
-        print(f"  ADVERTENCIA: No se pudo alcanzar target_total_tickers; faltan {shortage}")
-
+# Sin relleno hasta un total objetivo: el universo es exactamente el top N por
+# market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
+# mid-caps que el optimizador terminaba favoreciendo.
 all_tickers = list(dict.fromkeys(all_tickers))
 if dedupe_share_classes:
     all_tickers, _clases = md.dedupe_share_classes(all_tickers, share_class_groups)
@@ -495,8 +471,7 @@ print(f"- ETFs (todas las categorias):                {len(etf_tickers)}")
 print(f"- Commodities:                                {len(commodity_tickers)}")
 print(f"- Internacionales (top {n_top_international} de {len(international_tickers_full)}): "
       f"{len(international_tickers)}")
-print(f"- Objetivo de poblacion total (target_total_tickers): {target_total_tickers}")
-print(f"- Total unicos tras combinar + rellenar:      {len(all_tickers)}\n")
+print(f"- Total unicos tras combinar:                {len(all_tickers)}\n")
 
 # ==============================================================================
 # SECCION 5: DESCARGA Y PREPARACION DE DATOS
