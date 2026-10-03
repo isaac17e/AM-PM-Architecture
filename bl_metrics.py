@@ -41,6 +41,7 @@ __all__ = [
     "seleccionar_vencimientos",
     "ssvi_monotone_mask",
     "forward_por_paridad",
+    "tope_k_ssvi",
     "calibrar_superficie_ssvi",
     "momentos_fallback",
     "elegir_spot_momentos",
@@ -569,18 +570,40 @@ def _fecha_naive(hoy):
     return hoy.normalize()
 
 
+def tope_k_ssvi(sigma_atm, t_years, k_abs_max=0.5, k_sd_max=3.0):
+    """|k| maximo de un vencimiento.
+
+    El menor entre el tope absoluto y `k_sd_max * sigma_ATM * sqrt(T)`.
+    En un plazo de una semana 3 sigma queda cerca de 0.10, asi que un put
+    con k ~ -0.5 no entra al ajuste. `k_sd_max` None deja solo el tope
+    absoluto. Sin tope absoluto el resultado puede ser infinito.
+    """
+    if k_abs_max is None or not np.isfinite(k_abs_max):
+        tope = np.inf
+    else:
+        tope = float(k_abs_max)
+    if k_sd_max is None or not np.isfinite(k_sd_max):
+        return float(tope)
+    sig = float(sigma_atm)
+    t = float(t_years)
+    if not (np.isfinite(sig) and sig > 0 and np.isfinite(t) and t > 0):
+        return float(tope)
+    return float(min(tope, float(k_sd_max) * sig * math.sqrt(t)))
+
+
 def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
                              max_dias=243, min_vencimientos=3, k_abs_max=0.5,
-                             precio_min=0.10, oi_min=10.0, rho_abs_max=0.95,
-                             k_side_min=0.10, min_per_side=2, rmse_rel_max=0.20,
-                             normalizar_vencimiento=True):
+                             k_sd_max=3.0, precio_min=0.10, oi_min=10.0,
+                             rho_abs_max=0.95, k_side_min=0.10, min_per_side=2,
+                             rmse_rel_max=0.20, normalizar_vencimiento=True):
     """Ajusta una SSVI conjunta a una cadena ya parseada.
 
     `df` lleva strike, expiracion, tipo, iv y, si existen, precio, oi y spot.
     Recorta vencimientos a [min_dias, max_dias], tira precios chicos, OI
     conocido bajo el piso y violaciones de monotonia, y normaliza la perdida
-    por vencimiento. Devuelve el mismo dict que usa Black-Litterman. Lanza
-    ValueError si no queda volatilidad ATM.
+    por vencimiento. Cada plazo entra solo hasta
+    min(k_abs_max, k_sd_max * sigma_ATM * sqrt(T)). Devuelve el mismo dict
+    que usa Black-Litterman. Lanza ValueError si no queda volatilidad ATM.
     """
     df = pd.DataFrame(df).copy()
     for col in ("precio", "oi", "spot", "iv"):
@@ -614,6 +637,7 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
     n_drop_precio = 0
     n_drop_oi = 0
     n_drop_monotonia = 0
+    n_drop_k_sd = 0
     puntos = []
     theta_guess = []
     t_years = []
@@ -656,15 +680,9 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
         otm_put = df_exp[(df_exp["tipo"] == "put") & (df_exp["k"] < 0)]
         otm_call = df_exp[(df_exp["tipo"] == "call") & (df_exp["k"] >= 0)]
         otm = pd.concat([otm_put, otm_call]).drop_duplicates(subset="strike")
-        ventana = otm[otm["k"].abs() <= float(k_abs_max)].copy()
-        if len(ventana) < int(min_strikes):
-            continue
 
-        ventana["w"] = ventana["iv"].to_numpy(dtype=float) ** 2 * T_anios
-        ventana = ventana.sort_values("k")
-        pesos = ssvi_weights(
-            ventana["k"].to_numpy(), ventana["w"].to_numpy(), ventana["oi"].to_numpy())
-
+        # sigma ATM del propio vencimiento, antes de recortar las alas: el
+        # interp en k=0 no usa el put profundo.
         ancho = otm[otm["k"].abs() <= 1.0]
         if (ancho["k"] < 0).any() and (ancho["k"] >= 0).any():
             base = ancho.sort_values("k")
@@ -677,6 +695,25 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
             theta0 = np.nan
         if not np.isfinite(theta0) or theta0 <= 0:
             continue
+
+        k_lim = tope_k_ssvi(
+            math.sqrt(theta0 / T_anios), T_anios,
+            k_abs_max=k_abs_max, k_sd_max=k_sd_max)
+        k_abs = otm["k"].abs().to_numpy(dtype=float)
+        if k_abs_max is None or not np.isfinite(k_abs_max):
+            dentro_abs = np.ones(len(otm), dtype=bool)
+        else:
+            dentro_abs = k_abs <= float(k_abs_max) + 1e-12
+        dentro_lim = k_abs <= float(k_lim) + 1e-12
+        n_drop_k_sd += int(np.sum(dentro_abs & ~dentro_lim))
+        ventana = otm.iloc[np.flatnonzero(dentro_lim)].copy()
+        if len(ventana) < int(min_strikes):
+            continue
+
+        ventana["w"] = ventana["iv"].to_numpy(dtype=float) ** 2 * T_anios
+        ventana = ventana.sort_values("k")
+        pesos = ssvi_weights(
+            ventana["k"].to_numpy(), ventana["w"].to_numpy(), ventana["oi"].to_numpy())
 
         idx = len(puntos)
         puntos.append(pd.DataFrame({
@@ -752,6 +789,7 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
         n_drop_precio=int(n_drop_precio), n_drop_oi=int(n_drop_oi),
         n_drop_monotonia=int(n_drop_monotonia),
         n_drop_higiene=int(n_drop_precio + n_drop_oi + n_drop_monotonia),
+        n_drop_k_sd=int(n_drop_k_sd), k_sd_max=k_sd_max,
         motivo_fallback=motivo_fallback,
     )
 

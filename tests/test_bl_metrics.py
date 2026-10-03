@@ -367,7 +367,7 @@ def _precios_con_paridad(f, k, t, r=0.02):
     return call, put
 
 
-def _cadena_ssvi(hoy, rho, eta, gamma, vol, dias_list, rho_por_dias=None):
+def _cadena_ssvi(hoy, rho, eta, gamma, vol, dias_list, rho_por_dias=None, k_span=0.30):
     filas = []
     r = 0.02
     for dias in dias_list:
@@ -375,7 +375,7 @@ def _cadena_ssvi(hoy, rho, eta, gamma, vol, dias_list, rho_por_dias=None):
         theta = vol ** 2 * t
         f = 100.0 * np.exp(r * t)
         rho_d = rho if rho_por_dias is None else rho_por_dias.get(dias, rho)
-        for k in np.linspace(-0.30, 0.30, 9):
+        for k in np.linspace(-k_span, k_span, 9):
             strike = float(f * np.exp(k))
             w = float(bm.ssvi_total_variance([k], theta, rho_d, eta, gamma)[0])
             iv = float(np.sqrt(max(w, 1e-12) / t))
@@ -420,3 +420,64 @@ def test_calibrar_superficie_ignora_leaps_y_quotes_rotos():
     assert sup["n_drop_oi"] >= 1
     assert sup["n_drop_monotonia"] >= 1
     assert sup["spot_cadena"] == pytest.approx(100.0)
+
+
+def test_tope_k_ssvi_es_el_minimo_entre_el_absoluto_y_tres_sigma():
+    # 7 dias, 30% anual: 3 sigma * sqrt(T) ~ 0.12, por debajo del tope 0.5.
+    t = 7 / 365.0
+    corto = bm.tope_k_ssvi(0.30, t, k_abs_max=0.5, k_sd_max=3.0)
+    assert corto == pytest.approx(3.0 * 0.30 * np.sqrt(t))
+    assert corto < 0.5
+    # Un plazo largo choca con el tope absoluto.
+    largo = bm.tope_k_ssvi(0.30, 200 / 365.0, k_abs_max=0.5, k_sd_max=3.0)
+    assert largo == pytest.approx(0.5)
+    assert bm.tope_k_ssvi(0.30, t, k_abs_max=0.5, k_sd_max=None) == pytest.approx(0.5)
+
+
+def test_ventana_k_sd_excluye_el_ala_vieja_que_rechazaba_la_sonrisa():
+    """Un put profundo en el vencimiento de 7 dias (k~-0.46, IV rota).
+
+    Con solo el tope |k|<=0.5 entra al ajuste y la perdida de ese plazo
+    rechaza la superficie. Con 3 sigma * sqrt(T) queda fuera y la sonrisa
+    calibra.
+    """
+    hoy = pd.Timestamp("2026-10-02")
+    rho, eta, gamma, vol = -0.30, 0.50, 0.40, 0.30
+    # k_span por dentro de 3 sigma aun en el plazo de 30 dias, para que el
+    # unico punto que saque la ventana sea el ala vieja.
+    cadena = _cadena_ssvi(
+        hoy, rho, eta, gamma, vol, dias_list=(30, 90, 180), k_span=0.20)
+    r = 0.02
+    dias = 7
+    t = dias / 365.0
+    theta = vol ** 2 * t
+    f = 100.0 * np.exp(r * t)
+    exp = hoy + pd.Timedelta(days=dias)
+    filas = []
+    for k in (-0.08, -0.04, 0.0, 0.04, 0.08):
+        strike = float(f * np.exp(k))
+        w = float(bm.ssvi_total_variance([k], theta, rho, eta, gamma)[0])
+        iv = float(np.sqrt(max(w, 1e-12) / t))
+        px_call, px_put = _precios_con_paridad(f, strike, t, r)
+        base = dict(strike=strike, expiracion=exp, iv=iv, oi=500.0, spot=100.0)
+        filas.append({**base, "tipo": "call", "precio": float(px_call)})
+        filas.append({**base, "tipo": "put", "precio": float(px_put)})
+    # El ala: dentro de |k|<=0.5, precio por encima del piso, OI liquido.
+    k_ala = -0.46
+    filas.append(dict(
+        strike=float(f * np.exp(k_ala)), expiracion=exp, tipo="put",
+        iv=1.85, precio=0.50, oi=200.0, spot=100.0))
+    cadena = pd.concat([cadena, pd.DataFrame(filas)], ignore_index=True)
+    comun = dict(tau_obj=4 / 12, hoy=hoy, max_dias=243, min_vencimientos=3,
+                 k_abs_max=0.5, precio_min=0.10, oi_min=10)
+    sin_ventana = bm.calibrar_superficie_ssvi(cadena, k_sd_max=None, **comun)
+    con_ventana = bm.calibrar_superficie_ssvi(cadena, k_sd_max=3.0, **comun)
+    assert not sin_ventana["aceptado"]
+    assert sin_ventana["rmse_rel"] > 0.20
+    assert sin_ventana["n_drop_k_sd"] == 0
+    assert sin_ventana["k_min"] == pytest.approx(k_ala, abs=0.02)
+    assert con_ventana["aceptado"] and con_ventana["usar_alas"]
+    assert con_ventana["rmse_rel"] <= 0.20
+    assert con_ventana["n_drop_k_sd"] == 1
+    assert con_ventana["k_min"] > -0.40
+    assert con_ventana["rho"] == pytest.approx(rho, abs=0.12)

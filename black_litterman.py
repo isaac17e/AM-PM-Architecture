@@ -168,6 +168,10 @@ SSVI_OI_MIN = 10
 # Un plazo largo deja de dominar la perdida en w = sigma^2 T.
 SSVI_NORMALIZAR_VENCIMIENTO = True
 SSVI_K_ABS_MAX = 0.5
+# Por vencimiento, |k| <= min(SSVI_K_ABS_MAX, SSVI_K_SD_MAX * sigma_ATM * sqrt(T)).
+# En una semana 3 sigma es ~0.10: un put profundo y viejo (k ~ -0.5, IV rota)
+# no entra al ajuste. La integral BKM sigue en +/- BKM_N_STD sigma.
+SSVI_K_SD_MAX = 3.0
 # |rho| cerca de tanh(3.8) ~ 0.999 es la cota del optimizador, no una sonrisa.
 # Sin strikes de los dos lados rho tampoco se identifica. Esas alas no entran
 # a BKM; se conserva la vol ATM.
@@ -293,6 +297,8 @@ if MAX_DIAS_VENCIMIENTO < MIN_DIAS_VENCIMIENTO:
     raise ValueError("MAX_DIAS_VENCIMIENTO debe ser >= MIN_DIAS_VENCIMIENTO")
 if SSVI_PRECIO_MIN < 0 or SSVI_OI_MIN < 0:
     raise ValueError("SSVI_PRECIO_MIN y SSVI_OI_MIN no pueden ser negativos")
+if SSVI_K_SD_MAX is not None and (not np.isfinite(SSVI_K_SD_MAX) or SSVI_K_SD_MAX <= 0):
+    raise ValueError("SSVI_K_SD_MAX debe ser positivo")
 
 rng_global = np.random.default_rng(SEMILLA)
 
@@ -439,6 +445,7 @@ if USAR_IV_POLYGON:
           f"(minimo {MIN_VENCIMIENTOS_SSVI} si el tope deja menos) | "
           f"perdida normalizada por vencimiento: {SSVI_NORMALIZAR_VENCIMIENTO} | "
           f"precio >= {SSVI_PRECIO_MIN:.2f} | OI >= {SSVI_OI_MIN:g} | "
+          f"|k| <= min({SSVI_K_ABS_MAX}, {SSVI_K_SD_MAX:g}*sigma*sqrt(T)) | "
           f"fallback de momentos: {FALLBACK_MOMENTOS}\n")
 
     def polygon_fetch_chain(ticker, api_key, max_pages=40):
@@ -498,7 +505,8 @@ if USAR_IV_POLYGON:
             df, tau_obj, pd.Timestamp(date.today()),
             min_strikes=min_strikes, min_dias=min_dias,
             max_dias=MAX_DIAS_VENCIMIENTO, min_vencimientos=MIN_VENCIMIENTOS_SSVI,
-            k_abs_max=SSVI_K_ABS_MAX, precio_min=SSVI_PRECIO_MIN, oi_min=SSVI_OI_MIN,
+            k_abs_max=SSVI_K_ABS_MAX, k_sd_max=SSVI_K_SD_MAX,
+            precio_min=SSVI_PRECIO_MIN, oi_min=SSVI_OI_MIN,
             rho_abs_max=SSVI_RHO_ABS_MAX, k_side_min=SSVI_K_SIDE_MIN,
             min_per_side=SSVI_MIN_PER_SIDE,
             normalizar_vencimiento=SSVI_NORMALIZAR_VENCIMIENTO)
@@ -522,6 +530,7 @@ if USAR_IV_POLYGON:
             extra += (f" | higiene precio={resultado.get('n_drop_precio', 0)}"
                       f" oi={resultado.get('n_drop_oi', 0)}"
                       f" monotonia={resultado.get('n_drop_monotonia', 0)}")
+        extra += f" | ventana_k={int(resultado.get('n_drop_k_sd') or 0)}"
         return (f"vencimientos: {resultado.get('n_vencimientos')}/"
                 f"{resultado.get('n_vencimientos_cadena', '?')} | "
                 f"DTE {dte} (tope {resultado.get('max_dias', MAX_DIAS_VENCIMIENTO)}) | "
