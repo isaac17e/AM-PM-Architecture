@@ -12,6 +12,8 @@
 #   M-1  longitud minima por ticker, sin recortar el panel a la serie mas corta
 #   M-10 cesta de dispersion: componentes con IV, cap-weighted si hay caps
 #   A-5  seleccion historica de cadena OTM con strikes y DTE reales
+#   E-1  piso de ETF alcanzable, reposiciones que respetan los filtros duros
+#        y chequeo de factibilidad de las restricciones antes de quadprog
 # ==============================================================================
 
 import math
@@ -60,6 +62,15 @@ __all__ = [
     "comparison_lambdas",
     "score_candidate_portfolios",
     "mfiv_annual_vol",
+    "etfs_necesarios",
+    "contar_etfs",
+    "reserva_etf",
+    "candidatos_reposicion",
+    "completar_etfs",
+    "siguiente_reposicion",
+    "restricciones_factibles",
+    "diagnostico_banda_etf",
+    "relajar_banda_etf",
 ]
 
 
@@ -860,3 +871,179 @@ def mfiv_annual_vol(mfiv, dte):
     if np.ndim(vol) == 0:
         vol = float(vol)
     return vol
+
+
+# ==============================================================================
+# E-1 PISO DE ETF, REPOSICIONES Y FACTIBILIDAD DE RESTRICCIONES
+# ==============================================================================
+# Precedencia (la misma que documenta quadratic_utility.py):
+#   1. Los descartes de los filtros duros (delta, IV vs vol. reciente y MFIS)
+#      no se revierten: ni la reposicion por piso de sobrevivientes ni la de
+#      ETF puede traer de vuelta un nombre que uno de ellos ya saco.
+#   2. El umbral de vol. reciente y el techo n_filter_candidates son blandos,
+#      igual que en su propio piso de sobrevivientes: la reposicion toma
+#      candidatos en orden ascendente de ratio aunque esten por encima.
+#   3. Si faltan ETF para el piso de la banda, la reposicion prioriza ETF.
+#   4. Si aun asi el piso no es alcanzable, el chequeo de factibilidad lo
+#      relaja al maximo alcanzable (o detiene la corrida) con un aviso claro.
+
+def etfs_necesarios(etf_floor, max_weight, tol=1e-9):
+    """ETF minimos para que el piso de la banda sea alcanzable.
+
+    Con tope por activo `max_weight`, n ETF suman como mucho n * max_weight.
+    Piso 0.45 y tope 0.12 piden ceil(3.75) = 4. Piso <= 0 no pide ninguno.
+    """
+    floor = float(etf_floor)
+    if not math.isfinite(floor) or floor <= tol:
+        return 0
+    mw = float(max_weight)
+    if not (math.isfinite(mw) and mw > 0):
+        raise ValueError("max_weight debe ser finito y > 0")
+    return int(math.ceil(floor / mw - tol))
+
+
+def contar_etfs(tickers, etf_set):
+    """Cuantos de `tickers` (sin repetir) son ETF o commodities."""
+    etf_set = set(etf_set)
+    return sum(1 for t in dict.fromkeys(tickers) if t in etf_set)
+
+
+def reserva_etf(ranking, seleccionados, etf_set, n_objetivo):
+    """ETF de una etapa previa que no entraron a la seleccion.
+
+    Recorre `ranking` en orden y devuelve los ETF que faltan para que la
+    seleccion mas la reserva sumen `n_objetivo` ETF. La reserva no entra al
+    flujo: solo se usa si el piso de ETF la necesita.
+    """
+    falta = int(n_objetivo) - contar_etfs(seleccionados, etf_set)
+    if falta <= 0:
+        return []
+    etf_set = set(etf_set)
+    sel = set(seleccionados)
+    out = []
+    for t in dict.fromkeys(ranking):
+        if t in etf_set and t not in sel:
+            out.append(t)
+            if len(out) >= falta:
+                break
+    return out
+
+
+def candidatos_reposicion(ordenados, actuales, descartados=(), rechaza=None):
+    """Orden de reposicion sin los actuales ni los descartados por filtros duros.
+
+    `descartados` son nombres que un filtro duro ya saco (por ejemplo IV vs
+    vol. reciente). `rechaza(t)`, si se da, aplica ese mismo filtro a nombres
+    que nunca pasaron por el, y los saca si no lo superan.
+    """
+    act = set(actuales)
+    desc = set(descartados)
+    out = []
+    for t in dict.fromkeys(ordenados):
+        if t in act or t in desc:
+            continue
+        if rechaza is not None and rechaza(t):
+            continue
+        out.append(t)
+    return out
+
+
+def completar_etfs(actuales, candidatos, etf_set, n_necesarios):
+    """ETF a agregar, en el orden de `candidatos`, hasta tener `n_necesarios`."""
+    falta = int(n_necesarios) - contar_etfs(actuales, etf_set)
+    if falta <= 0:
+        return []
+    etf_set = set(etf_set)
+    act = set(actuales)
+    out = []
+    for t in dict.fromkeys(candidatos):
+        if t in etf_set and t not in act:
+            out.append(t)
+            if len(out) >= falta:
+                break
+    return out
+
+
+def siguiente_reposicion(pool, usados, etf_set=(), priorizar_etf=False, solo_etf=False):
+    """Siguiente reemplazo del pool que aun no se uso.
+
+    priorizar_etf: el primer ETF libre si lo hay; si no, el primero libre.
+    solo_etf: solo un ETF (None si no queda ninguno).
+    """
+    etf_set = set(etf_set)
+    usados = set(usados)
+    libres = [t for t in dict.fromkeys(pool) if t not in usados]
+    if priorizar_etf or solo_etf:
+        for t in libres:
+            if t in etf_set:
+                return t
+        if solo_etf:
+            return None
+    return libres[0] if libres else None
+
+
+def restricciones_factibles(Amat, bvec, meq=0, tol=1e-9):
+    """True si existe w con A[:, :meq].T w == b[:meq] y A[:, meq:].T w >= b[meq:].
+
+    Mismo formato que quadprog.solve_qp (columnas = restricciones). Se resuelve
+    un LP sin objetivo con HiGHS; `tol` absorbe redondeo en las cotas.
+    """
+    from scipy.optimize import linprog
+
+    A = np.asarray(Amat, dtype=float)
+    b = np.asarray(bvec, dtype=float)
+    if A.ndim != 2 or A.shape[1] != b.size:
+        raise ValueError("Amat debe ser n x m y bvec de largo m")
+    n = A.shape[0]
+    meq = int(meq)
+    kwargs = {}
+    if meq > 0:
+        kwargs["A_eq"] = A[:, :meq].T
+        kwargs["b_eq"] = b[:meq]
+    if A.shape[1] > meq:
+        kwargs["A_ub"] = -A[:, meq:].T
+        kwargs["b_ub"] = -b[meq:] + tol
+    res = linprog(np.zeros(n), bounds=[(None, None)] * n, method="highs", **kwargs)
+    return bool(res.status == 0)
+
+
+def diagnostico_banda_etf(n_etf, n_acciones, max_weight, etf_lo, etf_hi, tol=1e-9):
+    """Razones legibles por las que la banda de ETF y los topes no cierran.
+
+    Lista vacia si los conteos alcanzan (la combinacion con los topes
+    regionales puede seguir fallando; eso lo decide restricciones_factibles).
+    """
+    mw = float(max_weight)
+    cap_etf = n_etf * mw
+    cap_acc = n_acciones * mw
+    razones = []
+    if (n_etf + n_acciones) * mw < 1 - tol:
+        razones.append(
+            f"{n_etf + n_acciones} activos x max_weight {mw:.2f} = {(n_etf + n_acciones) * mw:.0%} "
+            f"no alcanza el 100% del portafolio")
+    if cap_etf < etf_lo - tol:
+        razones.append(
+            f"piso de ETF {etf_lo:.0%} inalcanzable: {n_etf} ETF x max_weight {mw:.2f} = {cap_etf:.0%} "
+            f"(se necesitan al menos {etfs_necesarios(etf_lo, mw)} ETF)")
+    stk_lo = 1 - etf_hi
+    if cap_acc < stk_lo - tol:
+        razones.append(
+            f"piso de acciones {stk_lo:.0%} (1 - techo ETF {etf_hi:.0%}) inalcanzable: "
+            f"{n_acciones} acciones x max_weight {mw:.2f} = {cap_acc:.0%}")
+    return razones
+
+
+def relajar_banda_etf(n_etf, n_acciones, max_weight, etf_lo, etf_hi):
+    """Banda de ETF mas cercana a la pedida que los conteos pueden cumplir.
+
+    El piso baja a n_etf * max_weight si no se alcanza; el techo sube a
+    1 - n_acciones * max_weight si las acciones no llenan su parte. Lo que ya
+    era alcanzable no cambia.
+    """
+    mw = float(max_weight)
+    cap_etf = min(1.0, n_etf * mw)
+    cap_acc = min(1.0, n_acciones * mw)
+    lo = min(float(etf_lo), cap_etf)
+    hi = min(1.0, max(float(etf_hi), 1.0 - cap_acc))
+    lo = min(lo, hi)
+    return lo, hi
