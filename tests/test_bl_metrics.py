@@ -270,3 +270,153 @@ def test_log_portfolio_return_renormalizes_missing_names():
     w = pd.Series({"A": 0.25, "B": 0.75})
     assert bm.log_portfolio_return(r, w) == pytest.approx(np.log(1.10))
     assert np.isnan(bm.log_portfolio_return(pd.Series({"A": np.nan}), pd.Series({"A": 1.0})))
+
+
+# ------------------------------------------------------------------------------
+# Ventana de vencimientos, higiene, perdida por plazo y fallback de momentos
+# ------------------------------------------------------------------------------
+
+def test_seleccionar_vencimientos_corta_leaps_y_guarda_un_minimo():
+    dias = np.array([10, 40, 120, 240, 400, 800])
+    mask = bm.seleccionar_vencimientos(dias, max_dias=243, min_keep=3)
+    assert list(mask) == [True, True, True, True, False, False]
+    # Un solo vencimiento dentro del tope: se completan los dos mas cortos de afuera.
+    corto = bm.seleccionar_vencimientos(np.array([10, 400, 800]), 243, min_keep=3)
+    assert list(corto) == [True, True, True]
+    # Ya hay suficientes dentro del tope: el LEAP no entra.
+    ya = bm.seleccionar_vencimientos(np.array([10, 20, 400]), 243, min_keep=2)
+    assert list(ya) == [True, True, False]
+
+
+def test_ssvi_row_mask_drops_cheap_premiums_and_thin_oi():
+    mask = bm.ssvi_row_mask(
+        precio=[0.05, 0.10, 1.0, np.nan],
+        open_interest=[100, 9, 10, np.nan],
+        precio_min=0.10, oi_min=10)
+    assert list(mask) == [False, False, True, True]
+
+
+def test_ssvi_monotone_mask_drops_the_less_liquid_violator():
+    calls = bm.ssvi_monotone_mask(
+        [100, 105, 110, 115], [5.0, 6.0, 3.0, 2.5], ["call"] * 4, [100, 100, 100, 100])
+    assert list(calls) == [True, False, True, True]
+    puts = bm.ssvi_monotone_mask(
+        [100, 105, 110, 115], [1.0, 0.5, 2.0, 3.0], ["put"] * 4)
+    assert list(puts) == [True, False, True, True]
+    # El print del medio es el iliquido: se tira ese, no el ala.
+    medio = bm.ssvi_monotone_mask(
+        [100, 105, 110], [10.0, 1.0, 9.0], ["call"] * 3, [100, 1, 100])
+    assert list(medio) == [True, False, True]
+
+
+def test_fit_ssvi_normaliza_por_vencimiento_y_no_sigue_al_leap():
+    rho, eta, gamma = -0.40, 0.55, 0.45
+    k = np.linspace(-0.35, 0.35, 15)
+    th_s, th_l = 0.02, 0.45
+    w_s = bm.ssvi_total_variance(k, th_s, rho, eta, gamma)
+    w_l = bm.ssvi_total_variance(k, th_l, 0.85, eta, gamma)
+    k_all = np.concatenate([k, k])
+    w_all = np.concatenate([w_s, w_l])
+    th_row = np.concatenate([np.full(len(k), th_s), np.full(len(k), th_l)])
+    sl = np.concatenate([np.zeros(len(k)), np.ones(len(k))])
+    theta = np.array([th_s, th_l])
+    crudo = bm.fit_ssvi(
+        k_all, w_all, th_row, theta, sl, normalizar_vencimiento=False)
+    norm = bm.fit_ssvi(
+        k_all, w_all, th_row, theta, sl, normalizar_vencimiento=True)
+    assert crudo["rho"] > 0.4
+    assert norm["rho"] < crudo["rho"]
+    assert abs(norm["rho"] - rho) < abs(crudo["rho"] - rho)
+
+
+def test_momentos_fallback_historico_sector_y_neutro():
+    hist = bm.momentos_fallback("historico", skew_hist=-0.40, kurt_hist=3.80)
+    assert hist["fuente"] == "historico"
+    assert hist["mfis"] == pytest.approx(-0.40)
+    assert hist["mfik"] == pytest.approx(3.80)
+    neutro = bm.momentos_fallback("neutro", skew_hist=-0.40, kurt_hist=3.80)
+    assert neutro["fuente"] == "neutro"
+    assert neutro["mfis"] == 0.0 and neutro["mfik"] == 3.0
+    sector = bm.momentos_fallback(
+        "sector", -0.20, 3.20, skew_sector=-0.55, kurt_sector=4.10)
+    assert sector["fuente"] == "sector" and sector["mfis"] == pytest.approx(-0.55)
+    sin_etf = bm.momentos_fallback("sector", -0.20, 3.20, skew_sector=np.nan, kurt_sector=np.nan)
+    assert sin_etf["fuente"] == "historico"
+    # Curtosis por debajo de 1 + skew^2 no es un par posible: ultimo recurso, neutro.
+    roto = bm.momentos_fallback("historico", skew_hist=2.0, kurt_hist=3.0)
+    assert roto["fuente"] == "neutro"
+    with pytest.raises(ValueError):
+        bm.momentos_fallback("otro", 0.0, 3.0)
+
+
+def test_elegir_spot_momentos_usa_el_cierre_del_dia_o_la_cadena():
+    mismo = bm.elegir_spot_momentos(100.0, "2026-10-02", "2026-10-02", spot_cadena=103.8)
+    assert mismo["fuente"] == "cierre" and mismo["spot"] == pytest.approx(100.0)
+    # La barra de hoy no esta (yfinance end-exclusivo, o el diario todavia no cerro).
+    cadena = bm.elegir_spot_momentos(96.2, "2026-10-01", "2026-10-02", spot_cadena=100.0)
+    assert cadena["fuente"] == "cadena" and cadena["spot"] == pytest.approx(100.0)
+    previo = bm.elegir_spot_momentos(96.2, "2026-10-01", "2026-10-02", spot_cadena=np.nan)
+    assert previo["fuente"] == "cierre_previo" and previo["spot"] == pytest.approx(96.2)
+
+
+def _precios_con_paridad(f, k, t, r=0.02):
+    """Call y put con la misma constante, para que call - put = e^{-rT}(F-K)."""
+    disc = np.exp(-r * t)
+    call = disc * np.maximum(f - k, 0.0) + 2.0
+    put = disc * np.maximum(k - f, 0.0) + 2.0
+    return call, put
+
+
+def _cadena_ssvi(hoy, rho, eta, gamma, vol, dias_list, rho_por_dias=None):
+    filas = []
+    r = 0.02
+    for dias in dias_list:
+        t = dias / 365.0
+        theta = vol ** 2 * t
+        f = 100.0 * np.exp(r * t)
+        rho_d = rho if rho_por_dias is None else rho_por_dias.get(dias, rho)
+        for k in np.linspace(-0.30, 0.30, 9):
+            strike = float(f * np.exp(k))
+            w = float(bm.ssvi_total_variance([k], theta, rho_d, eta, gamma)[0])
+            iv = float(np.sqrt(max(w, 1e-12) / t))
+            px_call, px_put = _precios_con_paridad(f, strike, t, r)
+            base = dict(strike=strike, expiracion=hoy + pd.Timedelta(days=int(dias)),
+                        iv=iv, oi=500.0, spot=100.0)
+            filas.append({**base, "tipo": "call", "precio": float(px_call)})
+            filas.append({**base, "tipo": "put", "precio": float(px_put)})
+    return pd.DataFrame(filas)
+
+
+def test_calibrar_superficie_ignora_leaps_y_quotes_rotos():
+    hoy = pd.Timestamp("2026-10-02")
+    rho, eta, gamma = -0.35, 0.50, 0.40
+    cadena = _cadena_ssvi(
+        hoy, rho, eta, gamma, vol=0.32,
+        dias_list=(40, 90, 170, 700),
+        rho_por_dias={700: 0.95})
+    # Basura en el vencimiento de 90 dias: centavos, OI fino y un call que no es monotono.
+    exp90 = hoy + pd.Timedelta(days=90)
+    f90 = 100.0 * np.exp(0.02 * 90 / 365.0)
+    cadena = pd.concat([
+        cadena,
+        pd.DataFrame([
+            dict(strike=f90 * np.exp(-0.05), expiracion=exp90, tipo="put",
+                 iv=3.5, precio=0.03, oi=400.0, spot=100.0),
+            dict(strike=f90 * np.exp(0.05), expiracion=exp90, tipo="call",
+                 iv=3.5, precio=1.50, oi=2.0, spot=100.0),
+            dict(strike=f90 * np.exp(0.12), expiracion=exp90, tipo="call",
+                 iv=3.5, precio=80.0, oi=12.0, spot=100.0),
+        ]),
+    ], ignore_index=True)
+    sup = bm.calibrar_superficie_ssvi(
+        cadena, tau_obj=4 / 12, hoy=hoy, max_dias=243, min_vencimientos=3,
+        precio_min=0.10, oi_min=10)
+    assert sup["usar_alas"] and sup["fuente"] == "ssvi"
+    assert sup["n_vencimientos"] == 3
+    assert sup["n_vencimientos_cadena"] == 4
+    assert sup["dias_max"] <= 243
+    assert sup["rho"] == pytest.approx(rho, abs=0.08)
+    assert sup["n_drop_precio"] >= 1
+    assert sup["n_drop_oi"] >= 1
+    assert sup["n_drop_monotonia"] >= 1
+    assert sup["spot_cadena"] == pytest.approx(100.0)

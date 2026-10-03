@@ -15,7 +15,6 @@ import pandas as pd
 
 import yfinance as yf
 from scipy.optimize import minimize, linprog
-from scipy.interpolate import PchipInterpolator
 from scipy.stats import norm
 from scipy import sparse
 import quadprog
@@ -154,6 +153,20 @@ MDD_START_YEAR = date.today().year - 2
 USAR_IV_POLYGON = True
 MIN_STRIKES_SLICE = 5
 MIN_DIAS_VENCIMIENTO = 5
+# Tope de DTE (calendario) de la calibracion. 2x el horizonte: con 4 meses
+# son 243 dias. Los LEAPs (>~250d) quedaban fuera de la ventana de inversion
+# y, en varianza total, se comian la perdida y clavaban rho en la cota.
+# Si el recorte deja menos de MIN_VENCIMIENTOS_SSVI, se completan con los
+# vencimientos mas cortos por encima del tope.
+MAX_DIAS_VENCIMIENTO = int(round(2.0 * (MESES_HORIZONTE / 12.0) * 365.0))
+MIN_VENCIMIENTOS_SSVI = 3
+# Higiene de la cadena antes del ajuste. Precio bajo piso (centavos con IV
+# rota) u OI conocido por debajo del minimo no entran. OI ausente se conserva.
+SSVI_PRECIO_MIN = 0.10
+SSVI_OI_MIN = 10
+# True: cada vencimiento pesa igual y el residuo se divide por theta^2.
+# Un plazo largo deja de dominar la perdida en w = sigma^2 T.
+SSVI_NORMALIZAR_VENCIMIENTO = True
 SSVI_K_ABS_MAX = 0.5
 # |rho| cerca de tanh(3.8) ~ 0.999 es la cota del optimizador, no una sonrisa.
 # Sin strikes de los dos lados rho tampoco se identifica. Esas alas no entran
@@ -161,6 +174,21 @@ SSVI_K_ABS_MAX = 0.5
 SSVI_RHO_ABS_MAX = 0.95
 SSVI_K_SIDE_MIN = 0.10
 SSVI_MIN_PER_SIDE = 2
+# Momentos cuando la sonrisa se rechaza (rmse, rho en la cota, cadena rota).
+# "historico": skew y curtosis fisicos del ticker al horizonte.
+# "neutro": MFIS=0, MFIK=3.
+# "sector": sonrisa del ETF en FALLBACK_ETF_POR_TICKER; si no calibra, historico.
+FALLBACK_MOMENTOS = "historico"
+FALLBACK_ETF_POR_TICKER = {
+    "META": "XLK", "GOOGL": "XLK", "ORCL": "XLK", "DELL": "XLK", "MSFT": "XLK",
+    "CRM": "XLK", "CRWD": "XLK", "IT": "XLK",
+    "CMCSA": "XLC", "YELP": "XLC",
+    "BLK": "XLF", "GS": "XLF", "ARES": "XLF",
+    "REGN": "XLV",
+    "ABNB": "XLY", "LVS": "XLY", "EBAY": "XLY",
+    "BXP": "XLRE",
+    "EL": "XLP",
+}
 
 # ------------------------------------------------------------------------------
 # 9. MODULO ECONOMETRICO Q -> P (BLOQUE 1D)
@@ -259,6 +287,12 @@ if DELTA_MKT_MODO not in ("historical", "fixed", "implied"):
     raise ValueError("DELTA_MKT_MODO debe ser 'historical', 'fixed' o 'implied'")
 if not np.isfinite(DELTA_MKT_FIJO) or DELTA_MKT_FIJO <= 0:
     raise ValueError("DELTA_MKT_FIJO debe ser positivo")
+if FALLBACK_MOMENTOS not in ("historico", "neutro", "sector"):
+    raise ValueError("FALLBACK_MOMENTOS debe ser 'historico', 'neutro' o 'sector'")
+if MAX_DIAS_VENCIMIENTO < MIN_DIAS_VENCIMIENTO:
+    raise ValueError("MAX_DIAS_VENCIMIENTO debe ser >= MIN_DIAS_VENCIMIENTO")
+if SSVI_PRECIO_MIN < 0 or SSVI_OI_MIN < 0:
+    raise ValueError("SSVI_PRECIO_MIN y SSVI_OI_MIN no pueden ser negativos")
 
 rng_global = np.random.default_rng(SEMILLA)
 
@@ -293,9 +327,15 @@ print(f"Desde: {fecha_inicio} | Hasta: {fecha_fin}\n")
 
 
 def descargar_precio(ticker, start, end, max_retries=3):
+    """Cierres entre start y end, con end inclusivo.
+
+    yfinance trata `end` como exclusivo. Para que el ultimo cierre pueda ser
+    el del dia de la cadena (y no el de ayer) se pide el dia siguiente.
+    """
+    fin = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
     for _ in range(max_retries):
         try:
-            hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+            hist = yf.Ticker(ticker).history(start=start, end=fin.date(), auto_adjust=True)
             if hist is not None and len(hist) > 0:
                 s = hist["Close"].copy()
                 s.index = pd.to_datetime(s.index).tz_localize(None)
@@ -318,6 +358,15 @@ for tk in TICKERS:
 print(f"Tickers descargados: {len(tickers_ok)} / {len(TICKERS)}")
 
 precios_diarios = pd.DataFrame(precios_dict)[tickers_ok]
+if len(precios_diarios) == 0 or pd.isna(precios_diarios.index.max()):
+    print(f"  AVISO: no hay cierres. El spot de los momentos usara la cadena si existe.")
+else:
+    _ultima_barra = pd.Timestamp(precios_diarios.index.max()).normalize()
+    if _ultima_barra.date() < fecha_fin:
+        print(f"  AVISO: no hay cierre de {fecha_fin}. Ultima barra: {_ultima_barra.date()}. "
+              f"Si la cadena de opciones es de hoy, el spot de los momentos sale de la cadena.")
+    else:
+        print(f"  Ultima barra: {_ultima_barra.date()} (incluye el dia de hoy).")
 precios_semanales = precios_diarios.resample("W").last()
 precios_semanales, _semana_parcial = md.drop_partial_last_week(
     precios_semanales, precios_diarios.index.max())
@@ -385,7 +434,12 @@ if USAR_IV_POLYGON:
     tau_horizonte = MESES_HORIZONTE / 12
 
     print("\n=== Extrayendo volatilidad implicita ATM via Polygon (SSVI) ===")
-    print(f"Horizonte objetivo (tau): {tau_horizonte:.4f} anios\n")
+    print(f"Horizonte objetivo (tau): {tau_horizonte:.4f} anios")
+    print(f"Vencimientos: {MIN_DIAS_VENCIMIENTO}-{MAX_DIAS_VENCIMIENTO} dias "
+          f"(minimo {MIN_VENCIMIENTOS_SSVI} si el tope deja menos) | "
+          f"perdida normalizada por vencimiento: {SSVI_NORMALIZAR_VENCIMIENTO} | "
+          f"precio >= {SSVI_PRECIO_MIN:.2f} | OI >= {SSVI_OI_MIN:g} | "
+          f"fallback de momentos: {FALLBACK_MOMENTOS}\n")
 
     def polygon_fetch_chain(ticker, api_key, max_pages=40):
         """Cadena completa de opciones paginada; falla si queda incompleta."""
@@ -424,28 +478,6 @@ if USAR_IV_POLYGON:
                 continue
         return pd.DataFrame(filas)
 
-    def estimar_forward(df_exp):
-        anchos = df_exp[["strike", "tipo", "precio"]].pivot_table(
-            index="strike", columns="tipo", values="precio", aggfunc="mean"
-        ).reset_index()
-        if not {"call", "put"}.issubset(anchos.columns):
-            return np.nan
-        anchos = anchos.dropna(subset=["call", "put"])
-        if len(anchos) < 4:
-            return np.nan
-        y = (anchos["call"] - anchos["put"]).values
-        x = anchos["strike"].values
-        try:
-            b1, b0 = np.polyfit(x, y, 1)
-        except Exception:
-            return np.nan
-        if b1 >= 0:
-            return np.nan
-        F_est = -b0 / b1
-        if not np.isfinite(F_est) or F_est <= 0:
-            return np.nan
-        return F_est
-
     def phi_powerlaw(theta, eta, gamma):
         return eta * theta ** (-gamma)
 
@@ -456,131 +488,52 @@ if USAR_IV_POLYGON:
     def calibrar_ssvi_ticker(ticker, api_key, tau_obj,
                               min_strikes=MIN_STRIKES_SLICE,
                               min_dias=MIN_DIAS_VENCIMIENTO):
-
         chain_raw = polygon_fetch_chain(ticker, api_key)
         if len(chain_raw) == 0:
             raise ValueError("Cadena vacia")
-
         df = parse_chain(chain_raw)
-        df = df[df["iv"].notna() & (df["iv"] > 0)]
-        if len(df) == 0:
-            raise ValueError("Sin IVs validas")
-
-        hoy = pd.Timestamp(date.today())
-        df["dias"] = (df["expiracion"] - hoy).dt.days
-        df = df[df["dias"] >= min_dias]
-
-        vencimientos = sorted(df["expiracion"].unique())
-        puntos = []
-        theta_guess = []
-        t_years = []
-
-        for venc in vencimientos:
-            df_exp = df[df["expiracion"] == venc]
-            T_anios = (pd.Timestamp(venc) - hoy).days / 365
-
-            F_est = estimar_forward(df_exp)
-            if pd.isna(F_est):
-                continue
-
-            df_exp = df_exp.copy()
-            df_exp["k"] = np.log(df_exp["strike"] / F_est)
-            otm_put = df_exp[(df_exp["tipo"] == "put") & (df_exp["k"] < 0)]
-            otm_call = df_exp[(df_exp["tipo"] == "call") & (df_exp["k"] >= 0)]
-            otm = pd.concat([otm_put, otm_call])
-            otm = otm.drop_duplicates(subset="strike")
-            if "precio" not in otm.columns:
-                otm["precio"] = np.nan
-            if "oi" not in otm.columns:
-                otm["oi"] = np.nan
-            mask = bm.ssvi_row_mask(otm["precio"].to_numpy(), otm["oi"].to_numpy())
-            otm = otm.loc[mask].copy()
-            ventana = otm[otm["k"].abs() <= SSVI_K_ABS_MAX].copy()
-            if len(ventana) < min_strikes:
-                continue
-
-            ventana["w"] = ventana["iv"] ** 2 * T_anios
-            ventana = ventana.sort_values("k")
-            pesos = bm.ssvi_weights(
-                ventana["k"].to_numpy(), ventana["w"].to_numpy(), ventana["oi"].to_numpy())
-
-            ancho = otm[otm["k"].abs() <= 1.0]
-            if (ancho["k"] < 0).any() and (ancho["k"] >= 0).any():
-                base = ancho.sort_values("k")
-            else:
-                base = otm.sort_values("k")
-            base_w = base["iv"].to_numpy(dtype=float) ** 2 * T_anios
-            try:
-                theta0 = np.interp(0.0, base["k"].to_numpy(dtype=float), base_w)
-            except Exception:
-                theta0 = np.nan
-            if pd.isna(theta0) or theta0 <= 0:
-                continue
-
-            idx = len(puntos)
-            puntos.append(pd.DataFrame({
-                "k": ventana["k"].to_numpy(), "w": ventana["w"].to_numpy(),
-                "slice": idx, "peso": pesos,
-            }))
-            theta_guess.append(theta0)
-            t_years.append(T_anios)
-
-        if len(puntos) < 2:
-            raise ValueError("Menos de 2 vencimientos utilizables")
-
-        datos = pd.concat(puntos, ignore_index=True)
-        m = len(theta_guess)
-        theta_guess = np.array(theta_guess)
-        t_years = np.array(t_years)
-
-        theta_fijo = theta_guess
-
-        order = np.argsort(t_years)
-        t_sorted = t_years[order]
-        theta_sorted = theta_fijo[order]
-        theta_interp = PchipInterpolator(t_sorted, theta_sorted, extrapolate=False)
-
-        if tau_obj < t_years.min():
-            i_min = np.argmin(t_years)
-            theta_tau = theta_fijo[i_min] * (tau_obj / t_years[i_min])
-        elif tau_obj > t_years.max():
-            i_max = np.argmax(t_years)
-            theta_tau = theta_fijo[i_max] * (tau_obj / t_years[i_max])
-        else:
-            theta_tau = float(theta_interp(tau_obj))
-
-        theta_por_fila = theta_fijo[datos["slice"].values]
-
-        ajuste = bm.fit_ssvi(
-            datos["k"].values, datos["w"].values, theta_por_fila, theta_fijo,
-            slice_index=datos["slice"].values, weights=datos["peso"].values,
-            k_abs_max=SSVI_K_ABS_MAX)
         # sqrt(w/T) es la vol ANUAL y no depende de las alas. Se conserva
         # aunque el RMSE de la sonrisa supere el umbral.
-        sigma_atm_annual = math.sqrt(theta_tau / tau_obj) if theta_tau > 0 else np.nan
-        n_put = int(np.sum(datos["k"].to_numpy(dtype=float) < 0))
-        n_call = int(np.sum(datos["k"].to_numpy(dtype=float) >= 0))
-        decision = bm.ssvi_surface_decision(
-            ajuste, sigma_atm_annual, n_put=n_put, n_call=n_call,
+        return bm.calibrar_superficie_ssvi(
+            df, tau_obj, pd.Timestamp(date.today()),
+            min_strikes=min_strikes, min_dias=min_dias,
+            max_dias=MAX_DIAS_VENCIMIENTO, min_vencimientos=MIN_VENCIMIENTOS_SSVI,
+            k_abs_max=SSVI_K_ABS_MAX, precio_min=SSVI_PRECIO_MIN, oi_min=SSVI_OI_MIN,
             rho_abs_max=SSVI_RHO_ABS_MAX, k_side_min=SSVI_K_SIDE_MIN,
-            min_per_side=SSVI_MIN_PER_SIDE)
-        if decision["fuente"] == "historica":
-            raise ValueError(
-                f"SSVI sin vol ATM (rmse_rel={ajuste['rmse_rel']:.3f}, "
-                f"GJ_max={ajuste['gj_max']:.3f})"
-            )
+            min_per_side=SSVI_MIN_PER_SIDE,
+            normalizar_vencimiento=SSVI_NORMALIZAR_VENCIMIENTO)
 
-        return dict(sigma_atm_annual=decision["sigma_atm_annual"], theta_j=theta_fijo,
-                    t_years=t_years, rho=ajuste["rho"], eta=ajuste["eta"], gamma=ajuste["gamma"],
-                    n_vencimientos=m, metodo=ajuste["metodo"], gj_max=ajuste["gj_max"],
-                    rmse_rel=ajuste["rmse_rel"], usar_alas=decision["usar_alas"],
-                    fuente=decision["fuente"], motivos=decision.get("motivos") or [],
-                    n_put=n_put, n_call=n_call, n_strikes=ajuste["n_strikes"],
-                    k_min=ajuste["k_min"], k_max=ajuste["k_max"])
+    def _fmt_num(x, spec):
+        return format(float(x), spec) if x is not None and np.isfinite(x) else "n/d"
+
+    def _diag_ssvi(resultado):
+        """Vencimientos usados, error relativo, rho y si la sonrisa entra o cae al fallback."""
+        dte = (f"{resultado.get('dias_min')}-{resultado.get('dias_max')}"
+               if resultado.get("dias_min") is not None else "n/d")
+        if resultado.get("usar_alas"):
+            decision = "aceptada"
+        else:
+            porque = resultado.get("motivo_fallback") or ", ".join(resultado.get("motivos") or [])
+            decision = f"fallback {FALLBACK_MOMENTOS} ({porque or 'sonrisa rechazada'})"
+        extra = ""
+        if resultado.get("extendio_tope"):
+            extra += " | tope extendido para completar el minimo de vencimientos"
+        if resultado.get("n_drop_higiene"):
+            extra += (f" | higiene precio={resultado.get('n_drop_precio', 0)}"
+                      f" oi={resultado.get('n_drop_oi', 0)}"
+                      f" monotonia={resultado.get('n_drop_monotonia', 0)}")
+        return (f"vencimientos: {resultado.get('n_vencimientos')}/"
+                f"{resultado.get('n_vencimientos_cadena', '?')} | "
+                f"DTE {dte} (tope {resultado.get('max_dias', MAX_DIAS_VENCIMIENTO)}) | "
+                f"rmse_rel={_fmt_num(resultado.get('rmse_rel'), '.3f')} | "
+                f"rho={_fmt_num(resultado.get('rho'), '.3f')} | {decision}{extra}")
 
     sigma_iv_horizon = {t: np.nan for t in tickers}
     sigma_iv_annual = {t: np.nan for t in tickers}
     detalle_ssvi = {}
+    resultado_ssvi = {}
+    motivo_calibracion = {}
+    detalle_sector = {}
 
     for tk in tickers:
         print(f"  Calibrando SSVI: {tk} ... ", end="")
@@ -589,6 +542,7 @@ if USAR_IV_POLYGON:
         except Exception as e:
             print(f"FALLBACK ({e}) ", end="")
             resultado = None
+            motivo_calibracion[tk] = str(e)
 
         if resultado is not None and resultado.get("usar_alas"):
             anual = resultado["sigma_atm_annual"]
@@ -596,35 +550,58 @@ if USAR_IV_POLYGON:
             sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
                 anual, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
             detalle_ssvi[tk] = resultado
+            resultado_ssvi[tk] = resultado
             fuente_vol[tk] = "ssvi"
             print(f"OK ({resultado['metodo']}) - sigma_ATM anual = {anual:.4f} "
                   f"| al horizonte = {sigma_iv_horizon[tk]:.4f} "
-                  f"| vencimientos: {resultado['n_vencimientos']} | rho = {resultado['rho']:.3f} "
+                  f"| {_diag_ssvi(resultado)} "
                   f"| GJ_max = {resultado['gj_max']:.3f} (<=4 sin arbitraje)")
         elif resultado is not None and resultado.get("fuente") == "atm":
             anual = resultado["sigma_atm_annual"]
             sigma_iv_annual[tk] = anual
             sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
                 anual, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
+            resultado_ssvi[tk] = resultado
             fuente_vol[tk] = "atm"
-            motivos = resultado.get("motivos") or []
-            if resultado.get("metodo") == "ssvi_conjunto" and motivos:
-                detalle = f"degenerada: {', '.join(motivos)}"
-            else:
-                extra = f", {', '.join(motivos)}" if motivos else ""
-                detalle = (f"sonrisa {resultado['metodo']}, "
-                           f"rmse_rel={resultado['rmse_rel']:.3f}{extra}")
-            print(f"ATM ({detalle}, rho={resultado['rho']:.3f}, "
-                  f"k=[{resultado['k_min']:.2f}, {resultado['k_max']:.2f}], "
+            print(f"ATM (k=[{_fmt_num(resultado.get('k_min'), '.2f')}, "
+                  f"{_fmt_num(resultado.get('k_max'), '.2f')}], "
                   f"puts={resultado.get('n_put')}, calls={resultado.get('n_call')}) "
                   f"- sigma_ATM anual = {anual:.4f} "
                   f"| al horizonte = {sigma_iv_horizon[tk]:.4f} "
+                  f"| {_diag_ssvi(resultado)} "
                   f"| alas no usadas en BKM")
         else:
             sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
                 np.nan, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
             fuente_vol[tk] = "historica"
-            print(f"-> vol historica al horizonte = {sigma_iv_horizon[tk]:.4f}")
+            razon = motivo_calibracion.get(tk, "sin superficie")
+            print(f"-> vol historica al horizonte = {sigma_iv_horizon[tk]:.4f} "
+                  f"| fallback {FALLBACK_MOMENTOS} ({razon})")
+
+    if FALLBACK_MOMENTOS == "sector":
+        etfs_sector = []
+        for tk in tickers:
+            etf = FALLBACK_ETF_POR_TICKER.get(tk)
+            if etf and etf not in etfs_sector:
+                etfs_sector.append(etf)
+        print(f"\n  Sonrisas sectoriales para el fallback ({', '.join(etfs_sector) or 'ninguna'}):")
+        for etf in etfs_sector:
+            if etf in detalle_ssvi and detalle_ssvi[etf].get("usar_alas"):
+                detalle_sector[etf] = detalle_ssvi[etf]
+                print(f"  {etf}: reutilizada del universo | {_diag_ssvi(detalle_ssvi[etf])}")
+                continue
+            print(f"  Calibrando SSVI sector: {etf} ... ", end="")
+            try:
+                res_etf = calibrar_ssvi_ticker(etf, POLYGON_API_KEY, tau_horizonte)
+            except Exception as e:
+                print(f"sin sonrisa ({e})")
+                continue
+            if res_etf is not None and res_etf.get("usar_alas"):
+                detalle_sector[etf] = res_etf
+                print(f"OK | {_diag_ssvi(res_etf)}")
+            else:
+                porque = (res_etf or {}).get("motivo_fallback") or "rechazada"
+                print(f"sin sonrisa usable ({porque})")
 
     print(f"\n=== Volatilidades ATM al horizonte de {MESES_HORIZONTE} meses "
           f"(SSVI anualizada y luego escalada; M-11) ===")
@@ -640,6 +617,9 @@ else:
     Sigma_horizon = Sigma_hist_df.copy()
     tau_horizonte = MESES_HORIZONTE / 12
     detalle_ssvi = {}
+    resultado_ssvi = {}
+    motivo_calibracion = {}
+    detalle_sector = {}
 
 
 # ==============================================================================
@@ -714,6 +694,31 @@ def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
     return dict(MFIV=MFIV, MFIS=MFIS, MFIK=MFIK, V_T=V_T, W_T=W_T, X_T=X_T)
 
 
+def _momento_pendiente(motivo, mfiv=np.nan):
+    """Sonrisa rechazada: MFIS/MFIK se rellenan tras el bootstrap fisico."""
+    return dict(MFIV=mfiv, MFIS=np.nan, MFIK=np.nan, V_T=np.nan, W_T=np.nan, X_T=np.nan,
+                fuente_momentos="fallback", motivo_fallback=motivo)
+
+
+def _spot_bkm(tk, det):
+    """Cierre del dia de la cadena, o el spot del snapshot si esa barra no esta."""
+    serie = precios_diarios[tk].dropna()
+    cierre = float(serie.iloc[-1]) if len(serie) else np.nan
+    fecha_cierre = pd.Timestamp(serie.index[-1]).date() if len(serie) else None
+    elec = bm.elegir_spot_momentos(
+        cierre, fecha_cierre, date.today(), (det or {}).get("spot_cadena"))
+    if elec["fuente"] != "cierre":
+        print(f"  {tk}: spot de momentos = {elec['spot']:.2f} ({elec['fuente']}; "
+              f"cierre {elec['fecha_cierre']} = {elec['cierre']}; "
+              f"cadena = {elec['spot_cadena']})")
+    elif (np.isfinite(elec["spot_cadena"]) and np.isfinite(elec["cierre"])
+          and elec["cierre"] > 0
+          and abs(elec["cierre"] / elec["spot_cadena"] - 1.0) > 0.02):
+        print(f"  {tk}: cierre y spot de la cadena difieren "
+              f"({elec['cierre']:.2f} vs {elec['spot_cadena']:.2f}); se usa el cierre del dia")
+    return elec["spot"]
+
+
 print("\n=== Calculando momentos BKM (MFIV, MFIS, MFIK) por ticker ===")
 
 bkm_moments = {}
@@ -721,13 +726,18 @@ r_bkm = Rf_anual_bkm
 
 for tk in tickers:
     if tk not in detalle_ssvi:
-        print(f"  {tk}: sin superficie SSVI valida, se omite BKM (MFIS=0, MFIK=3 neutro)")
-        bkm_moments[tk] = dict(MFIV=np.nan, MFIS=0.0, MFIK=3.0, V_T=np.nan, W_T=np.nan, X_T=np.nan)
+        det_r = resultado_ssvi.get(tk) or {}
+        razon = det_r.get("motivo_fallback") or motivo_calibracion.get(tk) or "sin superficie"
+        print(f"  {tk}: sin sonrisa usable, se omite BKM | "
+              f"fallback {FALLBACK_MOMENTOS} ({razon})")
+        bkm_moments[tk] = _momento_pendiente(razon)
         continue
 
     det = detalle_ssvi[tk]
     try:
-        S_tk = precios_diarios[tk].iloc[-1]
+        S_tk = _spot_bkm(tk, det)
+        if not (np.isfinite(S_tk) and S_tk > 0):
+            raise ValueError("sin spot")
         F_tk = S_tk * np.exp(r_bkm * tau_horizonte)
         theta_tau_tk = det["sigma_atm_annual"] ** 2 * tau_horizonte
         # Sin k_min/k_max: la integral es +/- BKM_N_STD sigma al horizonte,
@@ -741,8 +751,12 @@ for tk in tickers:
         banda = bm.mfiv_vs_atm(resultado_bkm["MFIV"], theta_tau_tk, *BKM_MFIV_RATIO)
         if not banda["ok"]:
             print(f"  {tk}: MFIV/varianza ATM = {banda['ratio']} fuera de "
-                  f"{BKM_MFIV_RATIO}; se usa la varianza ATM y momentos neutros")
-            resultado_bkm = {**resultado_bkm, "MFIV": banda["mfiv"], "MFIS": 0.0, "MFIK": 3.0}
+                  f"{BKM_MFIV_RATIO}; se usa la varianza ATM y el fallback "
+                  f"{FALLBACK_MOMENTOS} para MFIS/MFIK")
+            resultado_bkm = {
+                **resultado_bkm, "MFIV": banda["mfiv"], "MFIS": np.nan, "MFIK": np.nan,
+                "fuente_momentos": "fallback", "motivo_fallback": "mfiv_fuera_de_banda",
+            }
         else:
             cap_mfik = rk.mfik_cap(
                 det.get("n_strikes", 0), base=BKM_MFIK_MAX, hard=BKM_MFIK_MAX_HARD)
@@ -750,21 +764,33 @@ for tk in tickers:
                     resultado_bkm["MFIS"], resultado_bkm["MFIK"], cap_mfik):
                 print(f"  {tk}: MFIS/MFIK inadmisibles ({resultado_bkm['MFIS']:.3f}, "
                       f"{resultado_bkm['MFIK']:.3f}, tope {cap_mfik:.1f} con "
-                      f"{det.get('n_strikes', 0)} strikes) -> neutro (MFIS=0, MFIK=3)")
-                resultado_bkm = {**resultado_bkm, "MFIS": 0.0, "MFIK": 3.0}
+                      f"{det.get('n_strikes', 0)} strikes) -> fallback {FALLBACK_MOMENTOS}")
+                resultado_bkm = {
+                    **resultado_bkm, "MFIS": np.nan, "MFIK": np.nan,
+                    "fuente_momentos": "fallback", "motivo_fallback": "momentos_inadmisibles",
+                }
+            else:
+                resultado_bkm = {
+                    **resultado_bkm, "fuente_momentos": "ssvi", "motivo_fallback": "",
+                }
         bkm_moments[tk] = resultado_bkm
-        print(f"  {tk}: MFIV={resultado_bkm['MFIV']:.4f} | MFIS={resultado_bkm['MFIS']:.3f} "
-              f"| MFIK={resultado_bkm['MFIK']:.3f} | integral k=+/-{ala:.2f} "
-              f"({BKM_N_STD:.0f} sigma; ajuste |k|<={SSVI_K_ABS_MAX})")
+        if resultado_bkm.get("fuente_momentos") == "ssvi":
+            print(f"  {tk}: MFIV={resultado_bkm['MFIV']:.4f} | MFIS={resultado_bkm['MFIS']:.3f} "
+                  f"| MFIK={resultado_bkm['MFIK']:.3f} | spot={S_tk:.2f} | integral k=+/-{ala:.2f} "
+                  f"({BKM_N_STD:.0f} sigma; ajuste |k|<={SSVI_K_ABS_MAX}) | aceptada")
     except Exception as e:
-        print(f"  {tk}: fallback neutro ({e})")
-        bkm_moments[tk] = dict(MFIV=np.nan, MFIS=0.0, MFIK=3.0, V_T=np.nan, W_T=np.nan, X_T=np.nan)
+        print(f"  {tk}: fallback {FALLBACK_MOMENTOS} ({e})")
+        bkm_moments[tk] = _momento_pendiente(str(e))
 
-MFIS_vec = np.array([bkm_moments[t]["MFIS"] for t in tickers])
-MFIK_vec = np.array([bkm_moments[t]["MFIK"] for t in tickers])
-
-print("\n=== Resumen momentos implicitos (skew=0, kurt=3 => distribucion normal) ===")
-print(pd.DataFrame({"MFIS": np.round(MFIS_vec, 3), "MFIK": np.round(MFIK_vec, 3)}, index=tickers))
+print("\n=== Sonrisas aceptadas (el resto espera el fallback de momentos) ===")
+_aceptadas = [t for t in tickers if bkm_moments[t].get("fuente_momentos") == "ssvi"]
+if _aceptadas:
+    print(pd.DataFrame({
+        "MFIS": [round(bkm_moments[t]["MFIS"], 3) for t in _aceptadas],
+        "MFIK": [round(bkm_moments[t]["MFIK"], 3) for t in _aceptadas],
+    }, index=_aceptadas))
+else:
+    print("  Ninguna sonrisa aceptada.")
 
 # ==============================================================================
 # BLOQUE 1D: MODULO ECONOMETRICO Q -> P
@@ -980,6 +1006,96 @@ print("  (las columnas *_iid_roll son el estimador de ventanas rodantes bajo "
       "agregacion iid;\n   convergen mecanicamente a 0 y 3 al crecer H y por eso "
       "no se usan como estimador primario)")
 
+
+def _sanear_momento_fisico(skew, kurt):
+    """Lleva un par fisico a las cotas del modelo y a la desigualdad de Pearson."""
+    try:
+        s = float(skew)
+        k = float(kurt)
+    except (TypeError, ValueError):
+        return np.nan, np.nan
+    if not (np.isfinite(s) and np.isfinite(k)):
+        return np.nan, np.nan
+    s = float(np.clip(s, *COTA_SKEW_P))
+    k = float(np.clip(k, *COTA_KURT_P))
+    k = max(k, s ** 2 + 1.05)
+    return s, k
+
+
+_cache_momentos_sector = {}
+
+
+def _momentos_sector(tk):
+    """MFIS/MFIK del ETF sectorial, si FALLBACK_MOMENTOS == 'sector' y la sonrisa entro."""
+    if FALLBACK_MOMENTOS != "sector":
+        return np.nan, np.nan
+    etf = FALLBACK_ETF_POR_TICKER.get(tk)
+    if not etf or etf not in detalle_sector:
+        return np.nan, np.nan
+    if etf in _cache_momentos_sector:
+        return _cache_momentos_sector[etf]
+    det = detalle_sector[etf]
+    try:
+        S = float(det.get("spot_cadena", np.nan))
+        if not (np.isfinite(S) and S > 0):
+            if etf in precios_diarios.columns:
+                serie_etf = precios_diarios[etf].dropna()
+                S = float(serie_etf.iloc[-1]) if len(serie_etf) else np.nan
+            else:
+                serie_etf = descargar_precio(etf, fecha_fin - timedelta(days=10), fecha_fin)
+                S = float(serie_etf.iloc[-1]) if serie_etf is not None and len(serie_etf) else np.nan
+        if not (np.isfinite(S) and S > 0):
+            raise ValueError("sin spot del ETF")
+        theta = det["sigma_atm_annual"] ** 2 * tau_horizonte
+        mom = calcular_bkm_moments(
+            S=S, F=S * np.exp(r_bkm * tau_horizonte), T=tau_horizonte, r=r_bkm,
+            rho=det["rho"], eta=det["eta"], gamma=det["gamma"],
+            theta_tau=theta, n_std=BKM_N_STD)
+        banda = bm.mfiv_vs_atm(mom["MFIV"], theta, *BKM_MFIV_RATIO)
+        cap = rk.mfik_cap(det.get("n_strikes", 0), base=BKM_MFIK_MAX, hard=BKM_MFIK_MAX_HARD)
+        if not banda["ok"] or not rk.higher_moments_admissible(mom["MFIS"], mom["MFIK"], cap):
+            raise ValueError("momentos del ETF fuera de banda")
+        par = (float(mom["MFIS"]), float(mom["MFIK"]))
+    except Exception as e:
+        print(f"  {etf}: sonrisa sectorial no usable ({e})")
+        par = (np.nan, np.nan)
+    _cache_momentos_sector[etf] = par
+    return par
+
+
+print(f"\n=== Fallback de momentos (modo {FALLBACK_MOMENTOS}) ===")
+n_fallback_momentos = 0
+for i, tk in enumerate(tickers):
+    mom = bkm_moments[tk]
+    if mom.get("fuente_momentos") == "ssvi" and np.isfinite(mom.get("MFIS", np.nan)):
+        continue
+    s_h, k_h = _sanear_momento_fisico(skew_bs[i], kurt_bs[i])
+    s_sec, k_sec = _momentos_sector(tk)
+    if np.isfinite(s_sec):
+        s_sec, k_sec = _sanear_momento_fisico(s_sec, k_sec)
+    fb = bm.momentos_fallback(
+        FALLBACK_MOMENTOS, s_h, k_h, s_sec, k_sec, kurt_max=COTA_KURT_P[1])
+    mom["MFIS"] = fb["mfis"]
+    mom["MFIK"] = fb["mfik"]
+    mom["fuente_momentos"] = fb["fuente"]
+    n_fallback_momentos += 1
+    print(f"  {tk}: fallback {fb['fuente']} | MFIS={fb['mfis']:.3f} | "
+          f"MFIK={fb['mfik']:.3f} | motivo: {mom.get('motivo_fallback') or 'sin sonrisa'}")
+if n_fallback_momentos == 0:
+    print("  Ningun ticker entro al fallback.")
+
+MFIS_vec = np.array([bkm_moments[t]["MFIS"] for t in tickers], dtype=float)
+MFIK_vec = np.array([bkm_moments[t]["MFIK"] for t in tickers], dtype=float)
+mask_sonrisa = np.array(
+    [bkm_moments[t].get("fuente_momentos") == "ssvi" for t in tickers], dtype=bool)
+
+print("\n=== Momentos de orden superior por ticker ===")
+print(pd.DataFrame({
+    "MFIS": np.round(MFIS_vec, 3),
+    "MFIK": np.round(MFIK_vec, 3),
+    "fuente": [bkm_moments[t].get("fuente_momentos", "") for t in tickers],
+}, index=tickers))
+
 # ==============================================================================
 # 1D.2  REGRESION DE CALIBRACION MINCER-ZARNOWITZ -> PRIMAS DE RIESGO
 # ==============================================================================
@@ -1111,12 +1227,42 @@ def mincer_zarnowitz(y, x, se_y, nombre, dominio=None, piso=None):
                 modelo=modelo, nombre=nombre)
 
 
+def pronostico_con_sonrisa(y, x, se, nombre, mask, dominio=None, piso=None):
+    """MZ en las sonrisas aceptadas. El fallback conserva su momento (x).
+
+    Meter el fallback en la transversal (antes era 0 y 3) sesga a y b. Con
+    menos de 4 sonrisas no hay regresion: cada nombre se queda con su fisico.
+    """
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    se = np.asarray(se, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+    n_sonrisa = int(mask.sum())
+    fit = np.array(y, dtype=float, copy=True)
+    se_fit = np.array(se, dtype=float, copy=True)
+    if n_sonrisa >= 4:
+        reg = mincer_zarnowitz(
+            y[mask], x[mask], se[mask], nombre, dominio=dominio, piso=piso)
+        fit[mask] = reg["fit"]
+        se_fit[mask] = reg["se_fit"]
+        a, b, t_b, r2 = reg["a"], reg["b"], reg["t_b"], reg["r2"]
+        modelo = reg["modelo"]
+    else:
+        a = b = t_b = r2 = np.nan
+        modelo = "fisico (sin sonrisas suficientes)"
+    if np.any(~mask):
+        fit[~mask] = x[~mask]
+    return dict(fit=fit, se_fit=se_fit, a=a, b=b, t_b=t_b, r2=r2,
+                modelo=modelo, nombre=nombre, n_sonrisa=n_sonrisa)
+
+
 reg_V = mincer_zarnowitz(var_P_est, MFIV_vec, var_P_se, "Varianza",
                          dominio=(1e-8, np.inf), piso=0.0)
-reg_S = mincer_zarnowitz(skew_P_est, MFIS_vec, skew_P_se, "Asimetria",
-                         dominio=COTA_SKEW_P)
-reg_K = mincer_zarnowitz(kurt_P_est, MFIK_vec, kurt_P_se, "Curtosis",
-                         dominio=COTA_KURT_P, piso=1.0)
+reg_S = pronostico_con_sonrisa(
+    skew_P_est, MFIS_vec, skew_P_se, "Asimetria", mask_sonrisa, dominio=COTA_SKEW_P)
+reg_K = pronostico_con_sonrisa(
+    kurt_P_est, MFIK_vec, kurt_P_se, "Curtosis", mask_sonrisa,
+    dominio=COTA_KURT_P, piso=1.0)
 
 print("\n=== Regresiones de calibracion Mincer-Zarnowitz (seccion transversal, "
       f"n = {n} activos, WLS) ===")
@@ -1132,6 +1278,9 @@ print("  (b < 1 => el momento implicito sobre-reacciona respecto del fisico, "
       "que es el patron documentado)")
 print(f"  NOTA (B-10): Mincer-Zarnowitz es transversal con n = {n}. Con ~19 nombres "
       "la potencia es baja y a, b salen ruidosos. No se cambia el estimador.")
+print(f"  Asimetria y curtosis: la regresion usa {int(mask_sonrisa.sum())} sonrisas aceptadas; "
+      f"{int((~mask_sonrisa).sum())} tickers conservan el fallback {FALLBACK_MOMENTOS} "
+      f"(SRP = KRP = 0 ahi).")
 
 # ==============================================================================
 # PRONOSTICOS FISICOS Y PRIMAS DE RIESGO
