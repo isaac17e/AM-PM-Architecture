@@ -14,12 +14,15 @@
 #   A-5  seleccion historica de cadena OTM con strikes y DTE reales
 # ==============================================================================
 
+import math
+import re
 from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 
 import polygon_client as pc
+import portfolio_constraints as pq
 import risk_estimators as rk
 
 __all__ = [
@@ -36,6 +39,12 @@ __all__ = [
     "dispersion_usable",
     "clip_implied_correlation",
     "scale_option_deltas",
+    "bs_call_delta_from_vol",
+    "otm_log_moneyness",
+    "delta_cushion",
+    "es_ticker_formato_us",
+    "combinar_tickers",
+    "region_de_ticker",
     "sector_implied_ready",
     "align_daily_panel",
     "stitch_covariance",
@@ -287,6 +296,9 @@ def scale_option_deltas(delta, mode="direct", delta_min=0.30,
     `minmax` estira el rango observado de la corrida a [delta_min, 1].
     Con deltas 0.48-0.56 eso convierte 0.03 de delta en decenas de puntos
     del multiplicador.
+    `relative` divide por la mediana de la corrida y recorta a
+    [fixed_lo, fixed_hi]. La mediana queda en 1, asi que el nivel no
+    reescala lambda; solo inclina entre nombres.
     """
     d = np.asarray(delta, dtype=float)
     modo = str(mode)
@@ -306,9 +318,116 @@ def scale_option_deltas(delta, mode="direct", delta_min=0.30,
         scaled = np.clip(scaled, piso, 1.0)
     elif modo == "direct":
         scaled = np.clip(d, piso, 1.0)
+    elif modo == "relative":
+        if float(fixed_hi) <= float(fixed_lo):
+            raise ValueError("fixed_hi debe ser mayor que fixed_lo")
+        valid = d[np.isfinite(d)]
+        med = float(np.median(valid)) if len(valid) else float("nan")
+        if not (math.isfinite(med) and med > 0):
+            scaled = np.ones(np.shape(d), dtype=float)
+        else:
+            scaled = np.clip(d / med, float(fixed_lo), float(fixed_hi))
     else:
         raise ValueError(f"modo de delta desconocido: {mode}")
     return np.where(np.isfinite(d), scaled, 1.0)
+
+
+def bs_call_delta_from_vol(vol, years, rate, log_moneyness=0.0):
+    """Delta N(d1) con K = S * exp(log_moneyness) y q = 0. El spot se cancela.
+
+    NaN si la vol o el plazo no son positivos.
+    """
+    try:
+        vol = float(vol)
+        years = float(years)
+        rate = float(rate)
+        m = float(log_moneyness)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (math.isfinite(vol) and math.isfinite(years) and math.isfinite(rate) and math.isfinite(m)):
+        return float("nan")
+    if vol <= 0 or years <= 0:
+        return float("nan")
+    return pq.bs_call_delta(1.0, math.exp(m), years, rate, vol)
+
+
+def otm_log_moneyness(log_m, years, ref_years):
+    """Log-moneyness OTM escalada con sqrt(plazo / plazo de referencia).
+
+    `log_m` es el desplazamiento en el horizonte de referencia. Sin la
+    escala, el mismo 8% es cerca de un sigma a 2 meses y una fraccion de
+    sigma a un ano, y un umbral fijo deja de separar.
+    """
+    try:
+        log_m = float(log_m)
+        years = float(years)
+        ref_years = float(ref_years)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (math.isfinite(log_m) and years > 0 and ref_years > 0):
+        return float("nan")
+    return log_m * math.sqrt(years / ref_years)
+
+
+def delta_cushion(vol, years, rate, log_m, ref_years=None):
+    """Caida de la delta de la call entre K = S y el strike OTM.
+
+    Alta cuando la vol es baja (el strike fijo queda a muchos sigma) y baja
+    cuando la vol es alta (el mismo strike sigue cerca del dinero). El filtro
+    conserva cushion >= delta_min: un umbral alto se queda con la vol baja.
+    `ref_years` None usa el plazo tal cual, sin reescalar la moneyness.
+    """
+    if ref_years is None:
+        ref_years = years
+    m = otm_log_moneyness(log_m, years, ref_years)
+    atm = bs_call_delta_from_vol(vol, years, rate, 0.0)
+    otm = bs_call_delta_from_vol(vol, years, rate, m)
+    if not (math.isfinite(atm) and math.isfinite(otm)):
+        return float("nan")
+    return float(atm - otm)
+
+
+def es_ticker_formato_us(ticker):
+    """Formato de ticker estadounidense: largo 1-5, sin ^/$, sin digito inicial.
+
+    No decide la bolsa. BRK-B pasa; SHOP.TO, 7203.T y ULVR.L no. Esos
+    ultimos son internacionales y no deben entrar a este predicado.
+    """
+    if ticker is None:
+        return False
+    t = str(ticker).strip()
+    if not t or re.search(r"\^|\$", t):
+        return False
+    if not (1 <= len(t) <= 5):
+        return False
+    if re.match(r"^[0-9]", t):
+        return False
+    return True
+
+
+def region_de_ticker(ticker):
+    """Region para el tope max_region_weight. ADRs sin sufijo (HSBC, BP) quedan en US.
+
+    .TO no cae en Japon: el sufijo japones es .T, y .TO no termina en .T.
+    """
+    t = "" if ticker is None else str(ticker)
+    if t.endswith(".TO"):
+        return "Canada"
+    if re.search(r"\.(DE|L|PA|MC)$", t):
+        return "Europa"
+    if t.endswith(".T"):
+        return "Japon"
+    return "US"
+
+
+def combinar_tickers(domesticos, internacionales):
+    """Filtra el formato US solo en domesticos y luego concatena internacionales.
+
+    Aplicar el filtro a la lista ya mezclada elimina los sufijos de bolsa
+    (.DE, .TO, .L, .PA, .MC) y los tickers japoneses que empiezan por digito.
+    """
+    ok = [t for t in domesticos if es_ticker_formato_us(t)]
+    return list(dict.fromkeys(list(ok) + list(internacionales)))
 
 
 def sector_implied_ready(n_names, min_names=4):

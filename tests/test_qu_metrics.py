@@ -1,3 +1,5 @@
+import math
+import re
 from datetime import date
 
 import numpy as np
@@ -507,3 +509,127 @@ def test_lambda_scores_use_the_reference_lambda_and_mu_final():
     assert agresivo["ret"] == pytest.approx(0.02)
     assert agresivo["utilidad"] == pytest.approx(0.02 - 5.0 * 0.04)
     assert 0.8 in qm.comparison_lambdas(0.8)
+
+
+# ------------------------------------------------------------------------------
+# Universo: el formato US no se aplica a internacionales
+# ------------------------------------------------------------------------------
+
+_INTERNACIONALES = [
+    "RY.TO", "SHOP.TO", "ENB.TO", "SU.TO", "SIE.DE", "MUV2.DE", "ULVR.L",
+    "NG.L", "TTE.PA", "MC.PA", "ITX.MC", "BBVA.MC", "7203.T", "9984.T",
+    "HSBC", "BP",
+]
+
+
+def _formato_us_viejo(tickers):
+    return [
+        t for t in tickers
+        if not re.search(r"\^|\$", t) and 1 <= len(t) <= 5 and not re.match(r"^[0-9]", t) and t != ""
+    ]
+
+
+def test_combinar_tickers_conserva_sufijos_que_el_filtro_us_tiraba():
+    domesticos = ["AAPL", "BRK-B", "MSFT", "^GSPC", "$VIX", "1234", "", "TOOLONG"]
+    unidos = qm.combinar_tickers(domesticos, _INTERNACIONALES)
+    viejo = _formato_us_viejo(list(dict.fromkeys(domesticos + _INTERNACIONALES)))
+    for t in ("SHOP.TO", "ENB.TO", "SIE.DE", "MUV2.DE", "ULVR.L", "TTE.PA",
+              "ITX.MC", "BBVA.MC", "7203.T", "9984.T"):
+        assert t in unidos
+        assert t not in viejo
+    # MC.PA cabe en 5 caracteres: el filtro viejo ya lo dejaba pasar.
+    assert "MC.PA" in unidos and "MC.PA" in viejo
+    for t in ("AAPL", "BRK-B", "SU.TO", "NG.L", "HSBC", "BP"):
+        assert t in unidos
+    for t in ("^GSPC", "$VIX", "1234", "", "TOOLONG"):
+        assert t not in unidos
+    # SU.TO (largo 5) y NG.L (largo 4) ya pasaban el filtro viejo.
+    assert "SU.TO" in viejo and "NG.L" in viejo
+
+
+def test_region_de_ticker_separa_canada_de_japon_y_deja_adrs_en_us():
+    assert qm.region_de_ticker("SHOP.TO") == "Canada"
+    assert qm.region_de_ticker("ENB.TO") == "Canada"
+    assert qm.region_de_ticker("SU.TO") == "Canada"
+    assert qm.region_de_ticker("7203.T") == "Japon"
+    assert qm.region_de_ticker("9984.T") == "Japon"
+    assert qm.region_de_ticker("SIE.DE") == "Europa"
+    assert qm.region_de_ticker("ULVR.L") == "Europa"
+    assert qm.region_de_ticker("NG.L") == "Europa"
+    assert qm.region_de_ticker("TTE.PA") == "Europa"
+    assert qm.region_de_ticker("ITX.MC") == "Europa"
+    assert qm.region_de_ticker("HSBC") == "US"
+    assert qm.region_de_ticker("BP") == "US"
+    assert qm.region_de_ticker("BRK.B") == "US"
+
+
+# ------------------------------------------------------------------------------
+# Filtro delta: colchon OTM, no la delta ATM
+# ------------------------------------------------------------------------------
+
+# Pool sintetico de 45 vols anuales. Sin POLYGON_API_KEY: Black-Scholes,
+# no cadenas reales. Mezcla defensiva / mega-cap / growth / high-beta.
+_VOLS_POOL_45 = [
+    0.14, 0.15, 0.16, 0.16, 0.17, 0.18, 0.18, 0.19,
+    0.20, 0.21, 0.22, 0.22, 0.23, 0.24, 0.24, 0.25, 0.26, 0.26, 0.27, 0.28, 0.28, 0.29, 0.30,
+    0.32, 0.33, 0.34, 0.35, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46,
+    0.48, 0.50, 0.52, 0.55, 0.58, 0.62, 0.66, 0.70, 0.75, 0.80, 0.85, 0.90,
+]
+_T_REF = 2 / 12
+_R = 0.047
+_LOG_M = 0.08
+
+
+def _cojines(years=_T_REF):
+    return [
+        qm.delta_cushion(v, years, _R, _LOG_M, ref_years=_T_REF)
+        for v in _VOLS_POOL_45
+    ]
+
+
+def test_delta_atm_no_separa_los_umbrales_de_perfil():
+    atm = [qm.bs_call_delta_from_vol(v, _T_REF, _R, 0.0) for v in _VOLS_POOL_45]
+    assert min(atm) > 0.50
+    assert max(atm) - min(atm) < 0.06
+    # 0.30 y 0.42 no tiran a nadie. 0.55 solo roza el borde inferior.
+    assert sum(d < 0.30 for d in atm) == 0
+    assert sum(d < 0.42 for d in atm) == 0
+    assert sum(d < 0.55 for d in atm) <= 5
+
+
+def test_colchon_baja_con_la_vol_y_separa_perfiles():
+    bajo = qm.delta_cushion(0.18, _T_REF, _R, _LOG_M, ref_years=_T_REF)
+    alto = qm.delta_cushion(0.70, _T_REF, _R, _LOG_M, ref_years=_T_REF)
+    assert bajo > alto
+    cojines = _cojines()
+    drop_agr = sum(c < 0.12 for c in cojines)
+    drop_mod = sum(c < 0.18 for c in cojines)
+    drop_con = sum(c < 0.24 for c in cojines)
+    assert (drop_agr, drop_mod, drop_con) == (6, 14, 22)
+    assert drop_agr < drop_mod < drop_con
+    # El mismo umbral, a 4 meses, sigue separando parecido porque la
+    # moneyness escala con sqrt(T).
+    cojines_4m = _cojines(years=4 / 12)
+    drop_agr_4 = sum(c < 0.12 for c in cojines_4m)
+    drop_con_4 = sum(c < 0.24 for c in cojines_4m)
+    assert drop_agr_4 == drop_agr
+    assert abs(drop_con_4 - drop_con) <= 1
+
+
+def test_delta_cushion_sin_vol_es_nan():
+    assert math.isnan(qm.delta_cushion(0.0, _T_REF, _R, _LOG_M))
+    assert math.isnan(qm.delta_cushion(float("nan"), _T_REF, _R, _LOG_M))
+    assert math.isnan(qm.bs_call_delta_from_vol(-0.2, 0.2, 0.04))
+
+
+def test_scale_relative_no_reescala_lambda():
+    # Colchon tipico: la mediana queda en 1. NaN (sin opciones, como SU.TO
+    # si no hay vol) no recorta mu.
+    delta = np.array([0.12, 0.20, 0.28, 0.36, 0.44, np.nan])
+    mult = qm.scale_option_deltas(delta, mode="relative", fixed_lo=0.75, fixed_hi=1.25)
+    assert mult[2] == pytest.approx(1.0)  # mediana de los finitos
+    assert mult[5] == pytest.approx(1.0)
+    assert mult.min() >= 0.75 - 1e-12
+    assert mult.max() <= 1.25 + 1e-12
+    # direct sobre ATM ~0.5 si seria un recorte uniforme. relative no.
+    assert mult[2] > 0.9
