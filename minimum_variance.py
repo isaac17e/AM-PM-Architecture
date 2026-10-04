@@ -84,8 +84,6 @@ bkm_moneyness_lo = 0.70
 bkm_moneyness_hi = 1.30
 bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
-# Con pocos strikes OTM el tope sigue en 20. Con una cadena densa sube hasta
-# bkm_mfik_max_hard: SPY y otros indices superan 20 sin ser inadmisibles.
 bkm_mfik_max_hard = 80.0
 tail_risk_min_hist_weeks = 26
 tail_risk_filter_confidence = 0.95
@@ -94,9 +92,6 @@ cornish_fisher_confidence = 0.95
 # ------------------------------------------------------------------------------
 # FALLBACK HISTORICO DEL FILTRO DE TAIL RISK
 # ------------------------------------------------------------------------------
-# False: solo pasan el filtro los activos con momentos BKM validos.
-# True: los activos sin BKM (sin cobertura de opciones, no-USD o MFIS/MFIK
-# inadmisibles) usan asimetria y curtosis historicas llevadas al horizonte.
 tail_risk_hist_fallback = True
 tail_risk_min_survivors = 5
 
@@ -118,11 +113,7 @@ n_divers_candidates = 30
 volatility_percentile = 0.97
 correlation_percentile = 0.90
 max_assets_in_portfolio = 6
-# Poda hasta max_assets. min_weight saca el peso chico. max_mtr es la regla
-# anterior (mayor contribucion marginal: poda defensivos en la cota del 12%).
-# min_weight_x_mtr ordena por peso * contribucion, de menor a mayor.
 tail_prune_rule = "min_weight"
-# Clases duplicadas. El primer ticker de cada grupo se queda.
 dedupe_share_classes = True
 share_class_groups = (("GOOGL", "GOOG"),)
 
@@ -131,8 +122,6 @@ share_class_groups = (("GOOGL", "GOOG"),)
 # ------------------------------------------------------------------------------
 max_weight_per_asset = 0.35
 min_weight_per_asset = 0.001
-# En cada iteracion de la poda se sacan de una vez los activos por debajo de
-# este peso, si el resto sigue siendo factible. 0.0 lo desactiva.
 prune_below_weight = 0.01
 
 # ------------------------------------------------------------------------------
@@ -168,19 +157,11 @@ annualization_factor = 52
 # ------------------------------------------------------------------------------
 # FILTRO DELTA (COLCHON OTM), IV ATM (~30 DTE) Y GRIEGAS DE DIAGNOSTICO
 # ------------------------------------------------------------------------------
-# El filtro viejo (delta BS de una call ATM >= delta_min) no separaba nada
-# (M-3): con K = S la delta siempre supera 0.5. Este usa el diseno de QU:
-# colchon = delta(K=S) - delta(K=S*exp(m)), m = delta_otm_log_m * sqrt(T / T_ref),
-# con T = horizon_months / 12. Alto si la vol es baja. Solo filtra; no
-# escala los retornos. IV de Polygon si hay cadena; si no, vol historica.
-# Los nombres sin vol se conservan.
 use_delta_filter = True
 # Conservador 0.24, moderado 0.18, agresivo 0.15.
 delta_min = 0.15
 delta_otm_log_m = 0.08
 delta_otm_ref_months = 2
-# La tabla de griegas usa la delta real de la call ATM (diagnostico, no filtra).
-# La IV ATM tambien entra al shrinkage de la covarianza.
 delta_strike_mode = "atm"
 target_dte_iv = 30
 dte_tol_iv = 21
@@ -198,28 +179,16 @@ ratio_band = 0.20
 # ------------------------------------------------------------------------------
 # COVARIANZA HISTORICA: EWMA + SHRINKAGE LEDOIT-WOLF
 # ------------------------------------------------------------------------------
-# hist_cov_frequency:
-#   "daily"  : retornos diarios (mas precision en varianzas, Merton 1980), pero
-#              los cierres de Tokio/Europa/EE. UU. no son sincronicos y las
-#              correlaciones entre zonas horarias quedan subestimadas (M-2).
-#   "weekly" : retornos semanales; el desfase de cierres es una fraccion
-#              pequena del intervalo y la correlacion es robusta.
-#   "auto"   : weekly si hay algun ticker de bolsa no estadounidense en el
-#              pool final, daily si todos cotizan en EE. UU.
 hist_cov_frequency = "auto"
 cov_halflife_days = 120
 cov_halflife_weeks = 26
 use_lw_shrinkage = True
 
-# Peso de la covarianza historica en el blend con la implicita de factores.
 hist_shrink_alpha = 0.35
 
 # ------------------------------------------------------------------------------
 # ALINEACION DE PRECIOS MULTI-MERCADO
 # ------------------------------------------------------------------------------
-# Festivos locales: cada ticker se rellena hacia adelante como maximo
-# max_ffill_days sobre el calendario del benchmark (M-1). Lagunas mas largas
-# siguen eliminando la fila.
 max_ffill_days = 2
 min_price_coverage = 0.80
 
@@ -418,12 +387,8 @@ ticker_currency_by_suffix = {
     ".L": "GBP",
     ".T": "JPY",
 }
-# Overrides manuales. Solo se usan si el proveedor no informa la moneda; si la
-# contradicen se avisa y gana el proveedor. El antiguo {"HSBC": "GBP",
-# "BP": "GBP"} era incorrecto: ambos son ADRs de NYSE cotizados en USD (A-2).
 ticker_currency_override = {}
 
-# Se rellena tras la descarga con history_metadata["currency"] de yfinance.
 provider_currency = {}
 ticker_currency = {}
 
@@ -441,9 +406,6 @@ def get_currency_for_ticker(ticker):
 
 
 n_top_international = min(n_top_international, len(international_tickers_full))
-# Top N por market cap en USD, no por la posicion en la lista (los primeros 15
-# eran todos .TO). Sin market cap van al final en su orden; si yfinance falla
-# por completo se usa el orden de la lista. No hay peso minimo internacional.
 _mc_intl = md.ordenar_por_market_cap(international_tickers_full, n_top_international,
                                      ticker_currency_by_suffix, fx_pairs)
 international_tickers = _mc_intl["seleccion"]
@@ -466,13 +428,8 @@ international_tickers_clean = list(dict.fromkeys(t.upper() for t in internationa
 tickers_domesticos = list(dict.fromkeys(
     sp500_tickers_clean + nasdaq_tickers_clean + etf_tickers_clean + commodity_tickers_clean
 ))
-# El formato US solo en domesticos. En la lista mezclada tiraba SHOP.TO,
-# ULVR.L, TTE.PA y 7203.T. No hay piso de peso internacional.
 all_tickers = md.combinar_tickers(tickers_domesticos, international_tickers_clean)
 
-# Sin relleno hasta un total objetivo: el universo es exactamente el top N por
-# market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
-# mid-caps que el optimizador terminaba favoreciendo.
 all_tickers = list(dict.fromkeys(all_tickers))
 if dedupe_share_classes:
     all_tickers, _clases = md.dedupe_share_classes(all_tickers, share_class_groups)
@@ -542,7 +499,6 @@ for i, ticker in enumerate(all_tickers, start=1):
         cur_prov = data.attrs.get("currency")
         if cur_prov:
             provider_currency[ticker] = cur_prov
-            # GBp / ZAc: el proveedor cotiza en unidad menor; se lleva a la unidad mayor.
             data["adjusted"] = data["adjusted"] * md.price_scale_factor(cur_prov)
         stock_data_list[ticker] = data
         successful_tickers.append(ticker)
@@ -599,11 +555,6 @@ prices_wide = stock_data.pivot_table(index="date", columns="symbol", values="adj
 # ------------------------------------------------------------------------------
 # ALINEACION MULTI-MERCADO (M-1): calendario del benchmark + ffill acotado
 # ------------------------------------------------------------------------------
-# Antes: prices_wide.dropna() borraba la fila entera cuando CUALQUIER mercado
-# (Tokio, Londres, Toronto, ...) estaba cerrado: ~12% de los dias, con huecos
-# de 4-5 dias que distorsionaban los retornos "diarios" y el ultimo precio
-# semanal. Ahora cada ticker se rellena hasta max_ffill_days sobre los dias
-# de negociacion de SPY y solo se descartan las filas con lagunas mayores.
 benchmark_calendar = pd.DatetimeIndex(benchmark_data["date"])
 prices_wide_clean, align_info = md.align_prices_to_calendar(
     prices_wide, benchmark_calendar, max_ffill=max_ffill_days, min_coverage=min_price_coverage)
@@ -621,8 +572,6 @@ print(f"[INFO] Dias rellenados por festivos locales (ffill <= {max_ffill_days}):
 if len(prices_wide_clean) == 0:
     raise RuntimeError("Error: No hay datos despues de alinear los precios.")
 
-# Ultima semana parcial (B-6): resample("W") etiqueta el domingo; si el ultimo
-# dato no llega al viernes, la ultima fila mezcla una semana incompleta.
 last_daily_date = prices_wide_clean.index.max()
 prices_weekly, semana_parcial = md.drop_partial_last_week(
     prices_wide_clean.resample("W").last(), last_daily_date)
@@ -922,9 +871,6 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     fC_X = (12 * np.log(Kc / S) ** 2 - 4 * np.log(Kc / S) ** 3) / Kc ** 2 * Cc
     fP_X = (12 * np.log(S / Kp) ** 2 + 4 * np.log(S / Kp) ** 3) / Kp ** 2 * Pp
 
-    # rk.trapezoid: np.trapezoid (numpy >= 2) o np.trapz. Antes np.trapezoid
-    # fallaba con numpy 1.x dentro de este try y TODOS los activos caian al
-    # historico en silencio (A-1).
     try:
         V = rk.trapezoid(fC_V, Kc) + rk.trapezoid(fP_V, Kp)
         W = rk.trapezoid(fC_W, Kc) - rk.trapezoid(fP_W, Kp)
@@ -973,9 +919,6 @@ def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
         mom.update(spot=S, dte=np.nan, expiracion=None, transitorio=False)
         return mom
 
-    # Plazo REAL de los contratos elegidos (A-3): la MFIV es la varianza
-    # integrada hasta ese vencimiento, no hasta target_dte ni hasta el
-    # horizonte del portafolio.
     dte = info_cadena["dte"] if np.isfinite(info_cadena["dte"]) and info_cadena["dte"] > 0 else target_dte
     T = rk.to_years(dte=dte)
     calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df)
@@ -1056,8 +999,6 @@ def bkm_resumen_fallbacks(tickers, titulo):
 # ==============================================================================
 # SPOT E IV ATM (~30 DTE) PARA SHRINKAGE Y GRIEGAS DE DIAGNOSTICO
 # ==============================================================================
-# La IV ATM de Polygon alimenta el filtro Delta (colchon OTM) que sigue, el
-# shrinkage de la covarianza y las griegas de diagnostico.
 print(f"\nConsultando spot + IV ATM (~{target_dte_iv} DTE) para {len(selected_pre_seasonal)} activos "
       "(uso: shrinkage de covarianza y griegas de diagnostico)...")
 spot_cache = {t: get_spot_safe(t) for t in selected_pre_seasonal}
@@ -1073,10 +1014,6 @@ else:
 # ==============================================================================
 # FILTRO DELTA: COLCHON OTM
 # ==============================================================================
-# Mismo diseno que quadratic_utility.
-# Va antes del filtro de cola, donde estaba el filtro ATM eliminado (M-3).
-# colchon = delta(K=S) - delta(K=S*exp(m)); un umbral alto se queda con la vol
-# baja. La delta ATM de Polygon no se usa aqui: ronda 0.5 y no separa.
 if use_delta_filter:
     T_delta = horizon_months / 12
     m_otm = qm.otm_log_moneyness(delta_otm_log_m, T_delta, delta_otm_ref_months / 12.0)
@@ -1161,9 +1098,6 @@ for ticker in selected_pre_seasonal:
     fila = dict(Symbol=ticker, MFIV=np.nan, MFIS=np.nan, MFIK=np.nan, VaR_CF=np.nan,
                 HV_Annual=hv_annual, N_Obs=n_obs, Fuente=None, DTE=np.nan)
     if mom["ok"] and np.isfinite(mom["mfis"]):
-        # Momentos crudos de la cadena, escalados al DTE objetivo antes del VaR.
-        # La vol Q se lleva a P con la misma correccion que la covarianza (B-3),
-        # tambien al objetivo. La tabla guarda MFIS/MFIK sin escalar.
         dte_chain = mom["dte"] if np.isfinite(mom.get("dte", np.nan)) else target_dte_iv
         esc = rk.scale_bkm_moments(mom["mfiv"], mom["mfis"], mom["mfik"], dte_chain, target_dte_iv)
         sigma_T_q = math.sqrt(esc["mfiv"])
@@ -1265,7 +1199,6 @@ descriptive_stats = pd.DataFrame({
 descriptive_stats["MFIV_T"] = [bkm_moments_cache.get(c, {}).get("mfiv", np.nan) for c in log_returns_selected.columns]
 descriptive_stats["MFIS_Q"] = [bkm_moments_cache.get(c, {}).get("mfis", np.nan) for c in log_returns_selected.columns]
 descriptive_stats["MFIK_Q"] = [bkm_moments_cache.get(c, {}).get("mfik", np.nan) for c in log_returns_selected.columns]
-# Anualizada con el DTE real de cada cadena, no con el horizonte del portafolio (A-3)
 descriptive_stats["MFIV_Vol_Anual_Q"] = [bkm_annual_vol(c, medida="Q") for c in log_returns_selected.columns]
 
 disp = descriptive_stats.copy()
@@ -1297,8 +1230,6 @@ benchmark_iv = "SPY"
 
 print("\nEstimando MFIV (BKM) para covarianza forward-looking...")
 
-# Vol anual Q por activo, anualizada con el DTE real de su cadena (A-3). La
-# correccion Q->P se aplica abajo sobre el vector completo (incluye fallbacks).
 iv_assets_implied = np.array([bkm_annual_vol(t, medida="Q") for t in selected_tickers])
 
 n_iv_ok = np.sum(~pd.isna(iv_assets_implied))
@@ -1332,9 +1263,6 @@ print(f"     sd_ret (semanal, primeros 3):      {sd_ret.values[0]:.6f} | {sd_ret
 print(f"     sd_hist_annual (primeros 3):       {sd_hist_annual[0]:.6f} | {sd_hist_annual[1]:.6f} | {sd_hist_annual[2]:.6f}")
 print(f"     iv_final (post Q->P, primeros 3):  {iv_final[0]:.6f} | {iv_final[1]:.6f} | {iv_final[2]:.6f}")
 
-# Varianza del factor de mercado en la MISMA medida (P) que la de los activos
-# (M-4). Antes SPY y los ETFs sectoriales entraban en Q mientras los activos
-# ya estaban corregidos, y la varianza "explicada" podia superar la total.
 spy_hist_annual = benchmark_returns.iloc[:, 0].std() * math.sqrt(annualization_factor)
 iv_spy_implied_q = bkm_annual_vol(benchmark_iv, medida="Q") if use_iv_for_horizon else np.nan
 print(f"     iv_spy_implied (MFIV, Q):          {iv_spy_implied_q if not pd.isna(iv_spy_implied_q) else np.nan}")
@@ -1562,8 +1490,6 @@ corr_factors = factor_returns_mat.corr()
 iv_factor = {f: np.nan for f in factor_names}
 iv_factor["MKT"] = iv_spy_implied
 n_factores_q_a_p = 0
-# ETFs sectoriales y de pais: MFIV anualizada con su DTE real y corregida Q->P
-# con su propia vol historica (M-4), igual que los activos. Sin MFIV -> historica.
 for f in sectores_unicos + paises_unicos:
     iv_f = bkm_annual_vol(f, medida="P") if use_iv_for_horizon else np.nan
     if pd.isna(iv_f) or iv_f <= 0:
@@ -1633,10 +1559,6 @@ cov_mat = pd.DataFrame(cov_mat, index=selected_tickers, columns=selected_tickers
 
 print(f"     varianza explicada por mercado+sector+pais+fx (rango): {explained_var.min():.6f} - {explained_var.max():.6f}")
 print(f"     varianza idiosincratica anadida (rango):       {idio_var.min():.6f} - {idio_var.max():.6f}")
-# Activos cuya varianza explicada por factores supera la total: la
-# idiosincratica se trunca al piso y su correlacion implicita queda
-# sobreestimada (M-4). Con factores y activos en la misma medida deberian
-# ser pocos; si son muchos, revisar betas o la correccion Q->P.
 idio_en_piso = [t for t, v in zip(selected_tickers, idio_var_raw) if v <= idio_floor]
 print(f"     activos con varianza idiosincratica en el piso ({idio_floor:g}): {len(idio_en_piso)} de {n_sel}"
       + (f" -> {', '.join(idio_en_piso)}" if idio_en_piso else ""))
@@ -1649,10 +1571,6 @@ print(f"     sqrt(diag(cov_mat)) = vol semanal: {np.sqrt(np.diag(cov_mat.values)
 # ==============================================================================
 cov_scale_d2w = 252.0 / annualization_factor
 
-# Frecuencia de la covarianza historica (M-2). Con tickers de bolsas no
-# estadounidenses en el pool, los cierres diarios no son sincronicos y la
-# correlacion diaria Asia/Europa vs EE. UU. queda subestimada: el optimizador
-# los veria como diversificadores. En "auto" se pasa a semanal en ese caso.
 tickers_no_us_pool = [t for t in selected_tickers if is_non_us_exchange(t)]
 if hist_cov_frequency == "auto":
     cov_freq_usada = "weekly" if tickers_no_us_pool else "daily"
@@ -1936,8 +1854,6 @@ while True:
         break
 
     mtr = compute_marginal_cvar_contrib(current_tickers, w_vec, cm_iter)
-    # Solo se ordenan los activos por encima del piso de 0.1%: los que ya estan
-    # en el piso no reducen n_active y no aparecen en `active`.
     orden_poda = pq.prune_order(active, mtr, tail_prune_rule)
 
     drop_ticker = None
@@ -2000,9 +1916,6 @@ n = len(selected_tickers)
 Dmat_ef = 2 * cov_mat.values + np.eye(n) * (1e-6 * np.mean(np.diag(cov_mat.values)))
 dvec_ef = np.zeros(n)
 
-# Mismas restricciones que el optimizador (cotas, inversion total, banda ETF,
-# tope FX) mas el retorno objetivo (B-5). Los puntos infactibles se cuentan en
-# vez de silenciarse: quadprog lanza ValueError cuando no hay solucion.
 cons_ef = build_qp_constraints(selected_tickers)
 efficient_frontier_rows = []
 n_ef_infactibles = 0
@@ -2053,7 +1966,6 @@ def extract_metrics(opt_obj, label):
     ret_weekly = float(np.sum(w_vec * mr.values))
     risk_weekly = math.sqrt(float(w_vec @ cm.values @ w_vec))
 
-    # Log-retorno exacto del portafolio (B-2); el efectivo no invertido rinde 0.
     port_returns = rk.portfolio_log_returns(ret_mat, w)
     mdd = max_drawdown_from_returns(port_returns)
 
@@ -2094,8 +2006,8 @@ if len(panel_source) >= panel_min_obs:
     panel_final = rk.rescale_panel(Z_panel, mu_semanal, sd_prospectiva)
 
     mom_port = rk.portfolio_moments(w_final_vals, panel_final)
-    port_skew_final = mom_port["skew"]           # semanal
-    port_kurt_exc_final = mom_port["exkurt"]     # semanal
+    port_skew_final = mom_port["skew"]
+    port_kurt_exc_final = mom_port["exkurt"]
 
     mfis_final = np.array([bkm_moments_cache.get(t, {}).get("mfis", np.nan) for t in tickers_final])
     mfik_final = np.array([bkm_moments_cache.get(t, {}).get("mfik", np.nan) for t in tickers_final])
@@ -2107,10 +2019,6 @@ if len(panel_source) >= panel_min_obs:
     else:
         skew_naive, kurt_naive = np.nan, np.nan
 
-    # El panel es semanal; mu y sigma ya estan al horizonte. Asimetria y exceso
-    # de curtosis se llevan al horizonte con la regla iid (S/sqrt(h), K/h),
-    # la misma que usa el filtro por activo (A-4). Antes se mezclaban momentos
-    # semanales con sigma al horizonte y el CVaR quedaba sobreestimado.
     esc_port = rk.scale_moments(rk.to_years(weeks=1), rk.to_years(weeks=horizon_weeks),
                                 skew=port_skew_final, exkurt=port_kurt_exc_final)
     port_skew_horizon = esc_port["skew"]

@@ -49,12 +49,6 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 # ------------------------------------------------------------------------------
 # 1. UNIVERSO DE TICKERS
 # ------------------------------------------------------------------------------
-# El universo es exactamente esta lista: no hay listas paralelas de ETFs ni de
-# internacionales. Vale cualquier ticker de Yahoo Finance: acciones, ETFs o
-# commodities de EE. UU., y de otras bolsas con su sufijo (RY.TO, AZN.L,
-# 7203.T, ASML.AS, 0700.HK...). Un internacional se convierte a USD con la
-# moneda que reporta Yahoo y no se consulta en Polygon (sin opciones en
-# EE. UU.): usa vol y momentos historicos. Los ADRs (HSBC, BP) son de EE. UU.
 TICKERS = [
     "META", "GOOGL", "ORCL", "DELL", "MSFT",
     "BLK", "CRM", "CMCSA", "GS", "REGN",
@@ -98,15 +92,6 @@ Rf = 0.046
 # ------------------------------------------------------------------------------
 # 7. DELTA DE MERCADO
 # ------------------------------------------------------------------------------
-# Independiente del perfil (M-12).
-# "historical" es el comportamiento de siempre: exceso de ~2 anos / varianza,
-# ambos al horizonte. La media corta puede ser negativa y pi hereda el signo.
-# "fixed" usa DELTA_MKT_FIJO (rango habitual de aversion 2-4).
-# "implied" = var_Q de la cartera de mercado / var_P. La prima implicita es
-# la varianza neutral (Martin: el exceso del mercado es SVIX^2 = MFIV de
-# esa cartera) ya disponible en la cadena Q -> P. No es el default: ese
-# cociente suele quedar cerca de 1, no en 2.5, porque la prima ya esta en
-# unidades de varianza.
 DELTA_MKT_MODO = "historical"
 DELTA_MKT_FIJO = 2.5
 
@@ -121,44 +106,22 @@ MDD_START_YEAR = date.today().year - 2
 USAR_IV_POLYGON = True
 MIN_STRIKES_SLICE = 5
 MIN_DIAS_VENCIMIENTO = 5
-# Tope de DTE (calendario) de la calibracion. 2x el horizonte: con 4 meses
-# son 243 dias. Los LEAPs (>~250d) quedaban fuera de la ventana de inversion
-# y, en varianza total, se comian la perdida y clavaban rho en la cota.
-# Si el recorte deja menos de MIN_VENCIMIENTOS_SSVI, se completan con los
-# vencimientos mas cortos por encima del tope.
 MAX_DIAS_VENCIMIENTO = int(round(2.0 * (MESES_HORIZONTE / 12.0) * 365.0))
 MIN_VENCIMIENTOS_SSVI = 3
-# Higiene de la cadena antes del ajuste. Precio bajo piso (centavos con IV
-# rota) u OI conocido por debajo del minimo no entran. OI ausente se conserva.
 SSVI_PRECIO_MIN = 0.10
 SSVI_OI_MIN = 10
-# True: cada vencimiento pesa igual y el residuo se divide por theta^2.
-# Un plazo largo deja de dominar la perdida en w = sigma^2 T.
 SSVI_NORMALIZAR_VENCIMIENTO = True
 SSVI_K_ABS_MAX = 0.5
-# Por vencimiento, |k| <= min(SSVI_K_ABS_MAX, SSVI_K_SD_MAX * sigma_ATM * sqrt(T)).
-# En una semana 3 sigma es ~0.10: un put profundo y viejo (k ~ -0.5, IV rota)
-# no entra al ajuste. La integral BKM sigue en +/- BKM_N_STD sigma.
 SSVI_K_SD_MAX = 3.0
-# |rho| cerca de tanh(3.8) ~ 0.999 es la cota del optimizador, no una sonrisa.
-# Sin strikes de los dos lados rho tampoco se identifica. Esas alas no entran
-# a BKM; se conserva la vol ATM.
 SSVI_RHO_ABS_MAX = 0.95
 SSVI_K_SIDE_MIN = 0.10
 SSVI_MIN_PER_SIDE = 2
-# Momentos cuando la sonrisa se rechaza (rmse, rho en la cota, cadena rota).
-# "historico": skew y curtosis fisicos del ticker al horizonte.
-# "neutro": MFIS=0, MFIK=3.
-# "sector": sonrisa del ETF sectorial que asignes en FALLBACK_ETF_POR_TICKER
-# ({ticker: ETF}, p. ej. {"MSFT": "XLK"}). Los tickers sin entrada, o cuyo ETF
-# no calibra, usan el historico. Vacio por defecto: depende de tu universo.
 FALLBACK_MOMENTOS = "historico"
 FALLBACK_ETF_POR_TICKER = {}
 
 # ------------------------------------------------------------------------------
 # 10. MODULO ECONOMETRICO Q -> P
 # ------------------------------------------------------------------------------
-# Parametros del Bloque 1D.
 PASO_VENTANA_ROLLING = 5
 MIN_VENTANAS_ROLLING = 12
 NW_LAGS_AUTO = True
@@ -175,9 +138,6 @@ MAX_PRIMA_HM_SIGMA = 0.35
 
 COTA_SKEW_P = (-2.5, 1.5)
 COTA_KURT_P = (1.8, 12.0)
-# Misma cota que vrp_ratio_bounds de MV/QU y que rk.q_to_p_vol (B-9).
-# hi = 1.0 impone el signo del VRP: la vol fisica no supera a la implicita.
-# Antes (0.55, 1.25) dejaba sigma_P > sigma_Q, al reves que el resto del repo.
 COTA_RATIO_VOL_P = (0.70, 1.00)
 
 # ------------------------------------------------------------------------------
@@ -190,7 +150,6 @@ USAR_SHRINKAGE_LW = True
 # ------------------------------------------------------------------------------
 # 12. INTEGRACION BAYESIANA NO GAUSSIANA
 # ------------------------------------------------------------------------------
-# Parametros del Bloque 7.
 METODO_POSTERIOR = "entropy_pooling"
 N_ESCENARIOS = 12000
 BOOTSTRAP_BLOQUE = max(21, (MESES_HORIZONTE * DIAS_HABILES_MES) // 4)
@@ -202,26 +161,15 @@ EP_TOL_ENS = 0.10
 # ------------------------------------------------------------------------------
 # 13. RIESGO DE COLA Y MODO DE OPTIMIZACION
 # ------------------------------------------------------------------------------
-# Parametros de los Bloques 7B y 8B.
 NIVEL_CONFIANZA_VAR = 0.95
 BKM_MFIK_MAX = 20.0
-# Tope de MFIK: 20 con cadena corta, hasta BKM_MFIK_MAX_HARD si hay muchos
-# strikes OTM observados (no los puntos de la rejilla sintetica). Un indice
-# liquido supera 20 sin que el momento sea inadmisible.
 BKM_MFIK_MAX_HARD = 80.0
-# Alas de la integral BKM. El ajuste es |k|<=0.5; la integral usa las alas
-# SSVI (GJ ya chequeado) en +/- BKM_N_STD * sigma * sqrt(T). Recortar al
-# k del ajuste dejaba MFIK < 3. +/-6 sigma inflaba el MFIV (META ~4x).
 BKM_N_STD = 3.0
 BKM_MFIV_RATIO = (0.80, 2.0)
 NIVELES_CVAR = (0.95, 0.99)
 UMBRAL_OMEGA_RATIO = 0.0
 
 MODO_OPTIMIZACION = "mvsk"
-# NOTA DE DISENO (B-10), no se recalibra: LAMBDA3 y LAMBDA4 ponderan momentos
-# centrales crudos (skew * sigma^3, exceso de curtosis * sigma^4). Frente a
-# mu del horizonte y a (gamma/2) w'Sigma w esos terminos quedan en ordenes
-# menores, asi que el objetivo MVSK se comporta casi como media-varianza.
 LAMBDA3 = 1.0
 LAMBDA4 = 1.0
 ALPHA_CVAR_OBJETIVO = 0.95
@@ -231,13 +179,9 @@ MAX_ESCENARIOS_LP = 4000
 # ------------------------------------------------------------------------------
 # MODO SMOKE
 # ------------------------------------------------------------------------------
-# AMPM_SMOKE=1 ejecuta el script con universo chico y sin Polygon, para que
-# un test pueda recorrer el camino hasta Cornish-Fisher (el alias `rk` no
-# puede quedar pisado por un array).
 _es_smoke = os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}
 if _es_smoke:
     USAR_IV_POLYGON = False
-    # AMPM_SMOKE_TICKERS="AAPL,AZN.L" cambia el universo del smoke.
     TICKERS = os.environ.get("AMPM_SMOKE_TICKERS", "AAPL,MSFT,SPY").split(",")
     N_ESCENARIOS = 60
     N_REP_BOOTSTRAP_MOM = 2
@@ -284,12 +228,9 @@ rng_global = np.random.default_rng(SEMILLA)
 # ==============================================================================
 # BLOQUE 0B: HORIZONTE Y UNIVERSO
 # ==============================================================================
-# El universo es TICKERS tal cual, sin duplicados. No se le aplica el filtro
-# de formato US: un sufijo de bolsa (.TO, .L, .T, .HK...) se conserva.
 TICKERS = list(dict.fromkeys(str(t).strip().upper() for t in TICKERS if str(t).strip()))
 if len(TICKERS) < 2:
     raise ValueError("TICKERS debe tener al menos 2 tickers distintos")
-# Internacional = cotiza fuera de EE. UU. (sin cadena de opciones en Polygon).
 _intl_universo = [t for t in TICKERS if not pc.is_us_ticker(t)]
 
 horizonte_dias = MESES_HORIZONTE * DIAS_HABILES_MES
@@ -310,11 +251,6 @@ print()
 # ==============================================================================
 # MAPEO DE MONEDA POR SUFIJO + PARES FX
 # ==============================================================================
-# Para la conversion a USD.
-# La moneda sale de Yahoo (history_metadata). El sufijo es el respaldo si
-# Yahoo no la informa. HSBC y BP son ADRs en USD: no van en el override.
-# .TO es CAD, no JPY. Solo se descarga el FX de las monedas del universo; una
-# moneda sin par en fx_pairs usa {MONEDA}USD=X (USD por unidad).
 fx_pairs = {
     "CAD": {"ticker": "CAD=X", "invert": True},
     "EUR": {"ticker": "EURUSD=X", "invert": False},
@@ -430,7 +366,6 @@ def descargar_precio(ticker, start, end, max_retries=3, fx_prices=None):
     return None
 
 
-# FX solo de las monedas que aparezcan en el universo, al descargar cada precio.
 _fx_desde = min(pd.Timestamp(fecha_inicio), pd.Timestamp(date(MDD_START_YEAR, 1, 1)))
 fx_prices_diarios = {}
 
@@ -461,8 +396,6 @@ else:
     else:
         print(f"  Ultima barra: {_ultima_barra.date()} (incluye el dia de hoy).")
 
-# Festivo en Tokio o Frankfurt no debe borrar el dia de Nueva York (M-1).
-# Solo cuando hay bolsa no estadounidense: el universo US se queda igual.
 if len(precios_diarios.columns) and any(not pc.is_us_ticker(t) for t in precios_diarios.columns):
     _ref_cal = precios_diarios.notna().sum().idxmax()
     _cal = precios_diarios.index[precios_diarios[_ref_cal].notna()]
@@ -520,7 +453,6 @@ if USAR_COV_DIARIA:
 if Sigma_sem is None:
     Sigma_sem = retornos_sem.cov().values
 
-# Al horizonte (semanal x factor de semanas), no anual (M-11). mu_historico igual.
 Sigma_hist = Sigma_sem * factor_anualizacion
 D_hist_inv = np.diag(1 / np.sqrt(np.diag(Sigma_hist)))
 Corr_hist = D_hist_inv @ Sigma_hist @ D_hist_inv
@@ -600,8 +532,6 @@ if USAR_IV_POLYGON:
         if len(chain_raw) == 0:
             raise ValueError("Cadena vacia")
         df = parse_chain(chain_raw)
-        # sqrt(w/T) es la vol ANUAL y no depende de las alas. Se conserva
-        # aunque el RMSE de la sonrisa supere el umbral.
         return bm.calibrar_superficie_ssvi(
             df, tau_obj, pd.Timestamp(date.today()),
             min_strikes=min_strikes, min_dias=min_dias,
@@ -646,8 +576,6 @@ if USAR_IV_POLYGON:
     detalle_sector = {}
 
     for tk in tickers:
-        # Opciones solo en cadena US. Un internacional sin contrato en Polygon
-        # sigue el camino historico (sin_opciones_us), no se consulta la API.
         if not pc.is_us_ticker(tk):
             sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
                 np.nan, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
@@ -863,8 +791,6 @@ for tk in tickers:
             raise ValueError("sin spot")
         F_tk = S_tk * np.exp(r_bkm * tau_horizonte)
         theta_tau_tk = det["sigma_atm_annual"] ** 2 * tau_horizonte
-        # Sin k_min/k_max: la integral es +/- BKM_N_STD sigma al horizonte,
-        # sobre las alas SSVI. El k del ajuste (|k|<=0.5) no recorta.
         resultado_bkm = calcular_bkm_moments(
             S=S_tk, F=F_tk, T=tau_horizonte, r=r_bkm,
             rho=det["rho"], eta=det["eta"], gamma=det["gamma"],
@@ -938,7 +864,6 @@ peso_tiempo = peso_tiempo / peso_tiempo.sum()
 # ==============================================================================
 # 1D.0  BOOTSTRAP ESTACIONARIO POR BLOQUES
 # ==============================================================================
-# Compartido con el Bloque 7.
 
 def bootstrap_estacionario(R, J, H, L_bloque, pesos_inicio, rng, chunk=2000):
     """Panel (J x n) de log-retornos agregados a H dias.
@@ -971,7 +896,6 @@ def bootstrap_estacionario(R, J, H, L_bloque, pesos_inicio, rng, chunk=2000):
 # ==============================================================================
 # 1D.1a  ESTIMADOR DE VENTANAS RODANTES
 # ==============================================================================
-# Diagnostico.
 
 def momentos_realizados_rolling(serie_diaria, H=H_VENTANA, paso=PASO_VENTANA_ROLLING):
     """Momentos realizados del retorno agregado a H dias, en ventanas rodantes.
@@ -1054,7 +978,6 @@ def media_hac(x):
 
 filas_roll = []
 for tk in tickers:
-    # kurt_roll, no `rk`: ese nombre es el modulo risk_estimators.
     rv, rs, kurt_roll = momentos_realizados_rolling(retornos_dia[tk])
     if len(rv) < MIN_VENTANAS_ROLLING:
         filas_roll.append(dict(ticker=tk, n_ventanas=len(rv),
@@ -1073,7 +996,6 @@ rolling = pd.DataFrame(filas_roll).set_index("ticker").loc[tickers]
 # ==============================================================================
 # 1D.1b  ESTIMADOR BOOTSTRAP DE LA DISTRIBUCION A H DIAS
 # ==============================================================================
-# Estimador primario.
 
 def momentos_horizonte_bootstrap(R, H, n_rep=N_REP_BOOTSTRAP_MOM,
                                  J_rep=J_POR_REPLICA_MOM, rng=None):
@@ -1230,8 +1152,6 @@ print(pd.DataFrame({
 MFIV_vec = np.array([bkm_moments[t]["MFIV"] for t in tickers], dtype=float)
 n_mfiv_fallback = 0
 for i, tk in enumerate(tickers):
-    # La diagonal de Sigma_horizon ya es varianza al horizonte. Antes, con
-    # SSVI bien y BKM mal, aqui entraba sigma_atm^2 anual (~1/tau veces mayor).
     previo = MFIV_vec[i]
     MFIV_vec[i] = bm.mfiv_or_horizon_variance(previo, float(Sigma_horizon.iloc[i, i]))
     if not (np.isfinite(previo) and previo > 0):
@@ -1501,9 +1421,6 @@ print(f"\n  Sigma_P construida. Vol media Q: {np.mean(np.sqrt(MFIV_vec)):.4f} | 
 print("\n=== Extrayendo market caps via Yahoo Finance ===")
 
 
-# Market cap en USD con la misma moneda de los precios: yfinance lo da en la
-# moneda de cotizacion (AZN.L en peniques via fast_info, 7203.T en yenes) y
-# sin convertir un internacional dominaba w_mkt.
 _monedas_bl = {t: ticker_currency.get(t) for t in tickers}
 _fx_spot_bl = {m: float(s.dropna().iloc[-1]) for m, s in fx_prices_diarios.items() if len(s.dropna())}
 _caps_bl = md.market_caps_usd(
@@ -1551,7 +1468,6 @@ desc_perfiles = dict(
 # ==============================================================================
 # DELTA DE MERCADO
 # ==============================================================================
-# No depende del perfil. Modo: DELTA_MKT_MODO (M-12).
 Rf_h = Rf * (MESES_HORIZONTE / 12)
 ret_mkt_hist = float(w_mkt @ mu_historico)
 var_mkt_hist = float(w_mkt @ Sigma_hist @ w_mkt)
@@ -1691,7 +1607,6 @@ prima_hm = np.clip(prima_hm, -tope_hm, tope_hm)
 # ==============================================================================
 # 4B.2  INCERTIDUMBRE DE LA PRIMA NO GAUSSIANA
 # ==============================================================================
-# Alimenta Omega.
 
 se_prima_hm = np.zeros(n)
 for i in range(n):
@@ -1763,7 +1678,6 @@ print(referencia_views.sort_values("Diff_Hist_Pi", ascending=False).to_string(in
 # ==============================================================================
 # BLOQUE 6: VIEWS DEL GESTOR
 # ==============================================================================
-# Edita aqui los views: pasos 1 a 3.
 
 # ==============================================================================
 # PASO 1: DEFINE CUANTOS VIEWS TIENES
@@ -1886,7 +1800,6 @@ print("=" * 79)
 # ==============================================================================
 # 7.1  PANEL DE ESCENARIOS PRIOR
 # ==============================================================================
-# Bootstrap estacionario, funcion del Bloque 1D.
 
 print(f"\nGenerando panel de {N_ESCENARIOS} escenarios "
       f"(bootstrap estacionario, bloque medio {BOOTSTRAP_BLOQUE} dias, "
@@ -2482,7 +2395,6 @@ if _intl_universo:
 # ==============================================================================
 # BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL
 # ==============================================================================
-# Portafolio de control.
 
 print("\n" + "=" * 79)
 print("BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL (CONTROL)")
@@ -2541,7 +2453,6 @@ print("=" * 79)
 # ==============================================================================
 # PANEL HISTORICO DE RETORNOS AL HORIZONTE
 # ==============================================================================
-# Ventanas solapadas.
 ret_hist_horizonte = (retornos_dia[tickers]
                       .rolling(horizonte_dias)
                       .sum()
@@ -2765,7 +2676,6 @@ fecha_mdd_inicio = date(MDD_START_YEAR, 1, 1)
 series_ok = {}
 for tk in tickers_bl:
     serie = descargar_precio(tk, fecha_mdd_inicio, date.today(), fx_prices=fx_prices_diarios)
-    # BRK.B <-> BRK-B solo en EE. UU.: en un internacional el punto es la bolsa.
     if (serie is None or len(serie) == 0) and pc.is_us_ticker(tk):
         alt = tk.replace(".", "-") if "." in tk else tk.replace("-", ".")
         serie = descargar_precio(alt, fecha_mdd_inicio, date.today(), fx_prices=fx_prices_diarios)
@@ -2790,7 +2700,6 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
     retornos_diarios_mdd = np.log(precios_mdd / precios_mdd.shift(1)).dropna(how="all")
 
     def port_ret_row(fila):
-        # Log exacto del portafolio. La suma de logs solo coincide a primer orden.
         return bm.log_portfolio_return(fila, weights_bl)
 
     retornos_diarios_mdd = retornos_diarios_mdd[tickers_bl]
@@ -2831,8 +2740,6 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
         mdd_clean = mdd_anual
 
     mdd_mediana = mdd_clean["mdd"].median()
-    # MDD es negativo: el escenario conservador es la cola baja (P10). El P90
-    # quedaba mas leve que la mediana.
     mdd_p10 = mdd_clean["mdd"].quantile(0.10)
     mdd_media = mdd_clean["mdd"].mean()
     mdd_peor = mdd_clean["mdd"].min()

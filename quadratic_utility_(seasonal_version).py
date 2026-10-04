@@ -71,8 +71,6 @@ rebalance_n_months = 1
 # ------------------------------------------------------------------------------
 # PARAMETROS GENERALES
 # ------------------------------------------------------------------------------
-# Hasta el ultimo mes completo (M-6). El arranque 2016 se conserva: no es el
-# mismo objeto que el 2014 del script base. La tasa si se alinea (B-9).
 as_of_date = date.today()
 history_start_year = 2016
 target_years, history_start, history_end = qm.history_window(as_of_date, history_start_year)
@@ -91,8 +89,6 @@ lookback_months = None
 # AVERSION AL RIESGO Y PONDERADORES DE SELECCION
 # ------------------------------------------------------------------------------
 lambda_ = 1.5
-# Opt-in (M-8). None conserva lambda_ tal cual, en unidades mensuales.
-# Si se fija, lambda_ = lambda_annual * 12. Ver qu_metrics.lambda_monthly_from_annual.
 lambda_annual = None
 weight_sharpe = 0.55
 weight_low_vol = 0.15
@@ -130,18 +126,9 @@ seasonal_min_survivors = 14
 # ------------------------------------------------------------------------------
 bkm_moneyness_lo = 0.70
 bkm_moneyness_hi = 1.40
-# La historia de MFIS usa la cadena OTM completa de un vencimiento (A-5), no
-# una rejilla de 7 puntos. El presupuesto cuenta ~estos contratos con precio
-# por fecha (el agregado de cada contrato se pide una vez, en rango).
-# polygon_client pasa las llamadas a minutos con POLYGON_CALLS_PER_MIN
-# (default 1200). bkm_hist_max_minutes es un presupuesto: se procesan tickers
-# de EE. UU. con MFIS actual finito, en el orden de los candidatos, hasta
-# agotarlo. El que no entra queda marcado, no se da por evaluado.
 bkm_hist_contracts_estimate = 26
 bkm_min_options_per_side = 3
 bkm_mfik_max = 20.0
-# Cadena corta: tope 20. Cadena densa (muchos strikes OTM): hasta este techo.
-# SPY y otros indices superan 20 con alas liquidas; no se descartan por eso.
 bkm_mfik_max_hard = 80.0
 bkm_lookback_months = 12
 bkm_hist_sample_freq = "2W"
@@ -150,9 +137,6 @@ bkm_hist_min_valid = 8
 bkm_hist_max_minutes = 60
 bkm_max_workers = 12
 bkm_z_threshold = 2.00
-# Cola del z de MFIS (M-9). "upper" conserva el comportamiento: descarta
-# z > umbral (demanda de calls; antes etiquetado cobertura_anomala).
-# "lower" descarta z < -umbral (demanda de puts). "both" usa las dos colas.
 bkm_tail_mode = "upper"
 bkm_min_survivors = 12
 cornish_fisher_confidence = 0.95
@@ -171,9 +155,6 @@ use_q_to_p_vol = True
 vrp_ratio_bounds = (0.70, 1.00)
 vrp_fallback_ratio = 0.90
 use_q_to_p_correlation = True
-# La cesta de dispersion tiene que cubrir esta fraccion de la cap conocida
-# de los componentes de SPY, y conocer al menos estas caps. Si no, se usa
-# la correlacion realizada. La implicita que si entra se recorta a >= 0.
 dispersion_min_cap_share = 0.40
 dispersion_min_known_caps = 50
 crp_ratio_bounds = (0.60, 1.00)
@@ -205,29 +186,15 @@ ideal_observations = 60
 # FILTRO DELTA
 # ------------------------------------------------------------------------------
 use_delta_filter = True
-# Colchon de delta (ATM menos OTM). Umbral del perfil agresivo: solo caen
-# las vols mas altas. El horizonte es len(rebalance_months): 1 mes con [10],
-# 2 meses con [10, 11]. La moneyness escala con sqrt(T / T_ref).
 # Conservador 0.24, moderado 0.18, agresivo 0.15.
 delta_min = 0.15
-# direct: el multiplicador es la delta, recortada a [delta_min, 1].
-# fixed: mapea [delta_scale_lo, delta_scale_hi] a [delta_min, 1].
-# minmax: estira el rango observado de la corrida (la regla anterior).
-# relative: colchon / mediana, recortada a [delta_rel_lo, delta_rel_hi].
-# La mediana queda en 1, asi que el nivel no reescala lambda.
 delta_scale_mode = "relative"
 delta_scale_lo = 0.45
 delta_scale_hi = 0.55
 delta_rel_lo = 0.75
 delta_rel_hi = 1.25
-# Menos acciones que esto: la correlacion implicita del sector no se usa.
 sector_implied_min_names = 4
-# atm: K = S. Con la delta real de Polygon (o BS ATM) todas caen en
-# ~0.50-0.58 y delta_min no separa perfiles. mu: strike al retorno esperado.
-# rf: strike forward. otm: colchon de delta hasta un log-moneyness fijo.
 delta_strike_mode = "otm"
-# Log-moneyness del strike OTM en el horizonte de referencia. Se escala con
-# sqrt(plazo / referencia). El plazo es len(rebalance_months) / 12.
 delta_otm_log_m = 0.08
 delta_otm_ref_months = 2
 iv_outlier_multiplier = 6.0
@@ -242,15 +209,7 @@ max_region_weight = 0.80
 # ------------------------------------------------------------------------------
 pct_etf_deseado = 0.10
 pct_etf_tolerancia = 0.10
-# Piso de la banda alcanzable: hacen falta ceil(piso / max_weight) ETF en el
-# optimizador. Si los filtros dejan menos, se completan con ETF de etapas
-# previas que superen los filtros duros (ver PRECEDENCIA en el filtro
-# estacional). Se reservan hasta este multiplo de los ETF necesarios desde el
-# pre-filtro.
 etf_floor_reserve_factor = 3
-# Si aun asi la banda no se puede cumplir: True baja el piso al maximo
-# alcanzable (n_ETF x max_weight) y lo avisa; False detiene la corrida con
-# el diagnostico en vez del "constraints are inconsistent" de quadprog.
 etf_band_relax_if_infeasible = True
 
 # ------------------------------------------------------------------------------
@@ -464,8 +423,6 @@ def polygon_contracts_asof(ticker, strike_lo, strike_hi, exp_min, exp_max, as_of
 
 def polygon_contract_close_near(contract_ticker, target_date, window_days=5, api_key=None):
     """Cierre diario del contrato mas cercano a target_date. Devuelve (precio, definitivo)."""
-    # Solo agregados de opciones (O:...). Un agregado de accion devuelve 403
-    # en este plan y no se usa: los precios salen de yfinance.
     if not str(contract_ticker).startswith("O:"):
         return np.nan, True
     target_d = pd.Timestamp(target_date)
@@ -526,8 +483,6 @@ def bkm_compute_moments(S, r, T, calls_df, puts_df):
     fP_X = (12 * np.log(S / Kp) ** 2 + 4 * np.log(S / Kp) ** 3) / Kp ** 2 * Pp
 
     try:
-        # rk.trapezoid cubre numpy 1.x y 2.x. Un AttributeError de np.trapezoid
-        # caia en este except y mandaba a TODOS los tickers al fallback (A-1).
         V = rk.trapezoid(fC_V, Kc) + rk.trapezoid(fP_V, Kp)
         W = rk.trapezoid(fC_W, Kc) - rk.trapezoid(fP_W, Kp)
         X = rk.trapezoid(fC_X, Kc) + rk.trapezoid(fP_X, Kp)
@@ -753,8 +708,6 @@ def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, 
         puts_df = pd.DataFrame(datos["puts"], columns=["strike", "price"])
         mom = bkm_compute_moments(datos["S"], rf, rk.to_years(dte=float(dte_i)), calls_df, puts_df)
         if mom["ok"] and np.isfinite(mom["mfis"]):
-            # La cache guarda la cadena cruda. El z-score compara MFIS ya
-            # llevado al DTE objetivo, cada observacion desde su propio DTE.
             mfis_hist[i] = rk.scale_bkm_moments(
                 mom["mfiv"], mom["mfis"], mom["mfik"], float(dte_i), float(target_dte))["mfis"]
             validos += 1
@@ -932,9 +885,6 @@ ticker_currency_by_suffix = {
     ".L": "GBP",
     ".T": "JPY",
 }
-# Vacio a proposito (A-2). HSBC y BP son ADRs en USD; un override que
-# contradiga al proveedor se registra y no se aplica. Sirve para forzar una
-# moneda solo cuando yfinance no informa ninguna.
 ticker_currency_override = {}
 provider_currency = {}
 ticker_currency = {}
@@ -952,9 +902,6 @@ def get_currency_for_ticker(ticker):
     return "USD"
 
 
-# Top n_top_int por market cap en USD, no por la posicion en la lista. Sin
-# market cap van al final en su orden; si yfinance falla por completo se usa
-# el orden de la lista. No hay peso minimo internacional.
 _mc_intl = md.ordenar_por_market_cap(international_tickers_full, n_top_int,
                                      ticker_currency_by_suffix, fx_pairs)
 international_tickers = _mc_intl["seleccion"]
@@ -975,19 +922,11 @@ etf_tickers_clean = list(dict.fromkeys(t.upper() for t in etf_tickers))
 commodity_tickers_clean = list(dict.fromkeys(t.upper() for t in commodity_tickers))
 international_tickers_clean = list(dict.fromkeys(t.upper() for t in international_tickers))
 
-# El formato US (largo 1-5, sin ^/$, sin digito inicial) solo se aplica a
-# domesticos. En la lista ya mezclada tiraba SHOP.TO, ULVR.L, TTE.PA, 7203.T
-# y el resto de sufijos de bolsa. Los internacionales entran despues. No hay
-# piso de peso internacional: si no llegan al portafolio por el flujo, se
-# informa al final.
 tickers_domesticos = list(dict.fromkeys(
     sp500_tickers_clean + nasdaq_tickers_clean + etf_tickers_clean + commodity_tickers_clean
 ))
 all_tickers = qm.combinar_tickers(tickers_domesticos, international_tickers_clean)
 
-# Sin relleno hasta un total objetivo: el universo es exactamente el top N por
-# market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
-# mid-caps ($10-50B) que el optimizador terminaba favoreciendo.
 all_tickers = list(dict.fromkeys(all_tickers))
 _intl_set = set(international_tickers_clean)
 _n_intl_universo = sum(1 for t in all_tickers if t in _intl_set)
@@ -1041,8 +980,6 @@ def download_period_returns(tickers, start, end, period="1mo", fx_prices=None):
             hist = hist[["Close"]].rename(columns={"Close": "adjusted"})
             hist.index = pd.to_datetime(hist.index).tz_localize(None)
 
-            # Moneda del proveedor (A-2). GBp/ZAc se pasan a libras/rand antes
-            # del FX; el factor es constante y no cambia el retorno.
             meta = getattr(yf_tk, "history_metadata", None) or {}
             cur_prov = meta.get("currency")
             if cur_prov:
@@ -1180,8 +1117,6 @@ else:
 returns_wide = df_prices.pivot_table(index="date", columns="symbol", values="monthly_return")
 cor_matrix_full = returns_wide.corr(min_periods=1)
 
-# Fila completa, diagonal fuera (M-5). El agrupado Var1 < Var2 dejaba al
-# ultimo ticker alfabetico sin pares.
 avg_cor_by_ticker = (
     qm.average_abs_correlation(cor_matrix_full).rename("avg_cor").rename_axis("symbol").reset_index()
 )
@@ -1228,7 +1163,6 @@ if ff_data is not None:
             if len(merged) < 3:
                 continue
             try:
-                # Exceso contra la RF del propio mes de Fama-French (B-8), no una tasa constante.
                 merged["excess_return"] = merged["monthly_return"] - merged["RF"]
                 X = sm.add_constant(merged[["Mkt-RF", "SMB", "HML"]])
                 y = merged["excess_return"]
@@ -1407,21 +1341,12 @@ def select_optimal_candidates(df, n_candidates):
     return selected, list(df_candidates["symbol"])
 
 
-# Una sola pasada QUBO (M-13). La primera llamada y el filtro estacional que
-# la seguia se sobreescribian de inmediato con esta misma seleccion.
 ticker_candidates, prefilter_ranking = select_optimal_candidates(combined_stats, n_pre_seasonal)
 print(f"\nPool pre-filtro estacional: {len(ticker_candidates)} candidatos\n")
 
 # ==============================================================================
 # PISO DE ETF: CUANTOS HACEN FALTA Y RESERVA DESDE EL PRE-FILTRO
 # ==============================================================================
-# Misma logica que quadratic_utility.py (E-1). La banda de ETF solo se aplica
-# con include_etfs_in_portfolio. Con piso 0.45 y max_weight 0.12 hacen falta
-# 4 ETF en el optimizador; con 3 (FXI, GLD, MCHI = 36%) quadprog fallaba con
-# "constraints are inconsistent". La reserva son ETF que la QUBO no eligio, en
-# orden de h_score, y luego el resto de ETF elegibles con el mismo criterio.
-# Pasan por Polygon y el filtro delta, pero solo entran al flujo si el piso
-# de ETF los necesita.
 etf_group_set = set(etf_tickers + commodity_tickers)
 etf_band_floor_cfg = max(0.0, pct_etf_deseado - pct_etf_tolerancia) if include_etfs_in_portfolio else 0.0
 n_etf_needed = qm.etfs_necesarios(etf_band_floor_cfg, max_weight)
@@ -1531,8 +1456,6 @@ pc.print_diagnostics("     ")
 # FILTRO DELTA
 # ==============================================================================
 if use_delta_filter:
-    # El plazo del colchon es el horizonte estacional: 1 mes si rebalance_months
-    # tiene un mes ([10]), 2 meses si tiene dos ([10, 11]).
     print(f"\nAplicando filtro Delta (delta_min={delta_min:.2f}, modo={delta_strike_mode}, "
           f"T={horizon_months / 12:.3f} anios, {horizon_months} mes(es) de rebalanceo)...")
     if delta_strike_mode == "otm":
@@ -1588,7 +1511,6 @@ if use_delta_filter:
 
     delta_df = pd.DataFrame(delta_rows)
     delta_named = dict(zip(delta_df["symbol"], delta_df["delta"]))
-    # La reserva de ETF pasa el mismo filtro, pero no entra a los conteos.
     _es_reserva = delta_df["symbol"].isin(set(etf_reserva) - set(ticker_candidates))
     delta_df_reserva = delta_df[_es_reserva].copy()
     delta_df = delta_df[~_es_reserva].copy()
@@ -1654,7 +1576,6 @@ def tabla_ratio_estacional(tickers):
 
 
 seasonal_ratio_stats = tabla_ratio_estacional(ticker_candidates)
-# Reserva de ETF (solo para el piso de ETF), con el mismo ratio para ordenarla.
 reserva_ratio_stats = tabla_ratio_estacional([t for t in etf_reserva if t not in set(ticker_candidates)])
 
 n_pool_post_delta = len(ticker_candidates)
@@ -1688,18 +1609,6 @@ print(disp.rename(columns={"symbol": "Symbol", "seasonal_n_obs": "Semanas", "n_o
       [["Symbol", "SD_Estacional", "Semanas", "SD_General", "Ratio_Anualizado", "Sharpe", "Obs_Mensuales"]]
       .to_string(index=False))
 
-# PRECEDENCIA DE LAS REPOSICIONES (piso de ETF y MFIS), igual que en
-# quadratic_utility.py:
-#   1. Delta y MFIS son filtros duros. Ninguna reposicion trae de vuelta un
-#      nombre que alguno de ellos ya descarto: el pool es post-delta, la
-#      reserva paso el mismo filtro delta y los descartados por MFIS no
-#      vuelven. (Esta version no tiene filtro de IV vs vol. reciente.)
-#   2. El umbral estacional y el techo n_divers_candidates son blandos, igual
-#      que en su piso de sobrevivientes: se repone en orden ascendente de ratio.
-#   3. Piso de ETF: si quedan menos de n_etf_needed ETF, se completan ETF del
-#      pool post-delta y luego de la reserva del pre-filtro.
-#   4. Si el piso de ETF sigue sin alcanzarse, el chequeo previo a quadprog
-#      relaja la banda (o detiene la corrida) con un aviso explicito.
 orden_reposicion = seasonal_ratio_stats.sort_values("seasonal_vol_ratio")["symbol"].tolist()
 orden_reposicion_etf = orden_reposicion + reserva_ratio_stats["symbol"].tolist()
 
@@ -1733,9 +1642,7 @@ sample_dates_bkm = sample_dates_bkm[sample_dates_bkm >= hoy_ts - relativedelta(m
 print(f"   Fechas de muestreo historico: {len(sample_dates_bkm)} (freq={bkm_hist_sample_freq}, "
       f"ancladas a {bkm_hist_anchor})")
 
-# Mismo orden que la reposicion del filtro estacional (ver PRECEDENCIA).
 reponer_pool_bkm = qm.candidatos_reposicion(orden_reposicion, ticker_candidates)
-# Solo para el piso de ETF: incluye la reserva del pre-filtro.
 reponer_pool_bkm_etf = qm.candidatos_reposicion(orden_reposicion_etf, ticker_candidates)
 
 bkm_current_moments = {}
@@ -2014,8 +1921,6 @@ df_wide = (
     .pivot_table(index="date", columns="symbol", values="monthly_return")
     .sort_index()
 )
-# Longitud minima por ticker (M-1). dropna() recortaba todo el panel al que
-# tenia la historia mas corta y esa ventana comun entraba en la media.
 df_wide, dropped_short = qm.columns_with_min_obs(df_wide, min_observations)
 if dropped_short:
     print(f"   Activos fuera del panel por menos de {min_observations} meses: {', '.join(map(str, dropped_short))}")
@@ -2159,8 +2064,6 @@ if use_daily_cov:
     print("\n   Descargando retornos DIARIOS de los finalistas para la covarianza...")
     try:
         fx_prices_daily = download_fx_prices(start_date, end_date, period="1d")
-        # SPY arma el calendario aunque no este en el portafolio. Un nombre de
-        # historia corta se cae de la diaria; no tira la matriz de los demas.
         nombres_diarios = list(dict.fromkeys(list(assets) + ["SPY"]))
         df_daily = download_period_returns(nombres_diarios, start_date, end_date,
                                            period="1d", fx_prices=fx_prices_daily)
@@ -2542,11 +2445,6 @@ Amat, bvec = armar_restricciones(etf_lo, etf_hi)
 # ------------------------------------------------------------------------------
 # CHEQUEO DE FACTIBILIDAD ANTES DE quadprog
 # ------------------------------------------------------------------------------
-# quadprog solo dice "constraints are inconsistent". Aqui se prueba el mismo
-# conjunto con un LP y, si no cierra, se explica por que. Con banda de ETF y
-# etf_band_relax_if_infeasible = True, la banda se lleva a lo alcanzable
-# (piso = n_ETF x max_weight; techo = 1 - n_acciones x max_weight) y se avisa.
-# Si las restricciones ya eran factibles, nada cambia.
 if not qm.restricciones_factibles(Amat, bvec, meq):
     n_etf_opt = len(etf_commodity_assets) if etf_band_active else 0
     n_acc_opt = n - len(excluded_etf_set) - n_etf_opt if etf_band_active else n - len(excluded_etf_set)
