@@ -313,6 +313,33 @@ def nearest_psd(cov, eps_rel=1e-8):
     return out
 
 
+def seasonal_vol_ratio(returns, in_season, bounds=(0.70, 1.50), min_obs=10):
+    """Ratio vol estacional / vol de todo el historial, por columna.
+
+    ratio_i = clip(sd(r_i | temporada) / sd(r_i), lo, hi)
+
+    Escala una covarianza historica con D Sigma D (D = diag(ratio)): cambia la
+    vol de cada activo en la temporada y conserva las correlaciones del
+    historial completo. Estimar n ratios aguanta pocas semanas estacionales;
+    estimar n(n-1)/2 correlaciones no. Con menos de `min_obs` observaciones en
+    temporada, o sin vol finita, el ratio es 1 (sin ajuste).
+    """
+    r = pd.DataFrame(returns)
+    mask = np.asarray(in_season, dtype=bool)
+    if mask.shape[0] != len(r):
+        raise ValueError("in_season debe tener una entrada por fila de returns")
+    lo, hi = bounds
+    sd_total = r.std()
+    r_est = r.loc[mask]
+    sd_est = r_est.std()
+    n_est = r_est.notna().sum()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = sd_est / sd_total
+    valido = (n_est >= min_obs) & np.isfinite(ratio) & (sd_total > 0)
+    ratio = ratio.where(valido, 1.0)
+    return ratio.clip(lo, hi).astype(float)
+
+
 # ==============================================================================
 # 2. CORRECCION Q -> P (PRIMAS DE RIESGO)
 # ==============================================================================

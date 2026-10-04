@@ -127,6 +127,40 @@ def test_nearest_psd_repairs_negative_eigenvalue():
     assert np.allclose(B, B.T)
 
 
+def test_seasonal_vol_ratio_scales_vol_and_keeps_correlation():
+    rng = np.random.default_rng(7)
+    idx = pd.date_range("2018-01-07", periods=420, freq="W")
+    z = rng.multivariate_normal([0, 0], [[1, 0.6], [0.6, 1]], size=len(idx))
+    octubre = idx.month == 10
+    z[octubre, 0] *= 1.3                      # A mas volatil en octubre
+    r = pd.DataFrame(z * 0.02, index=idx, columns=["A", "B"])
+    r["C"] = np.nan
+    r.loc[idx[octubre][:4], "C"] = 0.01       # C: pocas semanas en temporada
+
+    ratio = rk.seasonal_vol_ratio(r, octubre, bounds=(0.70, 1.50), min_obs=10)
+    esperado_a = r.loc[octubre, "A"].std() / r["A"].std()
+    assert ratio["A"] == pytest.approx(esperado_a)
+    assert ratio["A"] > 1.1
+    assert ratio["C"] == 1.0
+
+    S = r[["A", "B"]].cov().values
+    S_est = S * np.outer(ratio[["A", "B"]], ratio[["A", "B"]])
+    corr = lambda M: M[0, 1] / np.sqrt(M[0, 0] * M[1, 1])
+    assert corr(S_est) == pytest.approx(corr(S))
+    assert np.sqrt(S_est[0, 0]) == pytest.approx(np.sqrt(S[0, 0]) * ratio["A"])
+
+
+def test_seasonal_vol_ratio_clips_to_bounds():
+    idx = pd.date_range("2018-01-07", periods=300, freq="W")
+    rng = np.random.default_rng(3)
+    r = pd.DataFrame({"A": rng.normal(0, 0.01, len(idx))}, index=idx)
+    temporada = idx.month == 10
+    r.loc[temporada, "A"] *= 10
+    assert rk.seasonal_vol_ratio(r, temporada, bounds=(0.70, 1.50))["A"] == pytest.approx(1.50)
+    with pytest.raises(ValueError):
+        rk.seasonal_vol_ratio(r, temporada[:-1])
+
+
 # ------------------------------------------------------------------------------
 # 2. Q -> P
 # ------------------------------------------------------------------------------

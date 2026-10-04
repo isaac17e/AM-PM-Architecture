@@ -101,6 +101,15 @@ share_class_groups = (("GOOGL", "GOOG"),)
 seasonal_min_weeks = 10
 
 # ------------------------------------------------------------------------------
+# VOLATILIDAD ESTACIONAL EN LA COVARIANZA HISTORICA
+# ------------------------------------------------------------------------------
+# Escala la vol de cada activo en la covarianza historica (EWMA + LW) por
+# sd(semanas de execution_months) / sd(todo el historial), acotado. Las
+# correlaciones siguen siendo las del historial completo.
+seasonal_vol_scaling = True
+seasonal_vol_ratio_bounds = (0.70, 1.50)
+
+# ------------------------------------------------------------------------------
 # PARAMETROS BKM Y TAIL RISK
 # ------------------------------------------------------------------------------
 bkm_moneyness_lo = 0.70
@@ -1106,6 +1115,7 @@ print(f"\nAplicando filtro de Tail Risk BKM estacional ({execution_label}) - "
       f"VaR_CF a {tail_risk_filter_confidence * 100:.0f}% de confianza...")
 print(f"  VaR_CF al horizonte de {target_dte_iv} dias. MFIS/MFIK de la tabla son los de la cadena; "
       "la cola se calcula con esos momentos escalados al objetivo.")
+print("  VaR_CF sin media (mu = 0): el filtro ordena solo por riesgo.")
 
 log_returns_seasonal = log_returns.loc[log_returns.index.month.isin(execution_months), selected_pre_seasonal]
 
@@ -1113,11 +1123,16 @@ n_seasonal_weeks = len(log_returns_seasonal)
 print(f"  OK Semanas dentro de {execution_label} disponibles: {n_seasonal_weeks}")
 
 if tail_risk_hist_fallback:
-    print("  Fallback historico ACTIVO: los activos sin BKM valido usan momentos historicos estacionales")
+    print("  Fallback historico ACTIVO: los activos sin BKM valido usan vol estacional y "
+          "asimetria/curtosis de todo el historial")
 
 
-def momentos_cola_historicos(r_semanal, dte=None):
+def momentos_cola_historicos(r_semanal, dte=None, r_forma=None):
     """Vol, asimetria y exceso de curtosis al plazo `dte` (dias) desde retornos semanales.
+
+    La vol sale de `r_semanal`. La asimetria y la curtosis salen de `r_forma`
+    si se pasa: con ~35 semanas estacionales la curtosis la domina un solo
+    episodio, asi que la forma de la cola se estima con todo el historial.
 
     Escalado iid centralizado en rk.scale_moments con h = dte / 7 semanas:
     sigma_T = sigma_w sqrt(h), S_T = S_w / sqrt(h), ExK_T = ExK_w / h.
@@ -1127,9 +1142,12 @@ def momentos_cola_historicos(r_semanal, dte=None):
     sd_w = r.std()
     if len(r) < 6 or not np.isfinite(sd_w) or sd_w <= 0:
         return None
+    r_f = r if r_forma is None else pd.Series(r_forma).dropna()
+    if len(r_f) < 6:
+        return None
     dte = target_dte_iv if dte is None or not np.isfinite(dte) else dte
     esc = rk.scale_moments(rk.to_years(weeks=1), rk.to_years(weeks=dte / 7),
-                           sd=sd_w, skew=float(skew(r)), exkurt=float(kurtosis(r)))
+                           sd=sd_w, skew=float(skew(r_f)), exkurt=float(kurtosis(r_f)))
     if not rk.higher_moments_admissible(esc["skew"], esc["exkurt"] + 3.0, bkm_mfik_max):
         return None
     return dict(sigma_T=esc["sd"], skew=esc["skew"], exkurt=esc["exkurt"], dte=dte)
@@ -1139,7 +1157,6 @@ tail_risk_rows = []
 for ticker in selected_pre_seasonal:
     r_seasonal = log_returns_seasonal[ticker].dropna()
     n_obs = len(r_seasonal)
-    mu_weekly_seasonal = r_seasonal.mean() if n_obs > 5 else np.nan
 
     mom = bkm_get_current_moments_cached(ticker)
 
@@ -1162,16 +1179,18 @@ for ticker in selected_pre_seasonal:
         s_T, exk_T = esc["mfis"], esc["mfik"] - 3.0
         dte_t = target_dte_iv
         fila.update(MFIV=mom["mfiv"], MFIS=mom["mfis"], MFIK=mom["mfik"], Fuente="BKM", DTE=dte_chain)
-    elif tail_risk_hist_fallback and (hist := momentos_cola_historicos(r_seasonal)) is not None:
+    elif tail_risk_hist_fallback and (hist := momentos_cola_historicos(
+            r_seasonal, r_forma=log_returns[ticker].dropna())) is not None:
         sigma_T, s_T, exk_T, dte_t = hist["sigma_T"], hist["skew"], hist["exkurt"], hist["dte"]
         fila.update(Fuente="Historico", DTE=dte_t)
     else:
         tail_risk_rows.append(fila)
         continue
 
-    mu_T = mu_weekly_seasonal * (dte_t / 7) if not pd.isna(mu_weekly_seasonal) else 0.0
+    # VaR sin media: la media de ~8 temporadas tiene error estandar ~0.35 sigma
+    # y reordenaria el ranking por suerte reciente, no por riesgo.
     cola = rk.cornish_fisher_tail(1 - tail_risk_filter_confidence, s_T, exk_T)
-    fila["VaR_CF"] = -(mu_T + sigma_T * cola["q"])
+    fila["VaR_CF"] = -sigma_T * cola["q"]
     tail_risk_rows.append(fila)
 
 tail_risk_stats = pd.DataFrame(tail_risk_rows)
@@ -1690,6 +1709,23 @@ else:
 cov_muestral_ref = log_returns_selected.cov().values
 print(f"     vol semanal media: muestral={np.sqrt(np.diag(cov_muestral_ref)).mean() * 100:.3f}% -> "
       f"EWMA+LW={np.sqrt(np.diag(cov_hist_simple)).mean() * 100:.3f}%")
+
+if seasonal_vol_scaling:
+    _ret_sel = log_returns[selected_tickers]
+    seasonal_ratio = rk.seasonal_vol_ratio(
+        _ret_sel, _ret_sel.index.month.isin(execution_months),
+        bounds=seasonal_vol_ratio_bounds, min_obs=seasonal_min_weeks)
+    _r = seasonal_ratio.reindex(selected_tickers).values
+    cov_hist_simple = cov_hist_simple * np.outer(_r, _r)
+    _lo, _hi = seasonal_vol_ratio_bounds
+    print(f"\n  ESCALADO ESTACIONAL DE VOL ({execution_label}, sd estacional / sd total, "
+          f"cotas {_lo:.2f}-{_hi:.2f}):")
+    _orden = seasonal_ratio.sort_values(ascending=False)
+    for _i in range(0, len(_orden), 6):
+        print("     " + " | ".join(f"{t} {v:.3f}" for t, v in _orden.iloc[_i:_i + 6].items()))
+    print(f"     en la cota superior: {int((seasonal_ratio >= _hi - 1e-12).sum())} | "
+          f"en la inferior: {int((seasonal_ratio <= _lo + 1e-12).sum())} | "
+          f"vol semanal media EWMA+LW estacional: {np.sqrt(np.diag(cov_hist_simple)).mean() * 100:.3f}%")
 
 off_diag_factor = cov_mat.values - np.diag(np.diag(cov_mat.values))
 off_diag_hist = cov_hist_simple - np.diag(np.diag(cov_hist_simple))
