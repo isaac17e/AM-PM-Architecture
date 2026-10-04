@@ -481,3 +481,31 @@ def test_ventana_k_sd_excluye_el_ala_vieja_que_rechazaba_la_sonrisa():
     assert con_ventana["n_drop_k_sd"] == 1
     assert con_ventana["k_min"] > -0.40
     assert con_ventana["rho"] == pytest.approx(rho, abs=0.12)
+
+
+# ------------------------------------------------------------------------------
+# lambda3 / lambda4 desde gamma (Taylor CRRA)
+# ------------------------------------------------------------------------------
+
+def test_crra_taylor_lambdas_match_profile_ladder():
+    assert bm.crra_taylor_lambdas(6.0) == pytest.approx((21.0, 56.0))
+    assert bm.crra_taylor_lambdas(3.0) == pytest.approx((6.0, 10.0))
+    assert bm.crra_taylor_lambdas(1.5) == pytest.approx((1.875, 2.1875))
+    with pytest.raises(ValueError):
+        bm.crra_taylor_lambdas(0.0)
+
+
+def test_crra_taylor_terms_are_the_crra_expansion():
+    # Con l3/3 y l4/4 los coeficientes quedan g(g+1)/6 y g(g+1)(g+2)/24, los de
+    # la serie de u(1 + r) = (1 + r)^(1 - g) / (1 - g) alrededor de r = 0.
+    g = 4.0
+    l3, l4 = bm.crra_taylor_lambdas(g)
+    assert l3 / 3.0 == pytest.approx(g * (g + 1) / 6.0)
+    assert l4 / 4.0 == pytest.approx(g * (g + 1) * (g + 2) / 24.0)
+    # Chequeo numerico: lo que separa la CRRA de su Taylor a 4.o orden es el
+    # termino de 5.o orden, g(g+1)(g+2)(g+3)/120 r^5.
+    r = 0.03
+    u = lambda x: (1.0 + x) ** (1.0 - g) / (1.0 - g)
+    taylor = u(0.0) + r - (g / 2.0) * r ** 2 + (l3 / 3.0) * r ** 3 - (l4 / 4.0) * r ** 4
+    quinto = g * (g + 1) * (g + 2) * (g + 3) / 120.0 * r ** 5
+    assert u(r) - taylor == pytest.approx(quinto, rel=0.15)

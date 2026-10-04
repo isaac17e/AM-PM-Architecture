@@ -170,8 +170,8 @@ NIVELES_CVAR = (0.95, 0.99)
 UMBRAL_OMEGA_RATIO = 0.0
 
 MODO_OPTIMIZACION = "mvsk"
-LAMBDA3 = 1.0
-LAMBDA4 = 1.0
+# lambda3 / lambda4 del MVSK ya no se fijan aqui: salen de gamma_ra del perfil
+# (Taylor de una CRRA, bm.crra_taylor_lambdas). gamma es la unica palanca.
 ALPHA_CVAR_OBJETIVO = 0.95
 RETORNO_MIN_CVAR = None
 MAX_ESCENARIOS_LP = 4000
@@ -1458,6 +1458,7 @@ print(pd.Series(np.round(w_mkt, 4), index=tickers))
 perfil = PERFILES[PERFIL_RIESGO]
 tau = perfil["tau"]
 gamma_ra = perfil["gamma_ra"]
+lambda3, lambda4 = bm.crra_taylor_lambdas(gamma_ra)
 
 desc_perfiles = dict(
     conservador="Portafolio cercano al benchmark. Views con poco peso.",
@@ -1496,6 +1497,8 @@ if delta_info["mode"] == "historical" and np.isfinite(delta_mkt) and delta_mkt <
     print("  La media de ~2 anos dio exceso negativo: pi hereda ese signo. "
           "DELTA_MKT_MODO = 'fixed' o 'implied' no usa esa muestra.")
 print(f"Tau (t): {tau} | Omega scale: {perfil['omega_scale']} | Gamma_RA: {gamma_ra}")
+print(f"MVSK desde gamma (Taylor CRRA): lambda3 = g(g+1)/2 = {lambda3:.4f} | "
+      f"lambda4 = g(g+1)(g+2)/6 = {lambda4:.4f}")
 
 # ==============================================================================
 # BLOQUE 4: RETORNOS DE EQUILIBRIO pi - CAPM INVERTIDO
@@ -2327,7 +2330,7 @@ if MODO_OPTIMIZACION == "cvar":
         X_prior, p_post, ALPHA_CVAR_OBJETIVO, retorno_min_efectivo, mu_opt)
     if w_bruto is None:
         print(f"  LP infactible ({info_opt['mensaje']}). Se recurre al modo MVSK.")
-        w_bruto, info_opt = optimizar_mvsk(X_prior, p_post, gamma_ra, LAMBDA3, LAMBDA4)
+        w_bruto, info_opt = optimizar_mvsk(X_prior, p_post, gamma_ra, lambda3, lambda4)
         modo_efectivo = "mvsk (fallback)"
     else:
         print(f"  LP resuelto sobre {info_opt['n_escenarios']} escenarios | "
@@ -2335,8 +2338,8 @@ if MODO_OPTIMIZACION == "cvar":
         modo_efectivo = "cvar"
 else:
     print(f"\n  Maximizando utilidad MVSK | gamma={gamma_ra} | "
-          f"lambda3={LAMBDA3} | lambda4={LAMBDA4}")
-    w_bruto, info_opt = optimizar_mvsk(X_prior, p_post, gamma_ra, LAMBDA3, LAMBDA4)
+          f"lambda3={lambda3:.4f} | lambda4={lambda4:.4f}")
+    w_bruto, info_opt = optimizar_mvsk(X_prior, p_post, gamma_ra, lambda3, lambda4)
     modo_efectivo = "mvsk"
 
 # ==============================================================================
@@ -2360,7 +2363,7 @@ if modo_efectivo == "cvar":
 else:
     w_ini = np.where(mask_final, w_bruto, 0.0)
     w_ini = w_ini / w_ini.sum()
-    w_opt, _ = optimizar_mvsk(X_prior, p_post, gamma_ra, LAMBDA3, LAMBDA4,
+    w_opt, _ = optimizar_mvsk(X_prior, p_post, gamma_ra, lambda3, lambda4,
                               activos_permitidos=mask_final, w_ini=w_ini)
 
 w_opt = np.where(w_opt < 1e-10, 0.0, w_opt)
@@ -2537,6 +2540,22 @@ print(f"  Kurtosis (m4):     {m4_port:.6f}")
 print(f"  Sharpe:            {sharpe_BL:.4f}   (mercado: {sharpe_mkt:.4f} | "
       f"Markowitz: {sharpe_mkw:.4f})")
 print(f"  Rf al horizonte:   {Rf_h:.4f}")
+
+_term_var = (gamma_ra / 2.0) * m2_port
+_term_skew = (lambda3 / 3.0) * m3_port
+_term_kurt = (lambda4 / 4.0) * m4_port
+_term_kurt_exc = (lambda4 / 4.0) * (m4_port - 3.0 * m2_port ** 2)
+print(f"\n  Terminos de U en el optimo (gamma={gamma_ra}, lambda3={lambda3:.3f}, lambda4={lambda4:.3f}):")
+print(f"    E[r] = {ret_port:.6f} | (g/2)m2 = {_term_var:.6f} | "
+      f"(l3/3)m3 = {_term_skew:+.6f} | (l4/4)m4 = {_term_kurt:.6f}")
+if _term_var > 0:
+    _var_media = f"{_term_var / ret_port:.1%}" if ret_port > 0 else "n/d (E[r] <= 0)"
+    print(f"    varianza/media: {_var_media} | asimetria/varianza: {_term_skew / _term_var:+.1%} | "
+          f"curtosis/varianza: {_term_kurt / _term_var:.1%} "
+          f"(curtosis en exceso: {_term_kurt_exc / _term_var:+.2%})")
+    if _term_kurt / _term_var > 0.5:
+        print("    AVISO: el termino de 4.o orden pesa mas de la mitad del de varianza. La serie de "
+              "Taylor truncada\n    deja de aproximar bien a la CRRA; revisar el portafolio antes de usarlo.")
 
 # ==============================================================================
 # BLOQUE 10: VISUALIZACION

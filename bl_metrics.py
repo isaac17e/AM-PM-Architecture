@@ -102,6 +102,24 @@ def mfiv_or_horizon_variance(mfiv, var_horizon):
     return respaldo
 
 
+def crra_taylor_lambdas(gamma):
+    """lambda3 y lambda4 del objetivo MVSK a partir de la aversion CRRA gamma.
+
+    U = E[r] - (g/2) m2 + (l3/3) m3 - (l4/4) m4, con momentos centrales
+    crudos, es la expansion de Taylor a cuarto orden de una CRRA si
+
+        l3 = g (g + 1) / 2,   l4 = g (g + 1) (g + 2) / 6
+
+    (los terminos quedan g(g+1)/6 m3 y g(g+1)(g+2)/24 m4). Asi gamma es la
+    unica palanca de riesgo. La parte normal de m4 (3 m2^2) es un termino
+    legitimo de la expansion: sube la aversion efectiva cuando la vol crece.
+    """
+    g = float(gamma)
+    if not (math.isfinite(g) and g > 0):
+        raise ValueError("gamma debe ser finito y positivo")
+    return g * (g + 1.0) / 2.0, g * (g + 1.0) * (g + 2.0) / 6.0
+
+
 def market_delta(mode, excess_hist, var_hist, delta_fixed=2.5, var_q=None, var_p=None):
     """Delta de pi = delta * Sigma @ w (M-12).
 

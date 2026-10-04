@@ -136,7 +136,8 @@
     <div class="dec">
       <h3>λ3 y λ4 de BL en forma cerrada desde γ</h3>
       <p>MVSK usa momentos centrales crudos, así que la expansión de Taylor de una CRRA da <b>λ3 = γ(γ+1)/2</b> y <b>λ4 = γ(γ+1)(γ+2)/6</b>: 21/56, 6/10 y 1.875/2.19.</p>
-      <p>Con σ = 10% al horizonte y curtosis 4, el término de curtosis pesa hoy (λ4 = 1, γ = 1.5) el 1.3% del de varianza; con los valores derivados pesa 2.9% (Agr) y 19% (Con). Con λ3 = λ4 = 1 fijos los momentos superiores no cambian nada entre perfiles.</p>
+      <p><b>Implementado (2026-10-04):</b> <code>bm.crra_taylor_lambdas(gamma_ra)</code>; las constantes LAMBDA3 / LAMBDA4 ya no existen. Corrida real (agresivo): con λ3 = λ4 = 1 la curtosis pesaba 1,65% del término de varianza y la asimetría −1,2%; con los derivados, 3,6%. El portafolio del agresivo no cambia (γ = 1.5 lo deja en la esquina de máximo retorno: 3 nombres al tope de 35%); con 21 / 56 el portafolio cambia 17% y pasa a 6 nombres.</p>
+      <p>El 93% de m4 es la parte normal (3σ⁴): λ4 actúa sobre todo como penalización cuártica de la varianza, un término legítimo de la serie CRRA. Si λ4/4·m4 supera la mitad de (γ/2)·m2, la serie truncada deja de aproximar bien y el script avisa: revisar el Conservador antes de usarlo.</p>
     </div>
     <div class="dec">
       <h3>Preferencias por perfil; estimadores iguales para todos</h3>
@@ -337,14 +338,14 @@ const SECTIONS = [
     '<b>Rellenos de candidatos.</b> Ya no reintroducen nombres que el filtro de IV frente a la vol realizada descartó.'
    ]},
   {id:"bl", title:"Black-Litterman", file:"~/AM-PM/black_litterman.py · Bloques 3–5 y 11", live:"hoy: agresivo",
-   summary:"PERFILES ya escalona omega_scale, tau y gamma_ra. Faltaban la cardinalidad, el tope por activo y los coeficientes de momentos superiores, que hoy son iguales para los tres perfiles.",
+   summary:"PERFILES escalona omega_scale, tau y gamma_ra; lambda3 y lambda4 ya se derivan de gamma_ra (Taylor CRRA), así que γ es la única palanca de riesgo del MVSK. Faltan la cardinalidad y el tope por activo, que hoy son iguales para los tres perfiles.",
    rows:[
     {p:"PERFIL_RIESGO", v:['"conservador"','"moderado"','"agresivo"'], live:'"agresivo"', st:"match", lab:"selector"},
     {p:"omega_scale", v:["5.0","1.0","0.25"], live:"0.25", st:"code", lab:"en PERFILES", note:"Menor confianza en las vistas para el conservador: el posterior se queda cerca del equilibrio.", skip:true},
     {p:"tau", v:["0.025","0.05","0.10"], live:"0.10", st:"code", lab:"en PERFILES", skip:true},
     {p:"gamma_ra", v:["6.0","3.0","1.5"], live:"1.5", st:"code", lab:"en PERFILES", note:"Escalera de referencia para γ en QU y US.", skip:true},
-    {p:"LAMBDA3", v:["21.0","6.0","1.875"], live:"1.0", st:"new", lab:"≈ Agr", note:"γ(γ+1)/2 — preferencia por asimetría de una CRRA."},
-    {p:"LAMBDA4", v:["56.0","10.0","2.1875"], live:"1.0", st:"new", lab:"≈ Agr", note:"γ(γ+1)(γ+2)/6 — aversión a la curtosis de una CRRA."},
+    {p:"lambda3", v:["21.0","6.0","1.875"], live:"desde γ", st:"code", lab:"desde gamma_ra", note:"γ(γ+1)/2, calculado con bm.crra_taylor_lambdas: sigue al perfil sin editarlo.", skip:true},
+    {p:"lambda4", v:["56.0","10.0","2.1875"], live:"desde γ", st:"code", lab:"desde gamma_ra", note:"γ(γ+1)(γ+2)/6. Con γ = 6 el término de 4.º orden puede rondar el 80% del de varianza: la serie truncada pierde precisión.", skip:true},
     {p:"MAX_TICKERS_FINAL", v:["12","10","8"], live:"10", st:"new", lab:"= Mod"},
     {p:"PESO_MAX_ACTIVO", v:["0.15","0.25","0.35"], live:"0.35", st:"new", lab:"= Agr", note:"Factible en los tres: 12×0.15, 10×0.25 y 8×0.35 superan 1."},
     {p:"ALPHA_CVAR_OBJETIVO", v:["0.99","0.975","0.95"], live:"0.95", st:"new", lab:"= Agr", note:'Solo actúa con MODO_OPTIMIZACION = "cvar".'},

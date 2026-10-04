@@ -184,7 +184,7 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 - **BKM** on the SSVI surface builds `Q` and `Ω`. Integration uses `risk_estimators.trapezoid`.
 - Q→P is a cross-sectional Mincer-Zarnowitz regression (n is the cross-section after the price filter: low power; left as designed) plus an Esscher transform. `COTA_RATIO_VOL_P = (0.70, 1.00)` matches minimum variance and quadratic utility, so physical vol is not allowed above implied vol.
 - Correlation for `Σ_P` comes from daily returns with EWMA and Ledoit-Wolf.
-- Posterior views can be combined by entropy pooling. Optimization is MVSK or CVaR. `LAMBDA3 = LAMBDA4 = 1` on raw central moments is a design note: those terms are small next to mean and variance, so MVSK is close to mean-variance. Not recalibrated here.
+- Posterior views can be combined by entropy pooling. Optimization is MVSK or CVaR. `lambda3` and `lambda4` are derived from the profile's `gamma_ra` (fourth-order Taylor expansion of CRRA utility on raw central moments): `λ3 = γ(γ+1)/2`, `λ4 = γ(γ+1)(γ+2)/6`, so 1.875 / 2.19 (aggressive), 6 / 10 (moderate), 21 / 56 (conservative). γ is the only risk lever. The run summary prints each utility term at the optimum and warns when the fourth-order term exceeds half the variance term, where the truncated series stops approximating CRRA well.
 - The historical tail panel uses overlapping horizon windows on about two years of daily data. The window count is not the number of independent observations; that is documented in the output and left overlapping on purpose.
 - Maximum drawdown of the optimized portfolio uses log returns (`exp(cumsum)`), and the portfolio log return is `log(1 + Σ w (e^r − 1))`, not the weighted sum of logs.
 
