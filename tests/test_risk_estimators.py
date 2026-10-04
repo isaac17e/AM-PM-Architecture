@@ -29,7 +29,10 @@ def retornos():
     n, T = 8, 300
     L = rng.normal(size=(n, n))
     C = L @ L.T / n + np.eye(n) * 0.5
-    return rng.multivariate_normal(np.zeros(n), C, size=T) * 0.01
+    # Cholesky explicito, no rng.multivariate_normal: este factoriza con SVD,
+    # cuyos signos dependen del BLAS (Accelerate en macOS, OpenBLAS en Linux),
+    # y los datos -y delta- cambiaban de una maquina a otra (0.081 a 0.102).
+    return rng.standard_normal((T, n)) @ np.linalg.cholesky(C).T * 0.01
 
 
 def _lw_constant_correlation_referencia(X):
@@ -89,10 +92,13 @@ def test_ledoit_wolf_matches_independent_reference(retornos):
 
 
 def test_ledoit_wolf_standard_case_regression(retornos):
-    # Valor obtenido con el modulo antes del cambio de gamma (B-7): el caso
-    # S=None no debe moverse ni en ruido numerico.
+    # El caso S=None no debe moverse. El valor se recalculo al pasar el fixture
+    # a Cholesky (el anterior, 0.0986..., dependia del BLAS de la maquina); que
+    # el modulo es el Ledoit-Wolf clasico lo garantiza el test contra la
+    # implementacion de referencia con bucles. rel=1e-9 absorbe el redondeo
+    # entre BLAS y sigue detectando cualquier cambio de formula.
     _, delta, _ = rk.ledoit_wolf_constant_correlation(retornos)
-    assert delta == pytest.approx(0.09860432701604373, abs=1e-12)
+    assert delta == pytest.approx(0.09801398782673243, rel=1e-9)
 
 
 def test_ledoit_wolf_ewma_target_is_built_from_shrunk_matrix(retornos):

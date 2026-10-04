@@ -9,6 +9,7 @@ entra a w_mkt en USD.
 
 import ast
 import runpy
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +40,9 @@ class _YahooMultimoneda:
             px = np.full(len(idx), _FX[ticker])
         else:
             nivel = _DATOS.get(ticker, ("USD", 1e11, 100.0))[2]
-            rng = np.random.default_rng(abs(hash(ticker)) % (2 ** 32))
+            # crc32 y no hash(): hash() de un str cambia en cada proceso
+            # (PYTHONHASHSEED) y volvia aleatorios los precios del test.
+            rng = np.random.default_rng(zlib.crc32(ticker.encode()))
             px = nivel * np.exp(np.cumsum(rng.normal(0.0003, 0.012, len(idx))))
         self._hist = pd.DataFrame(
             {"Open": px, "High": px, "Low": px, "Close": px, "Volume": 1_000_000}, index=idx)
@@ -95,9 +98,16 @@ def test_bl_con_internacionales_en_tickers(monkeypatch):
     assert "CAD=X" not in _PEDIDOS and "EURUSD=X" not in _PEDIDOS
     assert g["ticker_currency"]["AZN.L"] == "GBP"
     assert g["ticker_currency"]["7203.T"] == "JPY"
+    # Fecha a fecha, precio en USD / precio local = factor de conversion exacto.
     precios = g["precios_diarios"]
-    assert precios["AZN.L"].median() == pytest.approx(11870.0 * 0.01 * 1.30, rel=0.6)
-    assert precios["7203.T"].median() == pytest.approx(2850.0 / 150.0, rel=0.6)
+    for tk, factor in (("AZN.L", 0.01 * 1.30), ("7203.T", 1.0 / 150.0)):
+        local = _YahooMultimoneda(tk)._hist["Close"]
+        local.index = local.index.tz_localize(None).normalize()
+        comun = precios.index.intersection(local.index)
+        assert len(comun) > 100
+        ratio = precios.loc[comun, tk] / local.loc[comun]
+        assert ratio.min() == pytest.approx(factor, rel=1e-9)
+        assert ratio.max() == pytest.approx(factor, rel=1e-9)
 
     # Market cap en USD: AZN.L 1.84e13 GBp -> 2.39e11 USD; 7203.T 3.4e13 JPY -> 2.27e11 USD.
     caps = g["market_caps_raw"]

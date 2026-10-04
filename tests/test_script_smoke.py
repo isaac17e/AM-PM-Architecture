@@ -8,6 +8,7 @@ corre black_litterman.py con datos falsos.
 
 import ast
 import runpy
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -110,7 +111,8 @@ class _YahooFalso:
     def __init__(self, ticker):
         self.ticker = ticker
         idx = pd.bdate_range("2023-06-01", periods=560, tz="UTC")
-        rng = np.random.default_rng(abs(hash(ticker)) % (2 ** 32))
+        # crc32 y no hash(): hash() de un str cambia en cada proceso (PYTHONHASHSEED).
+        rng = np.random.default_rng(zlib.crc32(ticker.encode()))
         px = 100.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.012, len(idx))))
         self._hist = pd.DataFrame(
             {"Open": px, "High": px, "Low": px, "Close": px, "Volume": 1_000_000},
