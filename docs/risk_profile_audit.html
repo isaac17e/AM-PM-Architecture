@@ -70,6 +70,7 @@
   .pill.override{color:var(--override);background:var(--override-bg)}
   .pill.change{color:var(--change);background:var(--change-bg)}
   .pill.code{color:var(--accent);background:var(--accent-soft)}
+  .pill.proposal{color:var(--override);background:var(--override-bg)}
 
   .repo{font-family:var(--mono);font-size:0.72rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--accent);margin:3rem 0 0.25rem;padding-top:1rem;border-top:2px solid var(--line)}
   section.block{margin-top:1.75rem;scroll-margin-top:5rem}
@@ -131,7 +132,7 @@
     <div class="dec">
       <h3>Una sola aversión al riesgo γ por perfil: 6 / 3 / 1.5</h3>
       <p>QU, BL y US maximizan la misma forma <code>μ'w − (γ/2)·w'Σw</code> con μ y Σ en unidades consistentes (QU mensual/mensual; BL y US anual/anual), así que γ es adimensional y comparable. Hoy el mismo inversor agresivo tenía γ = 0.5, 0.8, 1.5 o 2 según el script.</p>
-      <p>Se adopta la escalera de BL (6 / 3 / 1.5). Cambia <b>lambda_</b> en ambos QU (Mod 2.5→3, Agr 0.5/0.8→1.5) y <b>risk_aversion</b> en US (8/4/2→6/3/1.5).</p>
+      <p>QU y BL están en la escalera de BL (6 / 3 / 1.5): <b>lambda_</b> en ambos QU (Mod 2.5→3, Agr 0.5/0.8→1.5) y <b>gamma_ra</b> en BL. En US Asset Manager la propuesta 6 / 3 / 1.5 <b>no está aplicada</b>: el código sigue en 8 / 4 / 2.</p>
     </div>
     <div class="dec">
       <h3>λ3 y λ4 de BL en forma cerrada desde γ</h3>
@@ -146,12 +147,12 @@
     </div>
     <div class="dec">
       <h3>Los scripts colombianos siguen el mandato de la casa</h3>
-      <p>COL Portfolio Architecture no tenía perfiles. Sus bandas RV/RF salen de <code>am_pm/profiles.py</code> (RV 0–10% / 20–40% / 50–85%), y <b>RF_TENOR_YEARS</b> sigue el horizonte del mandato (12 / 36 / 60 meses → 1 / 3 / 5 años).</p>
-      <p>Su objetivo es máximo Sharpe, que no depende del perfil: el perfil entra solo por bandas, topes y screening de bonos.</p>
+      <p>Asset Allocation (FICs) ya tiene los tres perfiles en <code>am_pm/profiles.py</code>. COL Portfolio Architecture no: el código es una sola configuración (RV y RF 40–60%). Las bandas por perfil de esa tabla, alineadas con el mandato (RV 0–10% / 20–40% / 50–85% y <b>RF_TENOR_YEARS</b> 1 / 3 / 5), son una propuesta y no están implementadas.</p>
+      <p>Su objetivo es máximo Sharpe, que no depende del perfil: si se adoptara, el perfil entraría solo por bandas, topes y screening de bonos.</p>
     </div>
     <div class="dec">
       <h3>Filtro delta de QU: cada umbral es un tope de IV anual</h3>
-      <p>Los dos QU usan el mismo filtro: <b>delta_strike_mode = "otm"</b>, delta_otm_log_m = 0.08, delta_otm_ref_months = 2 y options_dte_cap_days = 90. <b>delta_min</b> pasa a 0.24 / 0.18 / 0.15; el default del código es el Agresivo. En los dos QU el colchón solo filtra: ya no multiplica a μ.</p>
+      <p>Los dos QU usan el mismo filtro de colchón: <b>delta_strike_mode = "otm"</b>, delta_otm_log_m = 0.08 y delta_otm_ref_months = 2. <b>options_dte_cap_days = 90</b> solo existe en QU normal; el seasonal no tiene ese parámetro. <b>delta_min</b> es 0.24 / 0.18 / 0.15; el default del código es el Agresivo. En los dos QU el colchón solo filtra: ya no multiplica a μ.</p>
       <p>El colchón OTM depende solo de la volatilidad, así que cada umbral funciona como un tope de IV anual: 0.24 ≈ 31,5%, 0.18 ≈ 43%, 0.15 ≈ 52%. En el seasonal el horizonte es el número de meses de <code>rebalance_months</code> (1 con [10], 2 con [10, 11]) y el corte casi no cambia con el horizonte.</p>
     </div>
     <div class="dec">
@@ -174,6 +175,7 @@
     <div class="legend-item"><span class="pill new">nuevo</span> parámetro escalonado por primera vez</div>
     <div class="legend-item"><span class="pill dead">muerto</span> registrado, sin uso en el script</div>
     <div class="legend-item"><span class="pill code">en código</span> el perfil ya vive en el código</div>
+    <div class="legend-item"><span class="pill proposal">propuesta</span> valores de perfil no implementados; la columna «En el código» es la configuración viva</div>
   </div>
 
   <div id="sections"></div>
@@ -196,7 +198,80 @@
     </table></div>
     <p class="obs">† Medido antes del commit 8ddfdbc. Los descartes de QU normal conservador y moderado se midieron antes de ese commit, y las métricas de QU normal moderado también. Las métricas de QU normal conservador y agresivo son de después.</p>
     <p class="obs"><b>QU seasonal conservador</b> fallaba por la banda de ETF: solo llegaban 3 ETF, máximo 36% frente al piso de 45%. El piso de ETF ya está portado; falta revalidar.</p>
-    <p class="obs"><b>Antes de los cambios del 2026-10-04.</b> Todas las corridas son anteriores a quitar los premios a la vol baja y a encoger μ hacia Fama-French en los dos QU. Retorno, vol y Sharpe van a cambiar; conviene repetirlas y recalibrar λ con pen_ret.</p>
+    <p class="obs"><b>Corridas del 2026-10-04.</b> La tabla de arriba es anterior a quitar los premios a la vol baja y a encoger μ hacia Fama-French. Ese mismo día se volvió a correr QU normal en los tres perfiles (rf 0,05275), ya con esos cambios; retorno, vol y pen_ret de esa repetición están en «Calibración de λ».</p>
+  </section>
+
+  <p class="repo">Calibración</p>
+  <section class="block" id="calibracion-lambda">
+    <div class="block-head"><h2>Calibración de λ (QU normal, 2026-10-04)</h2></div>
+    <p class="file">quadratic_utility.py · results_comparison.csv de las tres corridas de hoy · rf 0,05275</p>
+    <p class="summary">Retorno y volatilidad en % mensual. La fila resaltada es el λ configurado de ese perfil (6 / 3 / 1.5). pen_ret = (λ/2 · w'Σw) / w'μ.</p>
+    <p class="obs">Con la escalera actual 6 / 3 / 1.5, el pen_ret de cada perfil en su propio λ es 0,133 / 0,111 / 0,139. La escalera no separa los perfiles (el moderado penaliza menos que el agresivo). Las diferencias las marcan los topes, el piso de ETF y los filtros.</p>
+    <p class="obs">En el agresivo hay un codo hacia λ ≈ 2,5–3: el tope del 30% deja de ligar y pen_ret se aplana cerca de 0,20 para λ entre 2,5 y 5. El moderado no tiene un codo claro, y su tope del 18% liga en todos los λ. En el conservador pen_ret crece casi lineal (~0,021·λ) y λ apenas mueve la cartera bajo las restricciones de 12% / 45% / 35%.</p>
+    <p class="obs"><b>PENDIENTE DE DECISIÓN de Isaac, no aplicado.</b> Escalera de ejemplo para un pen_ret objetivo de 0,14 / 0,20 / 0,30: agresivo 1,5, moderado ~7,5, conservador ~14. El 14 queda fuera de la rejilla (el último punto del conservador es λ = 10, pen_ret 0,215) y hay que volver a correrlo.</p>
+
+    <h3 style="font-family:var(--disp);font-size:1.05rem;margin:1.2rem 0 0.4rem">Conservador · λ = 6</h3>
+    <div class="tablewrap"><table>
+      <thead><tr><th>lambda_</th><th>retorno</th><th>volatilidad</th><th>sharpe</th><th>pen_ret</th><th>n_activos</th><th>max_peso</th></tr></thead>
+      <tbody>
+        <tr><td>0.5</td><td>1,34%</td><td>2,66%</td><td>0,338</td><td>0,013</td><td>9</td><td>12,00%</td></tr>
+        <tr><td>1.0</td><td>1,34%</td><td>2,65%</td><td>0,339</td><td>0,026</td><td>9</td><td>12,00%</td></tr>
+        <tr><td>1.5</td><td>1,34%</td><td>2,62%</td><td>0,342</td><td>0,039</td><td>9</td><td>12,00%</td></tr>
+        <tr><td>2.0</td><td>1,33%</td><td>2,57%</td><td>0,347</td><td>0,050</td><td>9</td><td>12,00%</td></tr>
+        <tr><td>2.5</td><td>1,33%</td><td>2,54%</td><td>0,351</td><td>0,061</td><td>9</td><td>12,00%</td></tr>
+        <tr><td>3.0</td><td>1,33%</td><td>2,51%</td><td>0,354</td><td>0,071</td><td>9</td><td>12,00%</td></tr>
+        <tr><td>4.0</td><td>1,33%</td><td>2,47%</td><td>0,359</td><td>0,092</td><td>11</td><td>12,00%</td></tr>
+        <tr><td>5.0</td><td>1,32%</td><td>2,44%</td><td>0,362</td><td>0,112</td><td>11</td><td>12,00%</td></tr>
+        <tr><td class="on">6.0</td><td class="on">1,32%</td><td class="on">2,42%</td><td class="on">0,364</td><td class="on">0,133</td><td class="on">11</td><td class="on">12,00%</td></tr>
+        <tr><td>7.5</td><td>1,32%</td><td>2,40%</td><td>0,366</td><td>0,164</td><td>11</td><td>12,00%</td></tr>
+        <tr><td>10.0</td><td>1,31%</td><td>2,37%</td><td>0,367</td><td>0,215</td><td>11</td><td>12,00%</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 style="font-family:var(--disp);font-size:1.05rem;margin:1.2rem 0 0.4rem">Moderado · λ = 3</h3>
+    <div class="tablewrap"><table>
+      <thead><tr><th>lambda_</th><th>retorno</th><th>volatilidad</th><th>sharpe</th><th>pen_ret</th><th>n_activos</th><th>max_peso</th></tr></thead>
+      <tbody>
+        <tr><td>0.5</td><td>1,55%</td><td>4,01%</td><td>0,277</td><td>0,026</td><td>7</td><td>18,00%</td></tr>
+        <tr><td>1.0</td><td>1,55%</td><td>4,01%</td><td>0,277</td><td>0,052</td><td>7</td><td>18,00%</td></tr>
+        <tr><td>1.5</td><td>1,55%</td><td>3,96%</td><td>0,280</td><td>0,076</td><td>8</td><td>18,00%</td></tr>
+        <tr><td>2.0</td><td>1,53%</td><td>3,65%</td><td>0,298</td><td>0,087</td><td>9</td><td>18,00%</td></tr>
+        <tr><td>2.5</td><td>1,51%</td><td>3,46%</td><td>0,310</td><td>0,099</td><td>10</td><td>18,00%</td></tr>
+        <tr><td class="on">3.0</td><td class="on">1,50%</td><td class="on">3,34%</td><td class="on">0,318</td><td class="on">0,111</td><td class="on">11</td><td class="on">18,00%</td></tr>
+        <tr><td>4.0</td><td>1,48%</td><td>3,17%</td><td>0,329</td><td>0,136</td><td>12</td><td>18,00%</td></tr>
+        <tr><td>5.0</td><td>1,46%</td><td>3,01%</td><td>0,339</td><td>0,155</td><td>14</td><td>18,00%</td></tr>
+        <tr><td>7.5</td><td>1,42%</td><td>2,77%</td><td>0,353</td><td>0,203</td><td>16</td><td>18,00%</td></tr>
+        <tr><td>10.0</td><td>1,38%</td><td>2,62%</td><td>0,360</td><td>0,248</td><td>17</td><td>18,00%</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 style="font-family:var(--disp);font-size:1.05rem;margin:1.2rem 0 0.4rem">Agresivo · λ = 1.5</h3>
+    <div class="tablewrap"><table>
+      <thead><tr><th>lambda_</th><th>retorno</th><th>volatilidad</th><th>sharpe</th><th>pen_ret</th><th>n_activos</th><th>max_peso</th></tr></thead>
+      <tbody>
+        <tr><td>0.5</td><td>2,23%</td><td>6,68%</td><td>0,268</td><td>0,050</td><td>5</td><td>30,00%</td></tr>
+        <tr><td>1.0</td><td>2,23%</td><td>6,62%</td><td>0,270</td><td>0,098</td><td>4</td><td>30,00%</td></tr>
+        <tr><td class="on">1.5</td><td class="on">2,21%</td><td class="on">6,39%</td><td class="on">0,277</td><td class="on">0,139</td><td class="on">5</td><td class="on">30,00%</td></tr>
+        <tr><td>2.0</td><td>2,19%</td><td>6,22%</td><td>0,281</td><td>0,177</td><td>5</td><td>30,00%</td></tr>
+        <tr><td>2.5</td><td>2,13%</td><td>5,75%</td><td>0,293</td><td>0,195</td><td>5</td><td>30,00%</td></tr>
+        <tr><td>3.0</td><td>2,06%</td><td>5,30%</td><td>0,305</td><td>0,205</td><td>7</td><td>27,94%</td></tr>
+        <tr><td>4.0</td><td>1,90%</td><td>4,36%</td><td>0,335</td><td>0,200</td><td>10</td><td>22,92%</td></tr>
+        <tr><td>5.0</td><td>1,80%</td><td>3,80%</td><td>0,357</td><td>0,201</td><td>12</td><td>19,62%</td></tr>
+        <tr><td>7.5</td><td>1,66%</td><td>3,15%</td><td>0,388</td><td>0,224</td><td>15</td><td>15,81%</td></tr>
+        <tr><td>10.0</td><td>1,59%</td><td>2,86%</td><td>0,402</td><td>0,258</td><td>16</td><td>17,54%</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <p class="repo">Seguimiento</p>
+  <section class="block" id="anomalias">
+    <div class="block-head"><h2>Anomalías abiertas</h2></div>
+    <ul>
+      <li>QU no deduplica clases de acción (MV sí, con <code>share_class_groups</code>). En el moderado, GOOG y GOOGL juntos llegaron al 22,55% frente al tope del 18%.</li>
+      <li>XLK y QQQ se solapan al 24% en el conservador.</li>
+      <li>En MV agresivo el filtro delta no puede ligar después del percentil de volatilidad: la IV máxima fue 33,9% y el corte de delta_min = 0,15 es ~52%.</li>
+      <li>En MV el shrinkage de Ledoit-Wolf sale 1,0.</li>
+    </ul>
   </section>
 
   <footer class="end">
@@ -213,7 +288,7 @@
 
 <script>
 const P = ["Conservador", "Moderado", "Agresivo"];
-const LBL = {match:"match", drift:"drift", override:"override", change:"cambio", new:"nuevo", dead:"muerto", code:"en código"};
+const LBL = {match:"match", drift:"drift", override:"override", change:"cambio", new:"nuevo", dead:"muerto", code:"en código", proposal:"propuesta"};
 
 const MV_EST = "parámetro de estimación escalonado por decisión previa; se conserva";
 const CF_MV = "Define alpha_final de la poda por CVaR marginal Cornish-Fisher: es una palanca de riesgo, no solo de reporte.";
@@ -223,35 +298,33 @@ const DELTA_NOTE = (a) => `Antes ${a}. Con strike OTM el colchón depende solo d
 const DELTA_SEAS = " El horizonte es el número de meses de rebalance_months (1 con [10], 2 con [10, 11]); el corte casi no cambia con el horizonte. Hoy rebalance_months = [10] (commit 005bd59, perfil agresivo), así que el horizonte es de 1 mes.";
 const REGION_NOTE = "Región por sufijo: .TO = Canadá; .DE / .L / .PA / .MC = Europa; .T = Japón; HSBC y BP cuentan como EE. UU.";
 const OBS_MV = [
-  "<b>Sin filtro delta.</b> MV no tiene filtro delta; delta_strike_mode = 'atm' solo afecta la tabla de griegas que se imprime.",
-  '<b>Internacionales: pendiente de decisión.</b> Con n_top_international = 15 (valor del perfil Agresivo) solo entran canadienses, y con tail_risk_hist_fallback = False ninguno pasa el filtro de cola. Hoy MV no usa internacionales en la práctica. Sin tope por región ni peso mínimo forzado.'
+  '<b>Filtro delta.</b> use_delta_filter = True. delta_strike_mode = "atm" solo arma la tabla de griegas; el filtro es el colchón OTM (delta_otm_log_m = 0.08, delta_otm_ref_months = 2), con delta_min 0.24 / 0.18 / 0.15.',
+  "<b>Internacionales.</b> Con n_top_international = 15 entran los 15 de mayor market cap del universo completo (Canadá, Europa, Japón y HSBC), no solo canadienses. tail_risk_hist_fallback = True y tail_risk_min_survivors = 5. Sin tope por región ni peso mínimo forzado."
 ];
 
 const mvCommon = (seasonal) => [
-  {p:"volatility_percentile", v:["0.55","0.85","0.97"], live:"0.55", st:"match", lab:"= Con"},
-  {p:"correlation_percentile", v:["0.60","0.75","0.90"], live:"0.60", st:"match", lab:"= Con"},
-  {p:"max_assets_in_portfolio", v:["15","10","6"], live:"15", st:"match", lab:"= Con"},
-  {p:"max_weight_per_asset", v:["0.12","0.22","0.35"], live:"0.12", st:"match", lab:"= Con"},
-  {p:"etf_min_weight", v:["0.30","0.00","0.00"], live:"0.30", st:"match", lab:"= Con"},
-  {p:"etf_max_weight", v:["0.55","0.20","0.05"], live:"0.55", st:"match", lab:"= Con"},
-  {p:"shrinkage_min", v:["0.35","0.02","0.02"], live:"0.35", st:"match", lab:"= Con", note:MV_EST},
-  {p:"shrinkage_max", v:["0.85","0.70","0.40"], live:"0.85", st:"match", lab:"= Con", note:MV_EST},
-  {p:"ratio_band", v:["0.30","0.25","0.20"], live:"0.30", st:"match", lab:"= Con", note:MV_EST},
-  {p:"n_pre_seasonal", v:["70","60","45"], live:"70", st:"match", lab:"= Con"},
+  {p:"volatility_percentile", v:["0.55","0.85","0.97"], live:"0.97", st:"match", lab:"= Agr"},
+  {p:"correlation_percentile", v:["0.60","0.75","0.90"], live:"0.90", st:"match", lab:"= Agr"},
+  {p:"max_assets_in_portfolio", v:["15","10","6"], live:"6", st:"match", lab:"= Agr"},
+  {p:"max_weight_per_asset", v:["0.12","0.22","0.35"], live:"0.35", st:"match", lab:"= Agr"},
+  {p:"etf_min_weight", v:["0.30","0.00","0.00"], live:"0.00", st:"match", lab:"= Mod/Agr"},
+  {p:"etf_max_weight", v:["0.55","0.20","0.05"], live:"0.05", st:"match", lab:"= Agr"},
+  {p:"shrinkage_min", v:["0.35","0.02","0.02"], live:"0.02", st:"match", lab:"= Mod/Agr", note:MV_EST},
+  {p:"shrinkage_max", v:["0.85","0.70","0.40"], live:"0.40", st:"match", lab:"= Agr", note:MV_EST},
+  {p:"ratio_band", v:["0.30","0.25","0.20"], live:"0.20", st:"match", lab:"= Agr", note:MV_EST},
+  {p:"n_pre_seasonal", v:["70","60","45"], live:"45", st:"match", lab:"= Agr"},
   seasonal
-    ? {p:"seasonal_min_weeks", v:["20","15","10"], live:"20", st:"match", lab:"= Con"}
+    ? {p:"seasonal_min_weeks", v:["20","15","10"], live:"10", st:"match", lab:"= Agr"}
     : {p:"seasonal_min_weeks", v:["20","15","10"], live:"—", st:"dead", lab:"", note:"El script no lo usa; solo existe n_pre_seasonal.", skip:true},
-  seasonal
-    ? {p:"n_top_international", v:["5","10","15"], live:"20", st:"drift", lab:"> Agr", note:"El script está en Conservador pero con 20 internacionales; el perfil pide 5."}
-    : {p:"n_top_international", v:["5","10","15"], live:"5", st:"match", lab:"= Con"},
-  seasonal
-    ? {p:"n_divers_candidates", v:["45","40","30"], live:"45", st:"new", lab:"= Con", note:"Escala con n_pre_seasonal: pool más amplio para el perfil que más diversifica."}
-    : {p:"n_divers_candidates", v:["45","40","30"], live:"35", st:"new", lab:"entre Mod/Agr", note:"Escala con n_pre_seasonal. El script está en Conservador pero con 35."},
-  seasonal
-    ? {p:"max_fx_exposure", v:["0.20","0.35","0.50"], live:"0.45", st:"new", lab:"≈ Agr", note:"Techo de exposición a tickers no denominados en USD. Es un techo, no genera infactibilidad."}
-    : {p:"max_fx_exposure", v:["0.20","0.35","0.50"], live:"0.35", st:"new", lab:"= Mod", note:"Techo de exposición a tickers no denominados en USD."},
-  {p:"tail_risk_filter_confidence", v:["0.99","0.975","0.95"], live:"0.99", st:"new", lab:"= Con", note:"Confianza del VaR_CF con que se rankean y filtran candidatos."},
-  {p:"cornish_fisher_confidence", v:["0.99","0.975","0.95"], live:"0.95", st:"new", lab:"= Agr", note:CF_MV},
+  {p:"n_top_international", v:["5","10","15"], live:"15", st:"match", lab:"= Agr", note:"Top 15 por market cap del universo completo (Canadá, Europa, Japón y HSBC), no solo canadienses."},
+  {p:"n_divers_candidates", v:["45","40","30"], live:"30", st:"match", lab:"= Agr", note:"Escala con n_pre_seasonal: pool más amplio para el perfil que más diversifica."},
+  {p:"max_fx_exposure", v:["0.20","0.35","0.50"], live:"0.50", st:"match", lab:"= Agr", note:"Techo de exposición a tickers no denominados en USD. Es un techo, no genera infactibilidad."},
+  {p:"tail_risk_filter_confidence", v:["0.99","0.975","0.95"], live:"0.95", st:"match", lab:"= Agr", note:"Confianza del VaR_CF con que se rankean y filtran candidatos."},
+  {p:"cornish_fisher_confidence", v:["0.99","0.975","0.95"], live:"0.95", st:"match", lab:"= Agr", note:CF_MV},
+  {p:"use_delta_filter", v:["True","True","True"], live:"True", st:"match", lab:"todos"},
+  {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"match", lab:"= Agr", note:"Comentario del código: Conservador 0.24, moderado 0.18, agresivo 0.15. Con el colchón OTM cada umbral es un tope de IV anual (0.24 ≈ 31,5%, 0.18 ≈ 43%, 0.15 ≈ 52%)."},
+  {p:"delta_otm_log_m", v:["0.08","0.08","0.08"], live:"0.08", st:"match", lab:"todos"},
+  {p:"delta_otm_ref_months", v:["2","2","2"], live:"2", st:"match", lab:"todos"},
 ];
 
 const LOWVOL_NOTE = "Absorbe el peso que tenía weight_low_vol (antes 0.30 / 0.40 / 0.55 + 0.50 / 0.35 / 0.15), así que el balance frente a weight_decorr no cambia. Sharpe mide eficiencia, no nivel de vol: la preferencia por vol baja vive solo en lambda_ y en los filtros de elegibilidad.";
@@ -268,15 +341,15 @@ const LAMBDA_NOTE = " Única palanca de aversión al riesgo dentro del QP. Calib
 
 const SECTIONS = [
   {repo:"AM-PM"},
-  {id:"mv-seasonal", title:"Minimum Variance (estacional)", file:"~/AM-PM/minimum_variance_(seasonal_version).py · Sección 1", live:"hoy: Conservador",
-   summary:"Conservador en todos los campos registrados salvo n_top_international, que quedó en 20. Los tres parámetros nuevos de cola y FX quedan escalonados.",
+  {id:"mv-seasonal", title:"Minimum Variance (estacional)", file:"~/AM-PM/minimum_variance_(seasonal_version).py · Sección 1", live:"hoy: Agresivo",
+   summary:"Agresivo en los campos registrados, incluido el filtro delta (delta_min 0.15). target_total_tickers y use_daily_cov ya no existen.",
    rows: mvCommon(true),
-   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["target_total_tickers","130"],["execution_months","[9]"],["risk_free_rate","0.045"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["use_etf_constraint / use_fx_factor","True / True"],["delta_strike_mode",'"atm"'],["target_dte_iv / dte_tol_iv","30 / 7"],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["use_lw_shrinkage / use_daily_cov","True / True"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
+   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["execution_months","[10]"],["risk_free_rate","0.047"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["use_etf_constraint / use_fx_factor","True / True"],["delta_strike_mode",'"atm"'],["target_dte_iv / dte_tol_iv","30 / 21"],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["use_lw_shrinkage","True"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"],["tail_risk_hist_fallback","True"],["tail_risk_min_survivors","5"]],
    obs:OBS_MV},
-  {id:"mv", title:"Minimum Variance", file:"~/AM-PM/minimum_variance.py · Sección 1", live:"hoy: Conservador",
-   summary:"Conservador en todos los campos registrados. n_divers_candidates y max_fx_exposure quedan fuera de perfil frente a los valores nuevos.",
+  {id:"mv", title:"Minimum Variance", file:"~/AM-PM/minimum_variance.py · Sección 1", live:"hoy: Agresivo",
+   summary:"Agresivo en los campos registrados, incluido el filtro delta (delta_min 0.15). target_total_tickers ya no existe.",
    rows: mvCommon(false),
-   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["target_total_tickers","200"],["horizon_months","1"],["options_horizon_cap_months","3"],["risk_free_rate","0.047"],["tail_risk_min_hist_weeks","26"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["delta_strike_mode",'"atm"'],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
+   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["horizon_months","1"],["options_horizon_cap_months","3"],["risk_free_rate","0.047"],["tail_risk_min_hist_weeks","26"],["tail_risk_hist_fallback","True"],["tail_risk_min_survivors","5"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["delta_strike_mode",'"atm"'],["target_dte_iv / dte_tol_iv","30 / 21"],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["use_lw_shrinkage","True"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
    obs:OBS_MV},
   {id:"qu-seasonal", title:"Quadratic Utility (estacional)", file:"~/AM-PM/quadratic_utility_(seasonal_version).py · Parámetros configurables", live:"hoy: Agresivo",
    summary:"Agresivo en todos los campos registrados. Igual que QU normal: la aversión al riesgo del optimizador vive solo en lambda_ y μ es la media histórica encogida hacia Fama-French. Los filtros de vol (volatility_percentile, delta_min, seasonal_vol_ratio_max) se mantienen como límites de elegibilidad por perfil.",
@@ -298,11 +371,11 @@ const SECTIONS = [
     {p:"seasonal_min_weeks", v:["40","35","30"], live:"30", st:"new", lab:"= Agr", note:"Más historia estacional exigida al perfil que más valora la robustez."},
     {p:"seasonal_min_survivors", v:["22","18","14"], live:"14", st:"new", lab:"= Agr", note:"Misma escalera que recent_vol_min_survivors del QU sin horizonte."},
    ],
-   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","500"],["rebalance_months","[10]"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["options_dte_cap_days","90"],["etf_band_relax_if_infeasible","True"]],
+   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["rebalance_months","[10]"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["lambda_annual","None (si se fija, pisa a lambda_)"],["panel_min_obs","24"],["etf_floor_reserve_factor","3"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["etf_band_relax_if_infeasible","True"]],
    obs:[
     LAMBDA_OBS,
     MU_OBS,
-    '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual (ver la fila de delta_min).',
+    '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual (ver la fila de delta_min). options_dte_cap_days no existe en este script; solo en QU normal (90).',
     '<b>Banda de ETF del Conservador: portada, falta revalidar.</b> El script ya tiene el piso de ETF de QU normal (ceil(piso / max_weight), reserva, reposición tras los filtros y chequeo de factibilidad antes de optimizar). La falla de la tabla de validación (3 ETF, máximo 36% frente al piso de 45%) se midió antes de ese cambio.'
    ]},
   {id:"qu", title:"Quadratic Utility", file:"~/AM-PM/quadratic_utility.py · Parámetros configurables", live:"hoy: Agresivo",
@@ -329,7 +402,7 @@ const SECTIONS = [
     {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"2.00", st:"new", lab:"= Agr", note:Z_NOTE},
     {p:"bkm_min_survivors", v:["16","14","12"], live:"12", st:"new", lab:"= Agr", note:"Piso tras el filtro MFIS."},
    ],
-   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","210"],["horizon_months","2"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["etf_band_relax_if_infeasible","True"]],
+   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["horizon_months","2"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["lambda_annual","None (si se fija, pisa a lambda_)"],["panel_min_obs","24"],["etf_floor_reserve_factor","3"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["options_dte_cap_days","90"],["etf_band_relax_if_infeasible","True"]],
    obs:[
     LAMBDA_OBS,
     MU_OBS,
@@ -338,7 +411,7 @@ const SECTIONS = [
     '<b>Rellenos de candidatos.</b> Ya no reintroducen nombres que el filtro de IV frente a la vol realizada descartó.'
    ]},
   {id:"bl", title:"Black-Litterman", file:"~/AM-PM/black_litterman.py · Bloques 3–5 y 11", live:"hoy: agresivo",
-   summary:"PERFILES escalona omega_scale, tau y gamma_ra; lambda3 y lambda4 ya se derivan de gamma_ra (Taylor CRRA), así que γ es la única palanca de riesgo del MVSK. Faltan la cardinalidad y el tope por activo, que hoy son iguales para los tres perfiles.",
+   summary:"PERFILES escalona omega_scale, tau y gamma_ra; lambda3 y lambda4 se derivan de gamma_ra (Taylor CRRA), así que γ es la única palanca de riesgo del MVSK. MAX_TICKERS_FINAL y PESO_MAX_ACTIVO no están en PERFILES: el código usa 10 y 0.35. Isaac deja la cardinalidad del agresivo en 10.",
    rows:[
     {p:"PERFIL_RIESGO", v:['"conservador"','"moderado"','"agresivo"'], live:'"agresivo"', st:"match", lab:"selector"},
     {p:"omega_scale", v:["5.0","1.0","0.25"], live:"0.25", st:"code", lab:"en PERFILES", note:"Menor confianza en las vistas para el conservador: el posterior se queda cerca del equilibrio.", skip:true},
@@ -346,18 +419,18 @@ const SECTIONS = [
     {p:"gamma_ra", v:["6.0","3.0","1.5"], live:"1.5", st:"code", lab:"en PERFILES", note:"Escalera de referencia para γ en QU y US.", skip:true},
     {p:"lambda3", v:["21.0","6.0","1.875"], live:"desde γ", st:"code", lab:"desde gamma_ra", note:"γ(γ+1)/2, calculado con bm.crra_taylor_lambdas: sigue al perfil sin editarlo.", skip:true},
     {p:"lambda4", v:["56.0","10.0","2.1875"], live:"desde γ", st:"code", lab:"desde gamma_ra", note:"γ(γ+1)(γ+2)/6. Con γ = 6 el término de 4.º orden puede rondar el 80% del de varianza: la serie truncada pierde precisión.", skip:true},
-    {p:"MAX_TICKERS_FINAL", v:["12","10","8"], live:"10", st:"new", lab:"= Mod"},
-    {p:"PESO_MAX_ACTIVO", v:["0.15","0.25","0.35"], live:"0.35", st:"new", lab:"= Agr", note:"Factible en los tres: 12×0.15, 10×0.25 y 8×0.35 superan 1."},
+    {p:"MAX_TICKERS_FINAL", v:["12","10","10"], live:"10", st:"match", lab:"= Mod/Agr", note:"El agresivo se deja en 10 (Isaac, 2026-10-04); ya no 8. No está dentro de PERFILES: el script usa un solo valor."},
+    {p:"PESO_MAX_ACTIVO", v:["0.15","0.25","0.35"], live:"0.35", st:"new", lab:"= Agr", note:"Factible en los tres: 12×0.15, 10×0.25 y 10×0.35 superan 1."},
     {p:"ALPHA_CVAR_OBJETIVO", v:["0.99","0.975","0.95"], live:"0.95", st:"new", lab:"= Agr", note:'Solo actúa con MODO_OPTIMIZACION = "cvar".'},
    ],
-   globals:[["TICKERS","19 nombres"],["MESES_HORIZONTE","4"],["Rf","0.046"],["UMBRAL_PESO_MIN","0.005"],["MODO_OPTIMIZACION",'"mvsk"'],["METODO_POSTERIOR",'"entropy_pooling"'],["N_ESCENARIOS","12000"],["HALF_LIFE_PRIOR","252"],["THETA_ESSCHER_COTA","(0.0, 25.0)"],["MAX_PRIMA_HM_SIGMA","0.35"],["COTA_SKEW_P / KURT_P","(-2.5,1.5) / (1.8,12.0)"],["NIVEL_CONFIANZA_VAR","0.95"],["BKM_MFIK_MAX","20.0"],["COV_HALFLIFE_DIAS","120"]],
+   globals:[["TICKERS","19 nombres"],["MESES_HORIZONTE","2"],["Rf","0.046 (solo fallback)"],["UMBRAL_PESO_MIN","0.005"],["MODO_OPTIMIZACION",'"mvsk"'],["METODO_POSTERIOR",'"entropy_pooling"'],["N_ESCENARIOS","12000"],["HALF_LIFE_PRIOR","252"],["THETA_ESSCHER_COTA","(0.0, 25.0)"],["MAX_PRIMA_HM_SIGMA","0.35"],["COTA_SKEW_P / KURT_P","(-2.5,1.5) / (1.8,12.0)"],["NIVEL_CONFIANZA_VAR","0.95"],["BKM_MFIK_MAX","20.0"],["COV_HALFLIFE_DIAS","120"]],
    obs:'<b>Internacionales:</b> BL agrega los internacionales con el mismo helper compartido (market_data.py), sin tope por región y sin peso mínimo forzado.'},
   {repo:"US Asset Allocation"},
   {id:"us", title:"US Asset Manager", file:"~/US Asset Allocation/US Asset Manager.py · Perfil y PROFILES", live:"hoy: Crecimiento",
-   summary:"Ya tiene tres perfiles (Crecimiento hace de Moderado). Solo cambia risk_aversion para usar la misma escalera que QU y BL; topes y objetivos de factor se mantienen.",
+   summary:"El selector en vivo es Crecimiento. risk_aversion en el código es 8 / 4 / 2. La escalera 6 / 3 / 1.5 es una propuesta pendiente y no está aplicada. Topes y objetivos de factor sí coinciden con el código.",
    rows:[
     {p:"INVESTMENT_PROFILE", v:['"Conservador"','"Crecimiento"','"Momentum/Agresivo"'], live:'"Crecimiento"', st:"match", lab:"selector"},
-    {p:"risk_aversion", v:["6.0","3.0","1.5"], live:"4.0", st:"change", lab:"antes = Mod", note:GAMMA_NOTE("8.0 / 4.0 / 2.0")},
+    {p:"risk_aversion", v:["8.0","4.0","2.0"], live:"4.0", st:"match", lab:"= Mod", note:"Propuesta pendiente, no aplicada: 6.0 / 3.0 / 1.5 (escalera de BL). El código sigue en 8 / 4 / 2. El selector vivo es Crecimiento, así que corre 4.0."},
     {p:"max_weight", v:["0.15","0.20","0.25"], live:"0.20", st:"match", lab:"= Mod"},
     {p:"targets · Value", v:["0.45","0.00","0.00"], live:"0.00", st:"match", lab:"= Mod"},
     {p:"targets · Growth", v:["0.00","0.60","0.55"], live:"0.60", st:"match", lab:"= Mod"},
@@ -366,27 +439,27 @@ const SECTIONS = [
     {p:"targets · LowVol", v:["0.70","0.00","0.00"], live:"0.00", st:"match", lab:"= Mod"},
    ],
    globals:[["SOLVER",'"cvxpy"'],["RISK_FREE_RATE","0.040"],["EQUITY_RISK_PREMIUM","0.050"],["HISTORICAL_MU_BLEND","0.25"],["PRICE_HISTORY_YEARS","3"],["DYNAMIC_CANDIDATE_POOL","90"],["MAX_DYNAMIC_ETFS","25"],["EXCLUDE_LEVERAGED_INVERSE","True"],["OPTIONS_TARGET_DAYS","60"],["BKM_MFIK_MAX","20.0"],["COVARIANCE_HALFLIFE_DAYS","120"],["VRP_RATIO_BOUNDS","(0.70, 1.00)"],["SA_ITERATIONS","80000"]],
-   obs:'<b>Conservador sin piso de renta fija.</b> El universo incluye TLT, IEF, SHY y AGG, pero no hay restricción por clase de activo: la postura defensiva descansa solo en γ y en el objetivo LowVol 0.70. Con γ bajando de 8 a 6 vale revisar si hace falta un mínimo en Fixed Income.'},
+   obs:'<b>Conservador sin piso de renta fija.</b> El universo incluye TLT, IEF, SHY y AGG, pero no hay restricción por clase de activo: la postura defensiva descansa solo en γ (hoy 8, no 6) y en el objetivo LowVol 0.70. RISK_FREE_RATE en vivo es 0.040.'},
   {repo:"Colombian Portfolio Architecture"},
   {id:"col-arch", title:"COL Portfolio Architecture", file:"~/Colombian Portfolio Architecture/COL_Portfolio_architecture.py · Parámetros editables", live:"hoy: sin perfil",
-   summary:"Hoy tiene una sola configuración (RV y RF entre 40% y 60%), que cae entre Moderado y Agresivo. Se proponen tres perfiles alineados con el mandato de la casa.",
+   summary:"Propuesta, no implementada. El código tiene una sola configuración (columna «En el código»): RV y RF entre 40% y 60%. Los tres perfiles de la tabla no están en el script.",
    rows:[
-    {p:"BANDA_RV", v:["(0.00, 0.10)","(0.20, 0.40)","(0.50, 0.85)"], live:"(0.40, 0.60)", st:"new", lab:"entre Mod/Agr", note:"rv_min / rv_max de am_pm/profiles.py."},
-    {p:"BANDA_RF", v:["(0.90, 1.00)","(0.60, 0.80)","(0.15, 0.50)"], live:"(0.40, 0.60)", st:"new", lab:"entre Mod/Agr", note:"Complemento de BANDA_RV; mínimos y máximos cierran en 100% en los tres perfiles."},
-    {p:"RF_TENOR_YEARS", v:["1.0","3.0","5.0"], live:"1.0", st:"new", lab:"= Con", note:"El propio código pide que refleje el horizonte: 12 / 36 / 60 meses."},
-    {p:"MAX_PESO_ACCION_INDIVIDUAL", v:["0.05","0.10","0.15"], live:"0.15", st:"new", lab:"= Agr"},
-    {p:"MAX_PESO_ETF_RV", v:["0.10","0.20","0.30"], live:"0.20", st:"new", lab:"= Mod"},
-    {p:"MAX_PESO_ETF_RF", v:["0.10","0.15","0.20"], live:"0.20", st:"new", lab:"= Agr", note:"El único ETF de RF es TLT: dólar y duración larga, riesgo que el conservador acota."},
-    {p:"MAX_PESO_NODO_TES", v:["0.30","0.25","0.20"], live:"0.20", st:"new", lab:"= Agr", note:"Sube para el conservador porque la RF debe llenar 90%: 4 nodos × 0.30 = 120% de capacidad."},
-    {p:"MAX_PESO_BONO_INDIVIDUAL", v:["0.10","0.15","0.15"], live:"0.15", st:"new", lab:"= Mod/Agr"},
-    {p:"NODOS_TES", v:["[1.0, 2.0, 3.0, 5.0]","[1.0, 3.0, 5.0, 10.0]","[1.0, 3.0, 5.0, 10.0, 15.0]"], live:"[1.0, 3.0, 5.0, 10.0]", st:"new", lab:"= Mod", note:"Duración máxima de la curva soberana: 5 / 10 / 15 años."},
-    {p:"BONOS_MIN_RATING", v:['"AAA"','"AA+"','"AA"'], live:'"AA+"', st:"new", lab:"= Mod"},
-    {p:"BONOS_PLAZO_MAX_ANIOS", v:["5.0","10.0","15.0"], live:"10.0", st:"new", lab:"= Mod"},
-    {p:"BONOS_MIN_LIQUIDEZ", v:["0.50","0.35","0.25"], live:"0.35", st:"new", lab:"= Mod"},
-    {p:"BONOS_MAX_SPREAD_BP", v:["250.0","450.0","600.0"], live:"450.0", st:"new", lab:"= Mod"},
-    {p:"BONOS_MAX_POR_EMISOR", v:["1","2","3"], live:"2", st:"new", lab:"= Mod"},
+    {p:"BANDA_RV", v:["(0.00, 0.10)","(0.20, 0.40)","(0.50, 0.85)"], live:"(0.40, 0.60)", st:"proposal", lab:"entre Mod/Agr", note:"Propuesta, no implementada. En vivo el código es (0.40, 0.60). El rango propuesto sale de rv_min / rv_max de am_pm/profiles.py."},
+    {p:"BANDA_RF", v:["(0.90, 1.00)","(0.60, 0.80)","(0.15, 0.50)"], live:"(0.40, 0.60)", st:"proposal", lab:"entre Mod/Agr", note:"Propuesta, no implementada. En vivo (0.40, 0.60)."},
+    {p:"RF_TENOR_YEARS", v:["1.0","3.0","5.0"], live:"1.0", st:"proposal", lab:"= Con", note:"Propuesta, no implementada. En vivo 1.0. La propuesta sigue el horizonte del mandato: 12 / 36 / 60 meses."},
+    {p:"MAX_PESO_ACCION_INDIVIDUAL", v:["0.05","0.10","0.15"], live:"0.15", st:"proposal", lab:"= Agr", note:"Propuesta, no implementada. En vivo 0.15."},
+    {p:"MAX_PESO_ETF_RV", v:["0.10","0.20","0.30"], live:"0.20", st:"proposal", lab:"= Mod", note:"Propuesta, no implementada. En vivo 0.20."},
+    {p:"MAX_PESO_ETF_RF", v:["0.10","0.15","0.20"], live:"0.20", st:"proposal", lab:"= Agr", note:"Propuesta, no implementada. En vivo 0.20. El único ETF de RF es TLT."},
+    {p:"MAX_PESO_NODO_TES", v:["0.30","0.25","0.20"], live:"0.20", st:"proposal", lab:"= Agr", note:"Propuesta, no implementada. En vivo 0.20."},
+    {p:"MAX_PESO_BONO_INDIVIDUAL", v:["0.10","0.15","0.15"], live:"0.15", st:"proposal", lab:"= Mod/Agr", note:"Propuesta, no implementada. En vivo 0.15."},
+    {p:"NODOS_TES", v:["[1.0, 2.0, 3.0, 5.0]","[1.0, 3.0, 5.0, 10.0]","[1.0, 3.0, 5.0, 10.0, 15.0]"], live:"[1.0, 3.0, 5.0, 10.0]", st:"proposal", lab:"= Mod", note:"Propuesta, no implementada. En vivo [1.0, 3.0, 5.0, 10.0]."},
+    {p:"BONOS_MIN_RATING", v:['"AAA"','"AA+"','"AA"'], live:'"AA+"', st:"proposal", lab:"= Mod", note:"Propuesta, no implementada. En vivo AA+."},
+    {p:"BONOS_PLAZO_MAX_ANIOS", v:["5.0","10.0","15.0"], live:"10.0", st:"proposal", lab:"= Mod", note:"Propuesta, no implementada. En vivo 10.0."},
+    {p:"BONOS_MIN_LIQUIDEZ", v:["0.50","0.35","0.25"], live:"0.35", st:"proposal", lab:"= Mod", note:"Propuesta, no implementada. En vivo 0.35."},
+    {p:"BONOS_MAX_SPREAD_BP", v:["250.0","450.0","600.0"], live:"450.0", st:"proposal", lab:"= Mod", note:"Propuesta, no implementada. En vivo 450.0."},
+    {p:"BONOS_MAX_POR_EMISOR", v:["1","2","3"], live:"2", st:"proposal", lab:"= Mod", note:"Propuesta, no implementada. En vivo 2."},
    ],
-   globals:[["FECHA_INICIO / FIN",'"2021-01-01" / "2024-12-31"'],["ACCIONES_BVC","28 emisores"],["ETFS_RV_LOCALES",'["ICOLCAP.CL", "HCOLSEL.CL"]'],["ETFS_RV_GLOBALES",'["SPY", "QQQ"]'],["ETFS_RF_GLOBALES",'["TLT"]'],["BENCHMARK",'"^GSPC"'],["BONOS_PLAZO_MIN_ANIOS","1.0"],["BONOS_INDEXACIONES_PERMITIDAS",'{"TF"}'],["LOOKBACK_DIAS","252"],["FRECUENCIA_REBALANCEO",'"ME"'],["USAR_SHRINKAGE_LEDOIT_WOLF","True"],["EXCLUIR_ACTIVOS_SIN_PRECIO_REAL","True"],["CURVA_VOL_NIVEL / PEND / CURV","5.5 / 3.5 / 2.5 bp"]],
+   globals:[["FECHA_INICIO / FIN",'"2021-01-01" / "2024-12-31"'],["ACCIONES_BVC","30 emisores"],["ETFS_RV_LOCALES",'["ICOLCAP.CL", "HCOLSEL.CL"]'],["ETFS_RV_GLOBALES",'["SPY", "QQQ"]'],["ETFS_RF_GLOBALES",'["TLT"]'],["BENCHMARK",'"^GSPC"'],["BONOS_PLAZO_MIN_ANIOS","1.0"],["BONOS_INDEXACIONES_PERMITIDAS",'{"TF"}'],["LOOKBACK_DIAS","252"],["FRECUENCIA_REBALANCEO",'"ME"'],["USAR_SHRINKAGE_LEDOIT_WOLF","True"],["EXCLUIR_ACTIVOS_SIN_PRECIO_REAL","True"],["CURVA_VOL_NIVEL / PEND / CURV","5.5 / 3.5 / 2.5 bp"]],
    obs:'<b>Máximo Sharpe no depende del perfil.</b> La cartera tangente es la misma para los tres; el perfil solo actúa si las bandas se activan. En Conservador la banda RV ≤ 10% casi seguro se activa, así que ese perfil queda definido por las restricciones más que por el optimizador.'},
   {repo:"Colombian Asset Allocation"},
   {id:"col-aa", title:"Asset Allocation (FICs)", file:"~/Colombian Asset Allocation/am_pm/profiles.py · PERFILES", live:"los 3 en cada corrida",
@@ -415,7 +488,7 @@ function blockFor(s, i){
   if (s.copy) return s.copy(i);
   const head = `# ${P[i]} · ${s.file.replace(/^~\//,"")}`;
   if (s.id === "us"){
-    return `${head}\nINVESTMENT_PROFILE = ${s.rows[0].v[i]}\n\nPROFILES = {\n    "Conservador": {\n        "risk_aversion": 6.0,\n        "max_weight": 0.15,\n        "targets": {"Value": 0.45, "Growth": 0.00, "Momentum": 0.00, "Quality": 0.55, "LowVol": 0.70},\n    },\n    "Crecimiento": {\n        "risk_aversion": 3.0,\n        "max_weight": 0.20,\n        "targets": {"Value": 0.00, "Growth": 0.60, "Momentum": 0.45, "Quality": 0.55, "LowVol": 0.00},\n    },\n    "Momentum/Agresivo": {\n        "risk_aversion": 1.5,\n        "max_weight": 0.25,\n        "targets": {"Value": 0.00, "Growth": 0.55, "Momentum": 0.70, "Quality": 0.00, "LowVol": 0.00},\n    },\n}`;
+    return `${head}\nINVESTMENT_PROFILE = ${s.rows[0].v[i]}\n\nPROFILES = {\n    "Conservador": {\n        "risk_aversion": 8.0,\n        "max_weight": 0.15,\n        "targets": {"Value": 0.45, "Growth": 0.00, "Momentum": 0.00, "Quality": 0.55, "LowVol": 0.70},\n    },\n    "Crecimiento": {\n        "risk_aversion": 4.0,\n        "max_weight": 0.20,\n        "targets": {"Value": 0.00, "Growth": 0.60, "Momentum": 0.45, "Quality": 0.55, "LowVol": 0.00},\n    },\n    "Momentum/Agresivo": {\n        "risk_aversion": 2.0,\n        "max_weight": 0.25,\n        "targets": {"Value": 0.00, "Growth": 0.55, "Momentum": 0.70, "Quality": 0.00, "LowVol": 0.00},\n    },\n}`;
   }
   const lines = s.rows.filter(r => !r.skip && r.st !== "dead").map(r => `${r.p} = ${r.v[i]}`);
   return `${head}\n${lines.join("\n")}`;
@@ -455,6 +528,8 @@ function render(){
     </section>`);
   }
   nav.push(`<a href="#validacion">Validación</a>`);
+  nav.push(`<a href="#calibracion-lambda">Calibración λ</a>`);
+  nav.push(`<a href="#anomalias">Anomalías</a>`);
   document.getElementById("sections").innerHTML = out.join("");
   document.getElementById("nav").innerHTML = nav.join("");
 }
