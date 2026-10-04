@@ -1545,45 +1545,27 @@ if use_delta_filter:
         usa_polygon = ticker in poly_ok_set
         # atm/mu/rf conservan el atajo: la delta ATM de Polygon, si existe.
         # En otm esa delta no discrimina y se recalcula el colchon con la IV.
-        if usa_polygon and delta_strike_mode != "otm":
-            fila = polygon_market_df[polygon_market_df["symbol"] == ticker].iloc[0]
-            delta_rows.append(dict(symbol=ticker, delta=fila["delta"], strike_mode="polygon_real", iv_used=fila["iv"]))
-            continue
+        fila_poly = None
+        if usa_polygon:
+            fila_poly = polygon_market_df[polygon_market_df["symbol"] == ticker].iloc[0]
 
         mu_i_series = mu_for_delta.loc[mu_for_delta["symbol"] == ticker, "mu_monthly"]
         mu_i = mu_i_series.iloc[0] if len(mu_i_series) and not pd.isna(mu_i_series.iloc[0]) else 0.0
 
         iv_series = hist_vol_for_delta.loc[hist_vol_for_delta["symbol"] == ticker, "vol_hist"]
-        iv = iv_series.iloc[0] if len(iv_series) and not pd.isna(iv_series.iloc[0]) and iv_series.iloc[0] > 0 else np.nan
-        fuente_iv = "hist"
+        iv_hist = iv_series.iloc[0] if len(iv_series) else np.nan
 
-        if usa_polygon:
-            fila = polygon_market_df[polygon_market_df["symbol"] == ticker].iloc[0]
-            iv_poly = fila["iv"]
-            if pd.notna(iv_poly) and iv_poly > 0:
-                iv = float(iv_poly)
-                fuente_iv = "polygon_iv"
-
-        if pd.isna(iv):
-            delta_rows.append(dict(symbol=ticker, delta=np.nan, strike_mode="sin_datos", iv_used=np.nan))
-            continue
-
-        if delta_strike_mode == "otm":
-            delta_i = qm.delta_cushion(
-                iv, T_horizon, rf_rate, delta_otm_log_m, ref_years=delta_otm_ref_months / 12.0)
-            delta_rows.append(dict(symbol=ticker, delta=delta_i, strike_mode=f"bs_otm_{fuente_iv}", iv_used=iv))
-            continue
-
-        if delta_strike_mode == "mu":
-            drift_term = mu_i * horizon_months
-        elif delta_strike_mode == "rf":
-            drift_term = rf_rate * (horizon_months / 12)
-        else:
-            drift_term = 0
-
-        d1 = (T_horizon * (rf_rate + iv ** 2 / 2) - drift_term) / (iv * math.sqrt(T_horizon))
-        delta_i = norm.cdf(d1)
-        delta_rows.append(dict(symbol=ticker, delta=delta_i, strike_mode=f"bs_{delta_strike_mode}", iv_used=iv))
+        fila_delta = qm.evaluar_delta_candidato(
+            iv_hist, T_horizon, rf_rate,
+            mode=delta_strike_mode,
+            log_m=delta_otm_log_m,
+            ref_years=delta_otm_ref_months / 12.0,
+            mu_sobre_horizonte=float(mu_i) * horizon_months,
+            usar_delta_polygon=usa_polygon and delta_strike_mode != "otm",
+            polygon_delta=None if fila_poly is None else fila_poly["delta"],
+            polygon_iv=None if fila_poly is None else fila_poly["iv"],
+        )
+        delta_rows.append(dict(symbol=ticker, **fila_delta))
 
     delta_df = pd.DataFrame(delta_rows)
     delta_named = dict(zip(delta_df["symbol"], delta_df["delta"]))
@@ -2834,7 +2816,10 @@ else:
         griegas_df[col] = np.nan
 
 delta_portfolio = np.nansum(weights_opt.reindex(assets).values * delta_aligned)
-print(f"  Delta de portafolio (ponderado, incl. fallback BS): {delta_portfolio:.4f}")
+if delta_strike_mode == "otm":
+    print(f"  Colchon delta OTM ponderado: {delta_portfolio:.4f}")
+else:
+    print(f"  Delta de portafolio (ponderado, incl. fallback BS): {delta_portfolio:.4f}")
 
 peso_con_griegas = griegas_df.loc[griegas_df["gamma"].notna(), "weight"].sum()
 

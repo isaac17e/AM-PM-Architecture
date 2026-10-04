@@ -205,16 +205,31 @@ ideal_observations = 60
 # FILTRO DELTA
 # ------------------------------------------------------------------------------
 use_delta_filter = True
-delta_min = 0.30
+# Colchon de delta (ATM menos OTM). Umbral del perfil agresivo: solo caen
+# las vols mas altas. El horizonte es len(rebalance_months): 1 mes con [10],
+# 2 meses con [10, 11]. La moneyness escala con sqrt(T / T_ref).
+# Conservador 0.24, moderado 0.18, agresivo 0.15.
+delta_min = 0.15
 # direct: el multiplicador es la delta, recortada a [delta_min, 1].
 # fixed: mapea [delta_scale_lo, delta_scale_hi] a [delta_min, 1].
 # minmax: estira el rango observado de la corrida (la regla anterior).
-delta_scale_mode = "direct"
+# relative: colchon / mediana, recortada a [delta_rel_lo, delta_rel_hi].
+# La mediana queda en 1, asi que el nivel no reescala lambda.
+delta_scale_mode = "relative"
 delta_scale_lo = 0.45
 delta_scale_hi = 0.55
+delta_rel_lo = 0.75
+delta_rel_hi = 1.25
 # Menos acciones que esto: la correlacion implicita del sector no se usa.
 sector_implied_min_names = 4
-delta_strike_mode = "rf"
+# atm: K = S. Con la delta real de Polygon (o BS ATM) todas caen en
+# ~0.50-0.58 y delta_min no separa perfiles. mu: strike al retorno esperado.
+# rf: strike forward. otm: colchon de delta hasta un log-moneyness fijo.
+delta_strike_mode = "otm"
+# Log-moneyness del strike OTM en el horizonte de referencia. Se escala con
+# sqrt(plazo / referencia). El plazo es len(rebalance_months) / 12.
+delta_otm_log_m = 0.08
+delta_otm_ref_months = 2
 iv_outlier_multiplier = 6.0
 
 # ------------------------------------------------------------------------------
@@ -249,6 +264,18 @@ if not (0 <= pct_etf_deseado <= 1):
     raise ValueError("Error: pct_etf_deseado debe estar entre 0 y 1 (ej. 0.30 = 30%)")
 if not (0 <= pct_etf_tolerancia <= 0.5):
     raise ValueError("Error: pct_etf_tolerancia debe estar entre 0 y 0.5")
+if delta_strike_mode not in ("atm", "mu", "rf", "otm"):
+    raise ValueError("Error: delta_strike_mode debe ser atm, mu, rf u otm")
+if delta_scale_mode not in ("direct", "fixed", "minmax", "relative"):
+    raise ValueError("Error: delta_scale_mode debe ser direct, fixed, minmax o relative")
+if not (math.isfinite(delta_min) and delta_min >= 0):
+    raise ValueError("Error: delta_min debe ser finito y >= 0")
+if delta_strike_mode == "otm" and not (math.isfinite(delta_otm_log_m) and delta_otm_log_m > 0):
+    raise ValueError("Error: delta_otm_log_m debe ser finito y > 0")
+if delta_strike_mode == "otm" and not (delta_otm_ref_months > 0):
+    raise ValueError("Error: delta_otm_ref_months debe ser > 0")
+if delta_scale_mode == "relative" and not (delta_rel_lo < delta_rel_hi):
+    raise ValueError("Error: delta_rel_lo debe ser menor que delta_rel_hi")
 
 horizon_months = len(rebalance_months)
 MONTH_ABB = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -925,21 +952,24 @@ etf_tickers_clean = list(dict.fromkeys(t.upper() for t in etf_tickers))
 commodity_tickers_clean = list(dict.fromkeys(t.upper() for t in commodity_tickers))
 international_tickers_clean = list(dict.fromkeys(t.upper() for t in international_tickers))
 
-all_tickers_raw = (sp500_tickers_clean + nasdaq_tickers_clean + etf_tickers_clean
-                    + commodity_tickers_clean + international_tickers_clean)
-
-all_tickers = list(dict.fromkeys(all_tickers_raw))
-
-all_tickers = [
-    t for t in all_tickers
-    if not re.search(r"\^|\$", t) and 1 <= len(t) <= 5 and not re.match(r"^[0-9]", t) and t != ""
-]
+# El formato US (largo 1-5, sin ^/$, sin digito inicial) solo se aplica a
+# domesticos. En la lista ya mezclada tiraba SHOP.TO, ULVR.L, TTE.PA, 7203.T
+# y el resto de sufijos de bolsa. Los internacionales entran despues. No hay
+# piso de peso internacional: si no llegan al portafolio por el flujo, se
+# informa al final.
+tickers_domesticos = list(dict.fromkeys(
+    sp500_tickers_clean + nasdaq_tickers_clean + etf_tickers_clean + commodity_tickers_clean
+))
+all_tickers = qm.combinar_tickers(tickers_domesticos, international_tickers_clean)
 
 # Sin relleno hasta un total objetivo: el universo es exactamente el top N por
 # market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
 # mid-caps ($10-50B) que el optimizador terminaba favoreciendo.
 all_tickers = list(dict.fromkeys(all_tickers))
-print(f"Total tickers FINAL (unicos): {len(all_tickers)}")
+_intl_set = set(international_tickers_clean)
+_n_intl_universo = sum(1 for t in all_tickers if t in _intl_set)
+print(f"Total tickers FINAL (unicos): {len(all_tickers)} | "
+      f"internacionales en el universo: {_n_intl_universo} de {len(international_tickers_clean)}")
 
 
 # ==============================================================================
@@ -1437,8 +1467,16 @@ pc.print_diagnostics("     ")
 # FILTRO DELTA
 # ==============================================================================
 if use_delta_filter:
-    print(f"\nAplicando filtro Delta (delta_min={delta_min:.2f}, T={horizon_months / 12:.3f} anios)...")
-    print("   Fuente: delta real de mercado (Polygon) para US, formula BS con vol historica para el resto")
+    # El plazo del colchon es el horizonte estacional: 1 mes si rebalance_months
+    # tiene un mes ([10]), 2 meses si tiene dos ([10, 11]).
+    print(f"\nAplicando filtro Delta (delta_min={delta_min:.2f}, modo={delta_strike_mode}, "
+          f"T={horizon_months / 12:.3f} anios, {horizon_months} mes(es) de rebalanceo)...")
+    if delta_strike_mode == "otm":
+        print("   Metrica: colchon = delta(K=S) - delta(K OTM). Alto si la vol es baja.")
+        print("   IV: Polygon si hay cadena US; si no, vol historica (internacionales incluidos).")
+        print("   Nombres sin vol se conservan. La delta ATM de Polygon no salta el modo otm.")
+    else:
+        print("   Fuente: delta real de mercado (Polygon) para US, formula BS con vol historica para el resto")
 
     T_horizon = horizon_months / 12
 
@@ -1454,33 +1492,34 @@ if use_delta_filter:
     delta_rows = []
     poly_ok_set = set(polygon_market_df.loc[polygon_market_df["ok"] == True, "symbol"]) if "ok" in polygon_market_df.columns else set()
 
+    m_otm = qm.otm_log_moneyness(delta_otm_log_m, T_horizon, delta_otm_ref_months / 12.0)
+    if delta_strike_mode == "otm":
+        print(f"   Log-moneyness OTM efectiva: {m_otm:.4f} "
+              f"(base {delta_otm_log_m:.4f} a {delta_otm_ref_months:g} meses)")
+
     for ticker in ticker_candidates:
         usa_polygon = ticker in poly_ok_set
+        fila_poly = None
         if usa_polygon:
-            fila = polygon_market_df[polygon_market_df["symbol"] == ticker].iloc[0]
-            delta_rows.append(dict(symbol=ticker, delta=fila["delta"], strike_mode="polygon_real", iv_used=fila["iv"]))
-            continue
+            fila_poly = polygon_market_df[polygon_market_df["symbol"] == ticker].iloc[0]
 
         mu_i_series = mu_for_delta.loc[mu_for_delta["symbol"] == ticker, "mu_monthly"]
         mu_i = mu_i_series.iloc[0] if len(mu_i_series) and not pd.isna(mu_i_series.iloc[0]) else 0.0
 
         iv_series = hist_vol_for_delta.loc[hist_vol_for_delta["symbol"] == ticker, "vol_hist"]
-        iv = iv_series.iloc[0] if len(iv_series) and not pd.isna(iv_series.iloc[0]) and iv_series.iloc[0] > 0 else np.nan
+        iv_hist = iv_series.iloc[0] if len(iv_series) else np.nan
 
-        if pd.isna(iv):
-            delta_rows.append(dict(symbol=ticker, delta=np.nan, strike_mode="sin_datos", iv_used=np.nan))
-            continue
-
-        if delta_strike_mode == "mu":
-            drift_term = mu_i * horizon_months
-        elif delta_strike_mode == "rf":
-            drift_term = rf_rate * (horizon_months / 12)
-        else:
-            drift_term = 0
-
-        d1 = (T_horizon * (rf_rate + iv ** 2 / 2) - drift_term) / (iv * math.sqrt(T_horizon))
-        delta_i = norm.cdf(d1)
-        delta_rows.append(dict(symbol=ticker, delta=delta_i, strike_mode=f"bs_{delta_strike_mode}", iv_used=iv))
+        fila_delta = qm.evaluar_delta_candidato(
+            iv_hist, T_horizon, rf_rate,
+            mode=delta_strike_mode,
+            log_m=delta_otm_log_m,
+            ref_years=delta_otm_ref_months / 12.0,
+            mu_sobre_horizonte=float(mu_i) * horizon_months,
+            usar_delta_polygon=usa_polygon and delta_strike_mode != "otm",
+            polygon_delta=None if fila_poly is None else fila_poly["delta"],
+            polygon_iv=None if fila_poly is None else fila_poly["iv"],
+        )
+        delta_rows.append(dict(symbol=ticker, **fila_delta))
 
     delta_df = pd.DataFrame(delta_rows)
     delta_named = dict(zip(delta_df["symbol"], delta_df["delta"]))
@@ -1491,11 +1530,20 @@ if use_delta_filter:
     n_pass = ((delta_df["delta"].notna()) & (delta_df["delta"] >= delta_min)).sum()
     n_real = (delta_df["strike_mode"] == "polygon_real").sum()
 
+    n_bs = int(delta_df["strike_mode"].astype(str).str.startswith(f"bs_{delta_strike_mode}").sum())
     print(f"  Deltas de mercado real (Polygon): {n_real} | Deltas via formula BS "
-          f"(modo '{delta_strike_mode}'): {(delta_df['strike_mode'] == f'bs_{delta_strike_mode}').sum()}")
+          f"(modo '{delta_strike_mode}'): {n_bs}")
     print(f"  Deltas calculados: {n_delta_ok} | Sin datos (se conservan): {n_delta_na}")
     print(f"  Descartados (delta < {delta_min:.2f}): {n_below}")
     print(f"  Superan el filtro (delta >= {delta_min:.2f}): {n_pass}")
+
+    _etiqueta_valor = "Colchon" if delta_strike_mode == "otm" else "Delta"
+    vista = delta_df.sort_values("delta", na_position="last").copy()
+    vista[_etiqueta_valor] = vista["delta"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "sin_vol")
+    vista["IV_anual"] = vista["iv_used"].map(lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "-")
+    print(f"\n  {_etiqueta_valor} y fuente de vol por ticker:")
+    print(vista.rename(columns={"symbol": "Symbol", "strike_mode": "Fuente"})
+          [["Symbol", _etiqueta_valor, "IV_anual", "Fuente"]].to_string(index=False))
 
     discarded_delta = delta_df[(delta_df["delta"].notna()) & (delta_df["delta"] < delta_min)].sort_values("delta")
     if len(discarded_delta) > 0:
@@ -1506,7 +1554,7 @@ if use_delta_filter:
         print(disp[["symbol", "Delta", "IV_anual", "strike_mode"]]
               .rename(columns={"symbol": "Symbol", "strike_mode": "Fuente"}).to_string(index=False))
 
-    tickers_pass_delta = delta_df[(delta_df["delta"].isna()) | (delta_df["delta"] >= delta_min)]["symbol"].tolist()
+    tickers_pass_delta = delta_df[delta_df["delta"].map(lambda d: qm.pasa_filtro_delta(d, delta_min))]["symbol"].tolist()
     ticker_candidates = tickers_pass_delta
     print(f"\nTras filtro Delta (sobre pool pre-estacional): {len(ticker_candidates)} tickers disponibles "
           f"para el filtro estacional\n")
@@ -2256,9 +2304,9 @@ if not include_etfs_in_portfolio:
             "   Amplia el pool de candidatos (n_pre_filter, n_filter_candidates) o sube max_weight."
         )
 
-canada_assets = [i for i, a in enumerate(assets) if a.endswith(".TO")]
-europe_assets = [i for i, a in enumerate(assets) if re.search(r"\.(DE|L|PA|MC)$", a)]
-japan_assets = [i for i, a in enumerate(assets) if a.endswith(".T")]
+canada_assets = [i for i, a in enumerate(assets) if qm.region_de_ticker(a) == "Canada"]
+europe_assets = [i for i, a in enumerate(assets) if qm.region_de_ticker(a) == "Europa"]
+japan_assets = [i for i, a in enumerate(assets) if qm.region_de_ticker(a) == "Japon"]
 
 geo_union = set(canada_assets) | set(europe_assets) | set(japan_assets)
 print(f"   Grupos geograficos - CA: {len(canada_assets)} | EU: {len(europe_assets)} | "
@@ -2271,9 +2319,11 @@ Dmat = cov_mat + np.eye(n) * 1e-8
 # DELTA COMO PONDERADOR DE RETORNO ESPERADO EN EL VECTOR dvec
 # ==============================================================================
 delta_aligned = np.array([delta_named.get(a, np.nan) for a in assets])
+_scale_lo = delta_rel_lo if delta_scale_mode == "relative" else delta_scale_lo
+_scale_hi = delta_rel_hi if delta_scale_mode == "relative" else delta_scale_hi
 delta_scaled = qm.scale_option_deltas(
     delta_aligned, mode=delta_scale_mode, delta_min=delta_min,
-    fixed_lo=delta_scale_lo, fixed_hi=delta_scale_hi)
+    fixed_lo=_scale_lo, fixed_hi=_scale_hi)
 print(f"   Delta -> multiplicador de mu (modo {delta_scale_mode}):")
 print(pd.DataFrame({"delta": delta_aligned, "multiplicador": delta_scaled}, index=assets).to_string(
     float_format=lambda x: f"{x:.3f}"))
@@ -2396,6 +2446,15 @@ for t_i in top_assets_idx:
 for region_name, idx_region in geo_groups.items():
     if len(idx_region) > 0:
         print(f"  Peso {region_name}: {weights_opt.iloc[idx_region].sum() * 100:.1f}%")
+
+_intl_en_opt = [a for a in assets if a in _intl_set]
+_intl_con_peso = [a for a in _intl_en_opt if weights_opt[a] > 1e-4]
+print(f"  Internacionales en el universo: {_n_intl_universo} | "
+      f"en la optimizacion: {len(_intl_en_opt)} | con peso > 0: {len(_intl_con_peso)}")
+if _intl_con_peso:
+    print("  " + ", ".join(f"{a} {weights_opt[a] * 100:.1f}%" for a in _intl_con_peso))
+else:
+    print("  Ningun internacional tiene peso. No hay piso de asignacion internacional.")
 
 # ==============================================================================
 # RESULTADOS
@@ -2554,7 +2613,10 @@ else:
         griegas_df[col] = np.nan
 
 delta_portfolio = np.nansum(weights_opt.reindex(assets).values * delta_aligned)
-print(f"  Delta de portafolio (ponderado, incl. fallback BS): {delta_portfolio:.4f}")
+if delta_strike_mode == "otm":
+    print(f"  Colchon delta OTM ponderado: {delta_portfolio:.4f}")
+else:
+    print(f"  Delta de portafolio (ponderado, incl. fallback BS): {delta_portfolio:.4f}")
 
 peso_con_griegas = griegas_df.loc[griegas_df["gamma"].notna(), "weight"].sum()
 

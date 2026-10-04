@@ -442,12 +442,9 @@ international_tickers_clean = list(dict.fromkeys(t.upper() for t in internationa
 tickers_domesticos = list(dict.fromkeys(
     sp500_tickers_clean + nasdaq_tickers_clean + etf_tickers_clean + commodity_tickers_clean
 ))
-tickers_domesticos_ok = [
-    t for t in tickers_domesticos
-    if not re.search(r"\^|\$", t) and 1 <= len(t) <= 5 and not re.match(r"^[0-9]", t) and t != ""
-]
-
-all_tickers = list(dict.fromkeys(tickers_domesticos_ok + international_tickers_clean))
+# El formato US solo en domesticos. En la lista mezclada tiraba SHOP.TO,
+# ULVR.L, TTE.PA y 7203.T. No hay piso de peso internacional.
+all_tickers = md.combinar_tickers(tickers_domesticos, international_tickers_clean)
 
 # Sin relleno hasta un total objetivo: el universo es exactamente el top N por
 # market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
@@ -457,7 +454,10 @@ if dedupe_share_classes:
     all_tickers, _clases = md.dedupe_share_classes(all_tickers, share_class_groups)
     for se_queda, se_van in _clases:
         print(f"[INFO] Clase duplicada: se queda {se_queda}, sale {', '.join(se_van)}")
-print(f"[INFO] Total de tickers FINAL (unicos): {len(all_tickers)}\n")
+_intl_set = set(international_tickers_clean)
+_n_intl_universo = sum(1 for t in all_tickers if t in _intl_set)
+print(f"[INFO] Total de tickers FINAL (unicos): {len(all_tickers)} | "
+      f"internacionales en el universo: {_n_intl_universo} de {len(international_tickers_clean)}\n")
 
 # ==============================================================================
 # MAPEO DE MONEDA POR SUFIJO DE TICKER + PARES FX (para conversion a USD)
@@ -2288,6 +2288,15 @@ if abs(metrics_minvar["Cash_Position"]) > 0.001:
 print(f"  Activos en portafolio : {len(w_final)}")
 print(f"  Peso maximo           : {w_final.max() * 100:.2f}% ({w_final.index[0]})")
 print(f"  Concentracion top 3   : {w_final.head(3).sum() * 100:.2f}%")
+_pesos_mv = metrics_minvar["Weights"]
+_intl_en_opt = [a for a in optimization_pool if a in _intl_set]
+_intl_con_peso = [a for a in _intl_en_opt if a in _pesos_mv.index and _pesos_mv[a] > 1e-4]
+print(f"  Internacionales en el universo: {_n_intl_universo} | "
+      f"en la optimizacion: {len(_intl_en_opt)} | con peso > 0: {len(_intl_con_peso)}")
+if _intl_con_peso:
+    print("  " + ", ".join(f"{a} {_pesos_mv[a] * 100:.1f}%" for a in _intl_con_peso))
+else:
+    print("  Ningun internacional tiene peso. No hay piso de asignacion internacional.")
 
 fx_weight_final = sum(w_final.get(t, 0.0) for t in w_final.index if get_currency_for_ticker(t) != "USD")
 print(f"  Exposicion cambiaria  : {fx_weight_final * 100:.2f}% (limite: {max_fx_exposure * 100:.0f}%)")

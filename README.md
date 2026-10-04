@@ -178,12 +178,12 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 - The delta screen is off: an ATM call delta is above 0.5 whenever the strike is the spot, so `delta_min = 0.30` never removed a name.
 
 #### `black_litterman.py`
-**Black-Litterman** on a fixed ticker list (19 names).
+**Black-Litterman** on a fixed domestic list (19 names) plus the shared international list. Exchange suffixes are not dropped by the US ticker-length check. Non-US names are not sent to Polygon (`sin_opciones_us`); their prices are converted to USD. There is no regional weight cap and no minimum international weight. `AMPM_SMOKE=1` keeps the three-name US universe.
 
 - Equilibrium returns `π = δ Σ w` from reverse CAPM. Market-cap weights are the reference. δ defaults to the historical estimate; see the methodology table.
 - Implied volatility from Polygon with an **SSVI** fit on `|k| <= 0.5` (`SSVI_K_ABS_MAX`), weighted by relative vega and open interest. The ATM vol is annual (`sqrt(total variance / T)`) and is **kept when the smile is rejected**. A fit with `|rho| >= 0.95` or without both wings (`SSVI_K_SIDE_MIN`, `SSVI_MIN_PER_SIDE`) is logged as degenerate and falls back to the ATM source: the wings are not integrated. An accepted smile feeds BKM over **±3 sigma** of the SSVI wings (`BKM_N_STD`), not over the `|k| <= 0.5` calibration window. Σ and the MFIV fallback are the horizon quantities (`bl_metrics`). The Q→P vol ratio is applied only when the vol source is implied (`ssvi` or `atm`). A historical vol is left as the horizon variance. MFIV-vs-ATM and the MFIK cap still apply.
 - **BKM** on the SSVI surface builds `Q` and `Ω`. Integration uses `risk_estimators.trapezoid`.
-- Q→P is a cross-sectional Mincer-Zarnowitz regression (n is the universe, about 19: low power; left as designed) plus an Esscher transform. `COTA_RATIO_VOL_P = (0.70, 1.00)` matches minimum variance and quadratic utility, so physical vol is not allowed above implied vol.
+- Q→P is a cross-sectional Mincer-Zarnowitz regression (n is the cross-section after the price filter: low power; left as designed) plus an Esscher transform. `COTA_RATIO_VOL_P = (0.70, 1.00)` matches minimum variance and quadratic utility, so physical vol is not allowed above implied vol.
 - Correlation for `Σ_P` comes from daily returns with EWMA and Ledoit-Wolf.
 - Posterior views can be combined by entropy pooling. Optimization is MVSK or CVaR. `LAMBDA3 = LAMBDA4 = 1` on raw central moments is a design note: those terms are small next to mean and variance, so MVSK is close to mean-variance. Not recalibrated here.
 - The historical tail panel uses overlapping horizon windows on about two years of daily data. The window count is not the number of independent observations; that is documented in the output and left overlapping on purpose.
@@ -205,7 +205,7 @@ What is not seasonal:
 - Moments from the seasonal window replace BKM **only** when `tail_risk_hist_fallback=True` (default `False`).
 - The **covariance matrix uses the full sample**. Restricting Σ to one month of the year would leave a handful of observations per year.
 
-The seasonal quadratic-utility script keeps a single QUBO pass. Its `rf_rate` is `0.047`, same as the base script.
+The seasonal quadratic-utility script keeps a single QUBO pass. Its `rf_rate` is `0.047`, same as the base script. Its delta screen matches the base script: OTM cushion (`delta_strike_mode="otm"`, aggressive `delta_min=0.15`), scaled with `sqrt(T)` where `T` is `len(rebalance_months)` (one month for `[10]`, two for `[10, 11]`). Polygon's ATM delta does not bypass that mode. The multiplier is `relative` (cushion / median, clipped to `[0.75, 1.25]`).
 
 ---
 

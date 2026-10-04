@@ -56,6 +56,23 @@ TICKERS = [
     "YELP", "EBAY", "IT", "EL"
 ]
 
+# Misma lista que el resto de optimizadores. El formato US no se les aplica:
+# SHOP.TO, ULVR.L, TTE.PA, los .DE/.MC y los .T que empiezan por digito
+# seguirian si el predicado de largo 1-5 se corriera sobre la lista mezclada.
+# No hay piso de peso internacional.
+INTERNATIONAL_TICKERS = [
+    "RY.TO", "SHOP.TO", "TD.TO", "BN.TO", "ENB.TO", "TRI.TO", "BNS.TO",
+    "CP.TO", "CNQ.TO", "AEM.TO", "SU.TO", "TRP.TO", "WCN.TO", "FNV.TO",
+    "SAP.TO", "SIE.DE", "DTE.DE", "ALV.DE", "MBG.DE", "IFX.DE", "BMW.DE",
+    "DB1.DE", "DHL.DE", "DBK.DE", "MUV2.DE", "AZN.L", "HSBC", "ULVR.L",
+    "BP", "GSK.L", "RIO.L", "BATS.L", "GLEN.L", "DGE.L", "NG.L", "MC.PA",
+    "TTE.PA", "SAN.PA", "OR.PA", "SU.PA", "AI.PA", "BNP.PA", "RMS.PA",
+    "CS.PA", "SAF.PA", "CAP.PA", "ITX.MC", "IBE.MC", "BBVA.MC", "SAN.MC",
+    "7203.T", "6758.T", "6861.T", "8306.T", "9984.T", "6367.T", "6098.T",
+    "4063.T", "7974.T", "9432.T", "6501.T", "7267.T", "8316.T", "4568.T",
+    "6902.T", "4502.T", "8031.T",
+]
+
 # ------------------------------------------------------------------------------
 # 2. HORIZONTE TEMPORAL
 # ------------------------------------------------------------------------------
@@ -270,7 +287,8 @@ MAX_ESCENARIOS_LP = 4000
 # AMPM_SMOKE=1 ejecuta el script con universo chico y sin Polygon, para que
 # un test pueda recorrer el camino hasta Cornish-Fisher (el alias `rk` no
 # puede quedar pisado por un array).
-if os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}:
+_es_smoke = os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}
+if _es_smoke:
     USAR_IV_POLYGON = False
     TICKERS = ["AAPL", "MSFT", "SPY"]
     N_ESCENARIOS = 60
@@ -279,6 +297,14 @@ if os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}:
     N_MC_DELTA = 4
     MAX_ESCENARIOS_LP = 30
     MIN_VENTANAS_ROLLING = 4
+
+# El smoke deja el universo chico. Fuera de el, los internacionales se
+# concatenan despues del filtro de formato US (que esta lista fija no
+# dispara, pero un sufijo de bolsa futuro no se descarta).
+_intl_para_universo = [] if _es_smoke else list(INTERNATIONAL_TICKERS)
+TICKERS = md.combinar_tickers(TICKERS, _intl_para_universo)
+_intl_set = set(_intl_para_universo)
+_n_intl_universo = sum(1 for t in TICKERS if t in _intl_set)
 
 if USAR_IV_POLYGON and not POLYGON_API_KEY:
     raise ValueError(
@@ -317,9 +343,32 @@ print(f"Dias habiles: {horizonte_dias}")
 print(f"Factor de escala (semanas): {factor_anualizacion}\n")
 
 print("=== UNIVERSO ===")
-print(f"Tickers: {len(TICKERS)}")
+print(f"Tickers: {len(TICKERS)} | internacionales en el universo: "
+      f"{_n_intl_universo} de {len(_intl_para_universo)}")
 print(TICKERS)
 print()
+
+# ==============================================================================
+# MAPEO DE MONEDA POR SUFIJO + PARES FX (conversion a USD)
+# ==============================================================================
+# HSBC y BP son ADRs en USD: no van en el override. .TO es CAD, no JPY.
+fx_pairs = {
+    "CAD": {"ticker": "CAD=X", "invert": True},
+    "EUR": {"ticker": "EURUSD=X", "invert": False},
+    "GBP": {"ticker": "GBPUSD=X", "invert": False},
+    "JPY": {"ticker": "JPY=X", "invert": True},
+}
+ticker_currency_by_suffix = {
+    ".TO": "CAD",
+    ".DE": "EUR",
+    ".PA": "EUR",
+    ".MC": "EUR",
+    ".L": "GBP",
+    ".T": "JPY",
+}
+ticker_currency_override = {}
+provider_currency = {}
+ticker_currency = {}
 
 # ==============================================================================
 # BLOQUE 1: DESCARGA DE PRECIOS
@@ -332,29 +381,76 @@ print("=== Descargando precios ===")
 print(f"Desde: {fecha_inicio} | Hasta: {fecha_fin}\n")
 
 
-def descargar_precio(ticker, start, end, max_retries=3):
-    """Cierres entre start y end, con end inclusivo.
+def descargar_fx(start, end):
+    """Series FX en USD por unidad de moneda local."""
+    fx_prices = {}
+    fin = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
+    for cur, info in fx_pairs.items():
+        try:
+            hist = yf.Ticker(info["ticker"]).history(start=start, end=fin.date(), auto_adjust=True)
+            if hist is None or hist.empty:
+                continue
+            s = hist["Close"].copy()
+            s.index = pd.to_datetime(s.index).tz_localize(None)
+            if info["invert"]:
+                s = 1.0 / s
+            fx_prices[cur] = s.sort_index()
+        except Exception:
+            pass
+    return fx_prices
+
+
+def descargar_precio(ticker, start, end, max_retries=3, fx_prices=None):
+    """Cierres entre start y end, con end inclusivo, en USD.
 
     yfinance trata `end` como exclusivo. Para que el ultimo cierre pueda ser
     el del dia de la cadena (y no el de ayer) se pide el dia siguiente.
+    GBp/ZAc se pasan a libras/rand antes del FX. Sin par FX el precio queda
+    en moneda local y se avisa.
     """
     fin = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
     for _ in range(max_retries):
         try:
-            hist = yf.Ticker(ticker).history(start=start, end=fin.date(), auto_adjust=True)
+            yf_tk = yf.Ticker(ticker)
+            hist = yf_tk.history(start=start, end=fin.date(), auto_adjust=True)
             if hist is not None and len(hist) > 0:
                 s = hist["Close"].copy()
                 s.index = pd.to_datetime(s.index).tz_localize(None)
+                meta = getattr(yf_tk, "history_metadata", None) or {}
+                cur_prov = meta.get("currency")
+                if cur_prov:
+                    provider_currency[ticker] = cur_prov
+                s = s * md.price_scale_factor(cur_prov)
+                cur_map, conflictos = md.resolve_currencies(
+                    [ticker], ticker_currency_by_suffix,
+                    overrides=ticker_currency_override,
+                    provider={ticker: cur_prov} if cur_prov else {},
+                )
+                ticker_currency[ticker] = cur_map[ticker]
+                for c in conflictos:
+                    print(f"  ADVERTENCIA moneda {c['ticker']}: {c['fuente']} {c['manual']} "
+                          f"contradice al proveedor {c['proveedor']}; se usa {c['proveedor']}")
+                cur = ticker_currency[ticker]
+                if cur != "USD":
+                    if fx_prices is not None and cur in fx_prices:
+                        s = md.convertir_serie_a_usd(s, fx_prices[cur])
+                    else:
+                        print(f"  ADVERTENCIA {ticker}: sin FX para {cur}; el precio queda en moneda local")
                 return s
         except Exception:
             time.sleep(1)
     return None
 
 
+print("Descargando pares FX para conversion a USD...")
+_fx_desde = min(pd.Timestamp(fecha_inicio), pd.Timestamp(date(MDD_START_YEAR, 1, 1)))
+fx_prices_diarios = descargar_fx(_fx_desde.date(), fecha_fin)
+print(f"  Pares FX disponibles: {', '.join(fx_prices_diarios) if fx_prices_diarios else '(ninguno)'}")
+
 tickers_ok = []
 precios_dict = {}
 for tk in TICKERS:
-    serie = descargar_precio(tk, fecha_inicio, fecha_fin)
+    serie = descargar_precio(tk, fecha_inicio, fecha_fin, fx_prices=fx_prices_diarios)
     if serie is None or len(serie) == 0:
         print(f"  Error descargando {tk}")
         continue
@@ -373,6 +469,20 @@ else:
               f"Si la cadena de opciones es de hoy, el spot de los momentos sale de la cadena.")
     else:
         print(f"  Ultima barra: {_ultima_barra.date()} (incluye el dia de hoy).")
+
+# Festivo en Tokio o Frankfurt no debe borrar el dia de Nueva York (M-1).
+# Solo cuando hay bolsa no estadounidense: el universo US se queda igual.
+if len(precios_diarios.columns) and any(not pc.is_us_ticker(t) for t in precios_diarios.columns):
+    _ref_cal = precios_diarios.notna().sum().idxmax()
+    _cal = precios_diarios.index[precios_diarios[_ref_cal].notna()]
+    if len(_cal) >= 2:
+        precios_diarios, _info_cal = md.align_prices_to_calendar(
+            precios_diarios, _cal, max_ffill=2, min_coverage=0.80)
+        _bajos = list(_info_cal.get("dropped_low_coverage") or [])
+        if _bajos:
+            print(f"  Cobertura < 80% fuera del calendario de {_ref_cal}: {', '.join(map(str, _bajos))}")
+        print(f"  Precios alineados a {_ref_cal}: {_info_cal.get('n_rows')} filas (ffill maximo 2 dias)")
+
 precios_semanales = precios_diarios.resample("W").last()
 precios_semanales, _semana_parcial = md.drop_partial_last_week(
     precios_semanales, precios_diarios.index.max())
@@ -545,6 +655,16 @@ if USAR_IV_POLYGON:
     detalle_sector = {}
 
     for tk in tickers:
+        # Opciones solo en cadena US. Un internacional sin contrato en Polygon
+        # sigue el camino historico (sin_opciones_us), no se consulta la API.
+        if not pc.is_us_ticker(tk):
+            sigma_iv_horizon[tk] = bm.iv_vol_at_horizon(
+                np.nan, float(Sigma_hist_df.loc[tk, tk]), tau_horizonte)
+            fuente_vol[tk] = "historica"
+            motivo_calibracion[tk] = "sin_opciones_us"
+            print(f"  {tk}: sin_opciones_us -> vol historica al horizonte = "
+                  f"{sigma_iv_horizon[tk]:.4f}")
+            continue
         print(f"  Calibrando SSVI: {tk} ... ", end="")
         try:
             resultado = calibrar_ssvi_ticker(tk, POLYGON_API_KEY, tau_horizonte)
@@ -1051,7 +1171,8 @@ def _momentos_sector(tk):
                 serie_etf = precios_diarios[etf].dropna()
                 S = float(serie_etf.iloc[-1]) if len(serie_etf) else np.nan
             else:
-                serie_etf = descargar_precio(etf, fecha_fin - timedelta(days=10), fecha_fin)
+                serie_etf = descargar_precio(etf, fecha_fin - timedelta(days=10), fecha_fin,
+                                             fx_prices=fx_prices_diarios)
                 S = float(serie_etf.iloc[-1]) if serie_etf is not None and len(serie_etf) else np.nan
         if not (np.isfinite(S) and S > 0):
             raise ValueError("sin spot del ETF")
@@ -2374,6 +2495,24 @@ w_mvsk = pd.Series(w_opt, index=tickers)
 print(f"\n=== Pesos optimos - Portafolio BL+BKM ({modo_efectivo.upper()}) ===")
 print(w_mvsk[w_mvsk > 0].sort_values(ascending=False).round(4).to_string())
 
+_regiones_bl = {}
+for _tk in tickers:
+    _regiones_bl.setdefault(md.region_de_ticker(_tk), []).append(_tk)
+for _region in ("Canada", "Europa", "Japon", "US"):
+    _idx = _regiones_bl.get(_region, [])
+    if _idx:
+        print(f"  Peso {_region}: {w_mvsk.loc[_idx].sum() * 100:.1f}% "
+              f"({len(_idx)} en la optimizacion)")
+
+_intl_en_opt = [a for a in tickers if a in _intl_set]
+_intl_con_peso = [a for a in _intl_en_opt if w_mvsk[a] > 1e-4]
+print(f"  Internacionales en el universo: {_n_intl_universo} | "
+      f"en la optimizacion: {len(_intl_en_opt)} | con peso > 0: {len(_intl_con_peso)}")
+if _intl_con_peso:
+    print("  " + ", ".join(f"{a} {w_mvsk[a] * 100:.1f}%" for a in _intl_con_peso))
+else:
+    print("  Ningun internacional tiene peso. No hay piso de asignacion internacional.")
+
 # ==============================================================================
 # BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL (CONTROL)
 # ==============================================================================
@@ -2668,10 +2807,10 @@ fecha_mdd_inicio = date(MDD_START_YEAR, 1, 1)
 
 series_ok = {}
 for tk in tickers_bl:
-    serie = descargar_precio(tk, fecha_mdd_inicio, date.today())
+    serie = descargar_precio(tk, fecha_mdd_inicio, date.today(), fx_prices=fx_prices_diarios)
     if serie is None or len(serie) == 0:
         alt = tk.replace(".", "-") if "." in tk else tk.replace("-", ".")
-        serie = descargar_precio(alt, fecha_mdd_inicio, date.today())
+        serie = descargar_precio(alt, fecha_mdd_inicio, date.today(), fx_prices=fx_prices_diarios)
         if serie is not None and len(serie) > 0:
             print(f"  Nota: {tk} recuperado como {alt}")
         else:

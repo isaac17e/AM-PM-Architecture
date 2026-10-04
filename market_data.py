@@ -16,6 +16,7 @@
 #      si la semana no esta completa (B-6).
 # ==============================================================================
 
+import re
 import threading
 import time
 
@@ -27,6 +28,10 @@ __all__ = [
     "price_scale_factor",
     "currency_from_suffix",
     "resolve_currencies",
+    "es_ticker_formato_us",
+    "region_de_ticker",
+    "combinar_tickers",
+    "convertir_serie_a_usd",
     "align_prices_to_calendar",
     "drop_partial_last_week",
     "resolve_execution_months",
@@ -67,12 +72,76 @@ def price_scale_factor(code):
 
 
 def currency_from_suffix(ticker, suffix_map):
-    """Moneda por sufijo del ticker (p. ej. {'.TO': 'CAD'}); None si no hay sufijo conocido."""
+    """Moneda por sufijo del ticker (p. ej. {'.TO': 'CAD'}); None si no hay sufijo conocido.
+
+    El sufijo mas largo que coincida gana: .TO es CAD y no JPY, aunque el
+    mapa liste .T despues. endswith(".T") es falso para SHOP.TO.
+    """
     t = str(ticker)
+    mejor = None
     for suf, cur in suffix_map.items():
-        if t.endswith(suf):
-            return cur
-    return None
+        if t.endswith(suf) and (mejor is None or len(suf) > len(mejor[0])):
+            mejor = (suf, cur)
+    return None if mejor is None else mejor[1]
+
+
+def es_ticker_formato_us(ticker):
+    """Formato de ticker estadounidense: largo 1-5, sin ^/$, sin digito inicial.
+
+    No decide la bolsa. BRK-B pasa; SHOP.TO, 7203.T y ULVR.L no. Esos
+    ultimos son internacionales y no deben entrar a este predicado.
+    """
+    if ticker is None:
+        return False
+    t = str(ticker).strip()
+    if not t or re.search(r"\^|\$", t):
+        return False
+    if not (1 <= len(t) <= 5):
+        return False
+    if re.match(r"^[0-9]", t):
+        return False
+    return True
+
+
+def region_de_ticker(ticker):
+    """Region para el tope max_region_weight. ADRs sin sufijo (HSBC, BP) quedan en US.
+
+    .TO no cae en Japon: el sufijo japones es .T, y .TO no termina en .T.
+    """
+    t = "" if ticker is None else str(ticker)
+    if t.endswith(".TO"):
+        return "Canada"
+    if re.search(r"\.(DE|L|PA|MC)$", t):
+        return "Europa"
+    if t.endswith(".T"):
+        return "Japon"
+    return "US"
+
+
+def combinar_tickers(domesticos, internacionales):
+    """Filtra el formato US solo en domesticos y luego concatena internacionales.
+
+    Aplicar el filtro a la lista ya mezclada elimina los sufijos de bolsa
+    (.DE, .TO, .L, .PA, .MC) y los tickers japoneses que empiezan por digito.
+    """
+    ok = [t for t in domesticos if es_ticker_formato_us(t)]
+    return list(dict.fromkeys(list(ok) + list(internacionales)))
+
+
+def convertir_serie_a_usd(precios, fx):
+    """Precios en moneda local por el FX (USD por unidad local), con ffill.
+
+    Si el FX no cubre el arranque, esas fechas quedan NaN. Sin serie FX se
+    devuelve el precio tal cual.
+    """
+    if precios is None or fx is None:
+        return precios
+    fx = pd.Series(fx).dropna().sort_index()
+    if len(fx) == 0:
+        return precios
+    union = fx.index.union(precios.index)
+    alineado = fx.reindex(union).sort_index().ffill().reindex(precios.index)
+    return precios * alineado
 
 
 def resolve_currencies(tickers, suffix_map, overrides=None, provider=None, default="USD"):

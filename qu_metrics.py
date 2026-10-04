@@ -17,15 +17,20 @@
 # ==============================================================================
 
 import math
-import re
 from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 
+import market_data as md
 import polygon_client as pc
 import portfolio_constraints as pq
 import risk_estimators as rk
+
+# Reexportadas desde market_data para no romper `import qu_metrics as qm`.
+es_ticker_formato_us = md.es_ticker_formato_us
+region_de_ticker = md.region_de_ticker
+combinar_tickers = md.combinar_tickers
 
 __all__ = [
     "average_abs_correlation",
@@ -47,6 +52,8 @@ __all__ = [
     "es_ticker_formato_us",
     "combinar_tickers",
     "region_de_ticker",
+    "evaluar_delta_candidato",
+    "pasa_filtro_delta",
     "sector_implied_ready",
     "align_daily_panel",
     "stitch_covariance",
@@ -398,47 +405,77 @@ def delta_cushion(vol, years, rate, log_m, ref_years=None):
     return float(atm - otm)
 
 
-def es_ticker_formato_us(ticker):
-    """Formato de ticker estadounidense: largo 1-5, sin ^/$, sin digito inicial.
+def _finito(valor):
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return float("nan")
+    return numero if math.isfinite(numero) else float("nan")
 
-    No decide la bolsa. BRK-B pasa; SHOP.TO, 7203.T y ULVR.L no. Esos
-    ultimos son internacionales y no deben entrar a este predicado.
+
+def evaluar_delta_candidato(
+    vol_hist,
+    years,
+    rate,
+    mode="otm",
+    log_m=0.08,
+    ref_years=None,
+    mu_sobre_horizonte=0.0,
+    usar_delta_polygon=False,
+    polygon_delta=None,
+    polygon_iv=None,
+):
+    """Delta o colchon de un nombre para el filtro.
+
+    En `otm` la delta ATM de Polygon no se usa: ronda 0.5 y no separa
+    perfiles, aunque `usar_delta_polygon` venga en True. El colchon se
+    calcula con la IV de Polygon si es positiva y, si no, con `vol_hist`.
+    Sin vol positiva el valor es NaN y el nombre se conserva.
+
+    En `atm` / `mu` / `rf`, si `usar_delta_polygon` es True se devuelve la
+    delta de Polygon tal cual (aunque sea NaN). Si no, delta BS con
+    K = S * exp(drift). `mu_sobre_horizonte` es mu del periodo por el
+    numero de periodos (el drift del modo mu). El modo rf usa r * T.
     """
-    if ticker is None:
-        return False
-    t = str(ticker).strip()
-    if not t or re.search(r"\^|\$", t):
-        return False
-    if not (1 <= len(t) <= 5):
-        return False
-    if re.match(r"^[0-9]", t):
-        return False
-    return True
+    modo = str(mode)
+    poly_d = _finito(polygon_delta)
+    poly_iv = _finito(polygon_iv)
+    hist = _finito(vol_hist)
+
+    if modo != "otm" and usar_delta_polygon:
+        return {"delta": poly_d, "strike_mode": "polygon_real", "iv_used": poly_iv}
+
+    if modo == "otm" and math.isfinite(poly_iv) and poly_iv > 0:
+        iv, fuente = poly_iv, "polygon_iv"
+    elif math.isfinite(hist) and hist > 0:
+        iv, fuente = hist, "hist"
+    else:
+        return {"delta": float("nan"), "strike_mode": "sin_datos", "iv_used": float("nan")}
+
+    if modo == "otm":
+        delta_i = delta_cushion(iv, years, rate, log_m, ref_years=ref_years)
+        return {"delta": delta_i, "strike_mode": f"bs_otm_{fuente}", "iv_used": iv}
+
+    if modo == "mu":
+        drift = _finito(mu_sobre_horizonte)
+        if not math.isfinite(drift):
+            drift = 0.0
+    elif modo == "rf":
+        anios = _finito(years)
+        tasa = _finito(rate)
+        drift = tasa * anios if math.isfinite(tasa) and math.isfinite(anios) else 0.0
+    else:
+        drift = 0.0
+    delta_i = bs_call_delta_from_vol(iv, years, rate, drift)
+    return {"delta": delta_i, "strike_mode": f"bs_{modo}", "iv_used": iv}
 
 
-def region_de_ticker(ticker):
-    """Region para el tope max_region_weight. ADRs sin sufijo (HSBC, BP) quedan en US.
-
-    .TO no cae en Japon: el sufijo japones es .T, y .TO no termina en .T.
-    """
-    t = "" if ticker is None else str(ticker)
-    if t.endswith(".TO"):
-        return "Canada"
-    if re.search(r"\.(DE|L|PA|MC)$", t):
-        return "Europa"
-    if t.endswith(".T"):
-        return "Japon"
-    return "US"
-
-
-def combinar_tickers(domesticos, internacionales):
-    """Filtra el formato US solo en domesticos y luego concatena internacionales.
-
-    Aplicar el filtro a la lista ya mezclada elimina los sufijos de bolsa
-    (.DE, .TO, .L, .PA, .MC) y los tickers japoneses que empiezan por digito.
-    """
-    ok = [t for t in domesticos if es_ticker_formato_us(t)]
-    return list(dict.fromkeys(list(ok) + list(internacionales)))
+def pasa_filtro_delta(delta, delta_min):
+    """True si no hay vol (NaN, se conserva) o el valor supera el umbral."""
+    valor = _finito(delta)
+    if not math.isfinite(valor):
+        return True
+    return valor >= float(delta_min)
 
 
 def sector_implied_ready(n_names, min_names=4):
