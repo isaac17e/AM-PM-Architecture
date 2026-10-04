@@ -493,6 +493,24 @@ def test_constrained_frontier_passes_through_the_optimum():
     assert fila["ret"] == pytest.approx(float(w_opt @ mu))
 
 
+def test_shrink_mu_to_prior_weights_by_history_length():
+    hist = pd.Series({"LARGO": 0.020, "CORTO": 0.030, "SIN_FF": 0.015})
+    prior = pd.Series({"LARGO": 0.010, "CORTO": 0.008})
+    n = pd.Series({"LARGO": 140, "CORTO": 35, "SIN_FF": 60})
+    mu, w = qm.shrink_mu_to_prior(hist, prior, n, k=140)
+    assert w["LARGO"] == pytest.approx(0.5)
+    assert mu["LARGO"] == pytest.approx(0.015)
+    assert w["CORTO"] == pytest.approx(35 / 175)
+    assert mu["CORTO"] == pytest.approx(0.2 * 0.030 + 0.8 * 0.008)
+    # Sin prior el activo conserva su media historica.
+    assert w["SIN_FF"] == 1.0 and mu["SIN_FF"] == pytest.approx(0.015)
+    # k = 0 desactiva el encogimiento.
+    mu0, _ = qm.shrink_mu_to_prior(hist, prior, n, k=0)
+    assert np.allclose(mu0.values, hist.values)
+    with pytest.raises(ValueError):
+        qm.shrink_mu_to_prior(hist, prior, n, k=-1)
+
+
 def test_lambda_scores_use_the_reference_lambda_and_mu_final():
     mu_final = np.array([0.02, 0.01])
     cov = np.array([[0.04, 0.0], [0.0, 0.01]])
@@ -509,6 +527,17 @@ def test_lambda_scores_use_the_reference_lambda_and_mu_final():
     assert agresivo["ret"] == pytest.approx(0.02)
     assert agresivo["utilidad"] == pytest.approx(0.02 - 5.0 * 0.04)
     assert 0.8 in qm.comparison_lambdas(0.8)
+    # pen_ret usa el lambda de su propia fila, no el de referencia.
+    assert agresivo["pen_ret"] == pytest.approx((0.1 / 2 * 0.04) / 0.02)
+    conservador = scored.loc[np.isclose(scored["lambda_"], 10.0)].iloc[0]
+    var_c = 0.2 ** 2 * 0.04 + 0.8 ** 2 * 0.01
+    assert conservador["pen_ret"] == pytest.approx((10.0 / 2 * var_c) / (0.2 * 0.02 + 0.8 * 0.01))
+
+
+def test_pen_ret_is_nan_when_return_is_not_positive():
+    scored = qm.score_candidate_portfolios(
+        [(1.5, np.array([1.0]))], np.array([-0.01]), np.array([[0.04]]), lambda_ref=1.5)
+    assert np.isnan(scored.iloc[0]["pen_ret"])
 
 
 # ------------------------------------------------------------------------------

@@ -151,6 +151,30 @@ def lambda_monthly_from_annual(lambda_annual, periods_per_year=12):
     return valor * periodos
 
 
+def shrink_mu_to_prior(mu_hist, mu_prior, n_obs, k):
+    """Encoge la media historica hacia un retorno de modelo, por activo.
+
+    mu_i = w_i mu_hist_i + (1 - w_i) mu_prior_i,  w_i = n_i / (n_i + k)
+
+    `k` son los meses de historia que pesan lo mismo que el modelo: con
+    n_i = k el peso es 50/50, y un activo con poca historia se apoya mas en
+    el modelo. Sin prior finito el activo conserva su media historica
+    (w = 1). Devuelve (mu, w) con el indice de `mu_hist`.
+    """
+    k = float(k)
+    if not (math.isfinite(k) and k >= 0):
+        raise ValueError("k debe ser finito y >= 0")
+    hist = pd.Series(mu_hist, dtype=float)
+    prior = pd.Series(mu_prior, dtype=float).reindex(hist.index)
+    n = pd.Series(n_obs, dtype=float).reindex(hist.index).fillna(0.0).clip(lower=0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = n / (n + k)
+    w = w.where(np.isfinite(w), 1.0)
+    w = w.where(np.isfinite(prior), 1.0)
+    mu = w * hist + (1.0 - w) * prior.fillna(0.0)
+    return mu, w
+
+
 def utility_terms(expected_return, variance, lambda_):
     """mu'w y (lambda/2) w'Sigma w ya evaluados en el optimo, y la utilidad."""
     mu_term = float(expected_return)
@@ -898,6 +922,11 @@ def score_candidate_portfolios(solved, mu_final, cov, lambda_ref, rf=0.0):
     utilidad no usa el lambda de esa fila: si lo hiciera, el lambda mas
     chico ganaria siempre. El retorno es w'μ_final, el mismo vector que ve
     el optimizador.
+
+    `pen_ret` si usa el lambda de la fila: (lambda/2 w'Σw) / w'μ_final, el
+    peso que tiene el riesgo frente al retorno en el objetivo con el que se
+    resolvio ese portafolio. Cerca de 0 el QP casi solo maximiza retorno;
+    cerca de 1 la penalizacion se come el retorno. NaN si w'μ_final <= 0.
     """
     filas = []
     for lam, w in solved:
@@ -907,12 +936,15 @@ def score_candidate_portfolios(solved, mu_final, cov, lambda_ref, rf=0.0):
         if not np.isfinite(w).all() or float(np.nansum(w)) <= 0.9:
             continue
         met = portfolio_mu_final_metrics(w, mu_final, cov, lambda_ref, rf=rf)
+        terms = utility_terms(met["ret"], met["var"], lam)
+        pen_ret = terms["risk_term"] / terms["mu_term"] if terms["mu_term"] > 0 else np.nan
         filas.append({
             "lambda_": float(lam),
             "retorno": met["ret"] * 100.0,
             "volatilidad": met["vol"] * 100.0,
             "sharpe": met["sharpe"],
             "utilidad": met["utilidad"],
+            "pen_ret": pen_ret,
             "ret": met["ret"],
             "risk": met["vol"],
             "n_activos": int(np.sum(w > 0.01)),

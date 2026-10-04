@@ -90,9 +90,19 @@ lookback_months = None
 # ------------------------------------------------------------------------------
 lambda_ = 1.5
 lambda_annual = None
-weight_sharpe = 0.55
-weight_low_vol = 0.15
+# El puntaje de seleccion no premia la vol baja: esa preferencia vive solo en
+# lambda. Sharpe mide eficiencia (retorno por unidad de riesgo), no nivel de vol.
+weight_sharpe = 0.70
 weight_decorr = 0.30
+
+# ------------------------------------------------------------------------------
+# RETORNO ESPERADO: MEDIA HISTORICA ENCOGIDA HACIA FAMA-FRENCH
+# ------------------------------------------------------------------------------
+# mu_i = w_i * media_historica_i + (1 - w_i) * retorno_FF3_i, w_i = n_i / (n_i + k).
+# k = meses de historia que pesan igual que el modelo (140 -> 50/50 con ~12 anios;
+# 36 meses -> ~20% historica). El mismo mu se usa en la seleccion y en el QP.
+# 0 desactiva el encogimiento (solo media historica).
+mu_shrink_k = 140
 
 # ------------------------------------------------------------------------------
 # TAMANO DE LOS FILTROS DE CANDIDATOS
@@ -188,11 +198,6 @@ ideal_observations = 60
 use_delta_filter = True
 # Conservador 0.24, moderado 0.18, agresivo 0.15.
 delta_min = 0.15
-delta_scale_mode = "relative"
-delta_scale_lo = 0.45
-delta_scale_hi = 0.55
-delta_rel_lo = 0.75
-delta_rel_hi = 1.25
 sector_implied_min_names = 4
 delta_strike_mode = "otm"
 delta_otm_log_m = 0.08
@@ -237,16 +242,14 @@ if not (isinstance(etf_floor_reserve_factor, int) and etf_floor_reserve_factor >
     raise ValueError("Error: etf_floor_reserve_factor debe ser un entero >= 1")
 if delta_strike_mode not in ("atm", "mu", "rf", "otm"):
     raise ValueError("Error: delta_strike_mode debe ser atm, mu, rf u otm")
-if delta_scale_mode not in ("direct", "fixed", "minmax", "relative"):
-    raise ValueError("Error: delta_scale_mode debe ser direct, fixed, minmax o relative")
+if not (math.isfinite(mu_shrink_k) and mu_shrink_k >= 0):
+    raise ValueError("Error: mu_shrink_k debe ser finito y >= 0")
 if not (math.isfinite(delta_min) and delta_min >= 0):
     raise ValueError("Error: delta_min debe ser finito y >= 0")
 if delta_strike_mode == "otm" and not (math.isfinite(delta_otm_log_m) and delta_otm_log_m > 0):
     raise ValueError("Error: delta_otm_log_m debe ser finito y > 0")
 if delta_strike_mode == "otm" and not (delta_otm_ref_months > 0):
     raise ValueError("Error: delta_otm_ref_months debe ser > 0")
-if delta_scale_mode == "relative" and not (delta_rel_lo < delta_rel_hi):
-    raise ValueError("Error: delta_rel_lo debe ser menor que delta_rel_hi")
 
 horizon_months = len(rebalance_months)
 MONTH_ABB = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -1202,10 +1205,21 @@ combined_stats = combined_stats.merge(
     ff_stats[["symbol", "beta_mkt", "beta_smb", "beta_hml", "ff_expected_return"]], on="symbol", how="left"
 )
 combined_stats["avg_cor"] = combined_stats["avg_cor"].fillna(combined_stats["avg_cor"].median())
+# Retorno esperado unico del script (seleccion y QP): media historica encogida
+# hacia FF3 segun la historia de cada activo. Sin FF3 queda la media historica.
+_mu_adj, _w_hist = qm.shrink_mu_to_prior(
+    combined_stats["mean_return"], combined_stats["ff_expected_return"],
+    combined_stats["n_obs"], mu_shrink_k)
+combined_stats["adjusted_return"] = _mu_adj
+combined_stats["mu_weight_hist"] = _w_hist
 combined_stats["ff_expected_return"] = combined_stats["ff_expected_return"].fillna(combined_stats["mean_return"])
-combined_stats["adjusted_return"] = (
-    combined_stats["mean_return"] + combined_stats["ff_expected_return"]
-) / 2
+_con_ff = combined_stats["mu_weight_hist"] < 1.0
+print(f"Retorno esperado (k={mu_shrink_k:g}): {int(_con_ff.sum())} de {len(combined_stats)} activos encogidos hacia FF3"
+      + (f" | peso de la historica {combined_stats.loc[_con_ff, 'mu_weight_hist'].min():.2f}-"
+         f"{combined_stats.loc[_con_ff, 'mu_weight_hist'].max():.2f}" if _con_ff.any() else " (sin FF3: solo media historica)"))
+_disp_hist = combined_stats["mean_return"].std() * 12
+_disp_adj = combined_stats["adjusted_return"].std() * 12
+print(f"   Dispersion de mu entre activos (anual): historica {_disp_hist * 100:.1f}% -> encogida {_disp_adj * 100:.1f}%")
 combined_stats["sharpe_ratio_adjusted"] = (
     (combined_stats["adjusted_return"] - rf_rate_period) / combined_stats["sd_return"]
 )
@@ -1311,14 +1325,10 @@ def select_optimal_candidates(df, n_candidates):
 
     df_candidates = df_candidates.copy()
     sr = df_candidates["sharpe_ratio_adjusted"]
-    sd = df_candidates["sd_return"]
     sharpe_norm = (sr - sr.min()) / (sr.max() - sr.min())
-    vol_norm = 1 - (sd - sd.min()) / (sd.max() - sd.min())
     df_candidates["sharpe_norm"] = sharpe_norm.fillna(0.5)
-    df_candidates["vol_norm"] = vol_norm.fillna(0.5)
     df_candidates["h_score"] = (
-        (weight_sharpe * df_candidates["sharpe_norm"] + weight_low_vol * df_candidates["vol_norm"])
-        * df_candidates["data_quality_penalty"]
+        weight_sharpe * df_candidates["sharpe_norm"] * df_candidates["data_quality_penalty"]
     )
     df_candidates = df_candidates.sort_values("h_score", ascending=False)
 
@@ -1356,9 +1366,8 @@ if n_etf_needed > 0:
     _eleg = combined_stats[(combined_stats["n_obs"] >= min_observations) & (combined_stats["sd_return"] > 0)
                            & combined_stats["sharpe_ratio_adjusted"].notna()
                            & np.isfinite(combined_stats["sharpe_ratio_adjusted"])].copy()
-    _sr, _sd = _eleg["sharpe_ratio_adjusted"], _eleg["sd_return"]
-    _h_eleg = (weight_sharpe * ((_sr - _sr.min()) / (_sr.max() - _sr.min())).fillna(0.5)
-               + weight_low_vol * (1 - (_sd - _sd.min()) / (_sd.max() - _sd.min())).fillna(0.5))
+    _sr = _eleg["sharpe_ratio_adjusted"]
+    _h_eleg = weight_sharpe * ((_sr - _sr.min()) / (_sr.max() - _sr.min())).fillna(0.5)
     if "data_quality_penalty" in _eleg.columns:
         _h_eleg = _h_eleg * _eleg["data_quality_penalty"]
     _orden_eleg = _eleg.assign(_h=_h_eleg).sort_values("_h", ascending=False)["symbol"].tolist()
@@ -1938,9 +1947,16 @@ print(f"Matriz de retornos: {df_xts.shape[0]} fechas x {df_xts.shape[1]} activos
 # MEDIA
 # ==============================================================================
 assets = ticker_candidates
-mu = df_xts[assets].mean().values
+# El mismo mu de la seleccion (historica encogida hacia FF3). Un activo fuera de
+# combined_stats cae a su media historica del panel.
+mu_hist_panel = df_xts[assets].mean()
+mu = (combined_stats.set_index("symbol")["adjusted_return"].reindex(assets)
+      .fillna(mu_hist_panel)).values
 mu = np.where(np.isfinite(mu), mu, 0.0)
 n_assets = len(assets)
+_w_sel = combined_stats.set_index("symbol")["mu_weight_hist"].reindex(assets)
+print(f"   mu del optimizador: historica encogida hacia FF3 (k={mu_shrink_k:g}) | "
+      f"peso medio de la historica en los finalistas: {_w_sel.mean():.2f}")
 
 # ==============================================================================
 # MATRIZ DE COVARIANZA: SHRINKAGE MFIV (BKM) + HISTORICA
@@ -2339,25 +2355,17 @@ n = n_assets
 Dmat = cov_mat + np.eye(n) * 1e-8
 
 # ==============================================================================
-# DELTA COMO PONDERADOR DE RETORNO ESPERADO EN EL VECTOR dvec
+# RETORNO ESPERADO EN EL VECTOR dvec
 # ==============================================================================
+# El colchon delta ya no multiplica a mu: premiaba la vol baja otra vez, fuera
+# de lambda. La aversion al riesgo del QP queda solo en lambda * w'Sigma w.
 delta_aligned = np.array([delta_named.get(a, np.nan) for a in assets])
-_scale_lo = delta_rel_lo if delta_scale_mode == "relative" else delta_scale_lo
-_scale_hi = delta_rel_hi if delta_scale_mode == "relative" else delta_scale_hi
-delta_scaled = qm.scale_option_deltas(
-    delta_aligned, mode=delta_scale_mode, delta_min=delta_min,
-    fixed_lo=_scale_lo, fixed_hi=_scale_hi)
-print(f"   Delta -> multiplicador de mu (modo {delta_scale_mode}):")
-print(pd.DataFrame({"delta": delta_aligned, "multiplicador": delta_scaled}, index=assets).to_string(
-    float_format=lambda x: f"{x:.3f}"))
-
-mu_delta_adjusted = mu * delta_scaled
 
 mfis_aligned = np.array([bkm_current_moments.get(a, {}).get("mfis", np.nan) for a in assets])
 mfik_aligned = np.array([bkm_current_moments.get(a, {}).get("mfik", np.nan) for a in assets])
 mfis_aligned = np.where(np.isnan(mfis_aligned), 0.0, mfis_aligned)
 mfik_aligned = np.where(np.isnan(mfik_aligned), 3.0, mfik_aligned)
-mu_final = mu_delta_adjusted.copy()
+mu_final = mu.copy()
 
 # ==============================================================================
 # RETORNO ESPERADO VIA SVIX (MARTIN-WAGNER) - EXPERIMENTAL, APAGADO
@@ -2379,8 +2387,8 @@ if use_svix_expected_return:
         mask_mw = np.isfinite(mu_svix)
         mu_final = np.where(
             mask_mw,
-            svix_blend * mu_svix + (1 - svix_blend) * mu_delta_adjusted,
-            mu_delta_adjusted)
+            svix_blend * mu_svix + (1 - svix_blend) * mu,
+            mu)
         print(f"   SVIX aplicado a {int(mask_mw.sum())}/{n_assets} activos "
               f"(blend={svix_blend:.2f}) | {mw_info['warning']}")
     else:
@@ -2388,8 +2396,7 @@ if use_svix_expected_return:
 
 dvec = mu_final / lambda_
 
-print(f"   Delta scaling aplicado - activos con delta real: {int((~pd.isna(delta_aligned)).sum())} | "
-      f"fallback (sin penalizacion): {int(pd.isna(delta_aligned).sum())}")
+print("   Delta: solo filtro de elegibilidad, no multiplica a mu")
 print("   Penalizacion de cola sobre mu: ELIMINADA (MFIS/MFIK son momentos Q sin calibrar)")
 
 etf_band_active = include_etfs_in_portfolio and len(etf_commodity_assets) > 0 and len(stock_assets) > 0
@@ -2499,7 +2506,7 @@ if etf_band_active:
           f"{', relajada desde la pedida' if etf_band_relaxed else ''})")
 
 top_assets_idx = weights_opt.sort_values(ascending=False).head(min(10, n)).index.tolist()
-print("\n  Top activos - efecto delta scaling y penalizacion de cola en retorno esperado:")
+print("\n  Top activos - retorno esperado y diagnosticos de opciones (delta = colchon del filtro):")
 print(f"  {'Ticker':<8}  {'Peso%':>8}  {'mu%':>8}  {'delta':>8}  {'MFIS':>8}  {'MFIK':>8}  {'mu_final%':>10}")
 print("  " + "-" * 68)
 for t_i in top_assets_idx:
@@ -2798,10 +2805,16 @@ if len(results_comparison) > 0:
     print("\n" + "=" * 70)
     print("RESULTADOS COMPARATIVOS")
     print("=" * 70 + "\n")
+    print("pen_ret = (λ/2 w'Σw) / w'μ_final con el λ de cada fila: cuanto pesa el riesgo frente al")
+    print("retorno en el objetivo. ~0 = casi solo maximiza retorno; ~1 = la penalizacion iguala al retorno.\n")
     disp = results_comparison.copy()
-    for col in ["retorno", "volatilidad", "sharpe", "utilidad", "max_peso"]:
+    for col in ["retorno", "volatilidad", "sharpe", "utilidad", "max_peso", "pen_ret"]:
         disp[col] = disp[col].map(lambda x: f"{x:.4f}")
-    print(disp.to_string(index=False))
+    print(disp[["lambda_", "retorno", "volatilidad", "sharpe", "pen_ret", "n_activos", "max_peso", "utilidad"]]
+          .to_string(index=False))
+    _fila_cfg = results_comparison.loc[(results_comparison["lambda_"] - float(lambda_)).abs().idxmin()]
+    print(f"\n  λ configurado ({lambda_:.2f}): pen_ret={_fila_cfg['pen_ret']:.3f} | "
+          f"{int(_fila_cfg['n_activos'])} activos | peso maximo {_fila_cfg['max_peso']:.1f}%")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=results_comparison["volatilidad"], y=results_comparison["retorno"], mode="lines",

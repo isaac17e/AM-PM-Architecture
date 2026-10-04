@@ -203,7 +203,9 @@ def test_bl_no_manda_internacionales_a_polygon():
 def test_defaults_estacionales_del_colchon():
     fuente = _fuente("quadratic_utility_(seasonal_version).py")
     assert 'delta_strike_mode = "otm"' in fuente
-    assert 'delta_scale_mode = "relative"' in fuente
+    # El colchon solo filtra: ya no multiplica a mu ni existe el modo de escala.
+    assert "delta_scale_mode" not in fuente
+    assert "mu_final = mu.copy()" in fuente
     assert "delta_min = 0.15" in fuente
     assert "Conservador 0.24, moderado 0.18, agresivo 0.15" in fuente
     assert "delta_otm_log_m = 0.08" in fuente

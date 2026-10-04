@@ -150,8 +150,13 @@
     </div>
     <div class="dec">
       <h3>Filtro delta de QU: cada umbral es un tope de IV anual</h3>
-      <p>Los dos QU usan el mismo filtro: <b>delta_strike_mode = "otm"</b>, delta_otm_log_m = 0.08, delta_otm_ref_months = 2, delta_scale_mode = "relative" (delta_rel_lo / hi = 0.75 / 1.25) y options_dte_cap_days = 90. <b>delta_min</b> pasa a 0.24 / 0.18 / 0.15; el default del código es el Agresivo.</p>
+      <p>Los dos QU usan el mismo filtro: <b>delta_strike_mode = "otm"</b>, delta_otm_log_m = 0.08, delta_otm_ref_months = 2 y options_dte_cap_days = 90. <b>delta_min</b> pasa a 0.24 / 0.18 / 0.15; el default del código es el Agresivo. En los dos QU el colchón solo filtra: ya no multiplica a μ.</p>
       <p>El colchón OTM depende solo de la volatilidad, así que cada umbral funciona como un tope de IV anual: 0.24 ≈ 31,5%, 0.18 ≈ 43%, 0.15 ≈ 52%. En el seasonal el horizonte es el número de meses de <code>rebalance_months</code> (1 con [10], 2 con [10, 11]) y el corte casi no cambia con el horizonte.</p>
+    </div>
+    <div class="dec">
+      <h3>QU: la aversión al riesgo vive solo en λ</h3>
+      <p>La vol baja se premiaba cuatro veces: en el puntaje QUBO (<b>weight_low_vol</b>), en el filtro delta, en un multiplicador de μ por el colchón delta y en λ·w'Σw. En los dos QU se eliminaron los dos premios (el término del puntaje y el multiplicador); <b>weight_sharpe</b> absorbe el peso del término eliminado (0.80 / 0.75 / 0.70).</p>
+      <p>Los filtros de elegibilidad (<b>volatility_percentile</b>, <b>delta_min</b>) se mantienen: deciden quién entra, no cuánto pesa, y funcionan como límites de mandato por perfil. μ es uno solo para selección y QP: media histórica encogida hacia Fama-French (<b>mu_shrink_k</b> = 140).</p>
     </div>
     <div class="dec">
       <h3>Tickers internacionales: filtro de formato solo en domésticos</h3>
@@ -189,7 +194,8 @@
       </tbody>
     </table></div>
     <p class="obs">† Medido antes del commit 8ddfdbc. Los descartes de QU normal conservador y moderado se midieron antes de ese commit, y las métricas de QU normal moderado también. Las métricas de QU normal conservador y agresivo son de después.</p>
-    <p class="obs"><b>QU seasonal conservador</b> falla por la banda de ETF: solo llegan 3 ETF, máximo 36% frente al piso de 45% (pendiente, ver el bloque de QU estacional).</p>
+    <p class="obs"><b>QU seasonal conservador</b> fallaba por la banda de ETF: solo llegaban 3 ETF, máximo 36% frente al piso de 45%. El piso de ETF ya está portado; falta revalidar.</p>
+    <p class="obs"><b>Antes de los cambios del 2026-10-04.</b> Todas las corridas son anteriores a quitar los premios a la vol baja y a encoger μ hacia Fama-French en los dos QU. Retorno, vol y Sharpe van a cambiar; conviene repetirlas y recalibrar λ con pen_ret.</p>
   </section>
 
   <footer class="end">
@@ -198,6 +204,8 @@
       <li><code>bkm_mfis_clip</code> / <code>bkm_mfik_clip</code> y <code>cornish_fisher_mfis_clip</code> / <code>mfik_clip</code>: reemplazados por <code>bkm_mfik_max = 20</code> y la condición K ≥ 1 + S², global en todos los scripts.</li>
       <li><code>tail_risk_alpha</code> / <code>beta</code> (MV) y <code>tail_penalty_theta1</code> / <code>theta2</code> (QU): penalizaciones de cola eliminadas por estar sin calibrar y bajo la medida Q.</li>
       <li><code>skew_z_threshold</code> (QU): nunca se usó; su función la cumple <code>bkm_z_threshold</code>, que hereda la misma intención con valores 1.50 / 1.75 / 2.00.</li>
+      <li><code>weight_low_vol</code> (los dos QU, 2026-10-04): premio a la vol baja en el puntaje QUBO, redundante con <code>lambda_</code>. Su peso pasó a <code>weight_sharpe</code>.</li>
+      <li><code>delta_scale_mode</code>, <code>delta_rel_lo</code> / <code>hi</code>, <code>delta_scale_lo</code> / <code>hi</code> (los dos QU, 2026-10-04): el colchón delta multiplicaba a μ y premiaba la vol baja dentro del QP, fuera de <code>lambda_</code>. El colchón queda solo como filtro.</li>
     </ul>
   </footer>
 </div>
@@ -245,12 +253,17 @@ const mvCommon = (seasonal) => [
   {p:"cornish_fisher_confidence", v:["0.99","0.975","0.95"], live:"0.95", st:"new", lab:"= Agr", note:CF_MV},
 ];
 
+const LOWVOL_NOTE = "Absorbe el peso que tenía weight_low_vol (antes 0.30 / 0.40 / 0.55 + 0.50 / 0.35 / 0.15), así que el balance frente a weight_decorr no cambia. Sharpe mide eficiencia, no nivel de vol: la preferencia por vol baja vive solo en lambda_ y en los filtros de elegibilidad.";
+
 const quCommon = [
   {p:"max_weight", v:["0.12","0.18","0.30"], live:"0.30", st:"match", lab:"= Agr"},
-  {p:"weight_sharpe", v:["0.30","0.40","0.55"], live:"0.55", st:"match", lab:"= Agr"},
-  {p:"weight_low_vol", v:["0.50","0.35","0.15"], live:"0.15", st:"match", lab:"= Agr"},
+  {p:"weight_sharpe", v:["0.80","0.75","0.70"], live:"0.70", st:"change", lab:"= Agr", note:LOWVOL_NOTE},
   {p:"weight_decorr", v:["0.20","0.25","0.30"], live:"0.30", st:"match", lab:"= Agr"},
 ];
+
+const MU_OBS = '<b>μ único, encogido hacia Fama-French.</b> La selección y el QP usan el mismo μ: media histórica encogida hacia el retorno FF3 con peso n / (n + mu_shrink_k), k = 140 meses (≈ 50/50 con 12 años; 36 meses ≈ 20% histórica). Es un parámetro de estimación, global para los tres perfiles. Al comprimir la dispersión de μ, el mismo λ da un pen_ret mayor: recalibrar λ después de la primera corrida.';
+const LAMBDA_OBS = '<b>Aversión al riesgo solo en lambda_.</b> El puntaje QUBO ya no tiene término de vol baja y el colchón delta ya no multiplica a μ: el optimizador ve μ y λ·w\'Σw. La tabla de comparación de lambdas imprime <b>pen_ret = (λ/2 w\'Σw) / w\'μ</b> por λ, para fijar la escalera 6 / 3 / 1.5 según cuánto pesa de verdad la penalización en cada perfil.';
+const LAMBDA_NOTE = " Única palanca de aversión al riesgo dentro del QP. Calibrar con pen_ret de la tabla de comparación de lambdas.";
 
 const SECTIONS = [
   {repo:"AM-PM"},
@@ -265,39 +278,41 @@ const SECTIONS = [
    globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["target_total_tickers","200"],["horizon_months","1"],["options_horizon_cap_months","3"],["risk_free_rate","0.047"],["tail_risk_min_hist_weeks","26"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["delta_strike_mode",'"atm"'],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
    obs:OBS_MV},
   {id:"qu-seasonal", title:"Quadratic Utility (estacional)", file:"~/AM-PM/quadratic_utility_(seasonal_version).py · Parámetros configurables", live:"hoy: Agresivo",
-   summary:"Pasó de Moderado (auditoría anterior) a Agresivo en todos los campos registrados. Los cuatro parámetros nuevos quedaron en valores de Moderado, así que el script está mezclado.",
+   summary:"Agresivo en todos los campos registrados. Igual que QU normal: la aversión al riesgo del optimizador vive solo en lambda_ y μ es la media histórica encogida hacia Fama-French. Los filtros de vol (volatility_percentile, delta_min, seasonal_vol_ratio_max) se mantienen como límites de elegibilidad por perfil.",
    rows:[
-    {p:"lambda_", v:["6.0","3.0","1.5"], live:"0.8", st:"change", lab:"antes = Agr", note:GAMMA_NOTE("6.0 / 2.5 / 0.8")},
+    {p:"lambda_", v:["6.0","3.0","1.5"], live:"1.5", st:"match", lab:"= Agr", note:GAMMA_NOTE("6.0 / 2.5 / 0.8") + LAMBDA_NOTE},
     ...quCommon,
     {p:"volatility_percentile", v:["0.45","0.60","0.85"], live:"0.85", st:"match", lab:"= Agr"},
     {p:"correlation_percentile", v:["0.50","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr"},
     {p:"n_pre_seasonal", v:["80","60","45"], live:"45", st:"match", lab:"= Agr"},
     {p:"n_divers_candidates", v:["50","40","30"], live:"30", st:"match", lab:"= Agr"},
-    {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"change", lab:"= Agr", note:DELTA_NOTE("0.55 / 0.45 / 0.30") + DELTA_SEAS},
-    {p:"pct_etf_deseado", v:["0.55","0.40","0.10"], live:"0.10", st:"match", lab:"= Agr", note:"La banda del Conservador (0.55 ± 0.10 con max_weight 0.12) se mantiene. Pendiente: hoy el Conservador falla (ver abajo)."},
+    {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"change", lab:"= Agr", note:DELTA_NOTE("0.55 / 0.45 / 0.30") + DELTA_SEAS + " Solo filtra: el colchón ya no multiplica a μ."},
+    {p:"pct_etf_deseado", v:["0.55","0.40","0.10"], live:"0.10", st:"match", lab:"= Agr", note:"La banda del Conservador (0.55 ± 0.10 con max_weight 0.12) se mantiene. El código ya garantiza que lleguen suficientes ETF para el piso (ceil(piso / max_weight)); falta revalidar el Conservador (ver abajo)."},
     {p:"pct_etf_tolerancia", v:["0.10","0.05","0.10"], live:"0.10", st:"match", lab:"= Agr"},
     {p:"max_region_weight", v:["0.35","0.60","0.80"], live:"0.80", st:"match", lab:"= Agr", note:REGION_NOTE},
     {p:"seasonal_vol_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr"},
     {p:"iv_outlier_multiplier", v:["3.0","4.0","6.0"], live:"6.0", st:"match", lab:"= Agr", note:MV_EST},
-    {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"1.75", st:"new", lab:"= Mod", note:Z_NOTE},
-    {p:"bkm_min_survivors", v:["16","14","12"], live:"14", st:"new", lab:"= Mod", note:"Piso tras el filtro MFIS; acompaña a max_weight (1/0.12 ≈ 9 nombres mínimos en Con)."},
-    {p:"seasonal_min_weeks", v:["40","35","30"], live:"35", st:"new", lab:"= Mod", note:"Más historia estacional exigida al perfil que más valora la robustez."},
-    {p:"seasonal_min_survivors", v:["22","18","14"], live:"18", st:"new", lab:"= Mod", note:"Misma escalera que recent_vol_min_survivors del QU sin horizonte."},
+    {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"2.00", st:"new", lab:"= Agr", note:Z_NOTE},
+    {p:"bkm_min_survivors", v:["16","14","12"], live:"12", st:"new", lab:"= Agr", note:"Piso tras el filtro MFIS; acompaña a max_weight (1/0.12 ≈ 9 nombres mínimos en Con)."},
+    {p:"seasonal_min_weeks", v:["40","35","30"], live:"30", st:"new", lab:"= Agr", note:"Más historia estacional exigida al perfil que más valora la robustez."},
+    {p:"seasonal_min_survivors", v:["22","18","14"], live:"14", st:"new", lab:"= Agr", note:"Misma escalera que recent_vol_min_survivors del QU sin horizonte."},
    ],
-   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","500"],["rebalance_months","[10]"],["rf_rate","0.046"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["delta_scale_mode",'"relative"'],["delta_rel_lo / hi","0.75 / 1.25"],["options_dte_cap_days","90"]],
+   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","500"],["rebalance_months","[10]"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["options_dte_cap_days","90"],["etf_band_relax_if_infeasible","True"]],
    obs:[
+    LAMBDA_OBS,
+    MU_OBS,
     '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual (ver la fila de delta_min).',
-    '<b>Pendiente: banda de ETF del Conservador.</b> La garantía de que lleguen suficientes ETF para cumplir el piso (ceil(piso / max_weight), ya presente en QU normal) todavía no está portada a este script. Hoy el perfil Conservador falla: solo llegan 3 ETF, máximo 36% frente al piso de 45%.'
+    '<b>Banda de ETF del Conservador: portada, falta revalidar.</b> El script ya tiene el piso de ETF de QU normal (ceil(piso / max_weight), reserva, reposición tras los filtros y chequeo de factibilidad antes de optimizar). La falla de la tabla de validación (3 ETF, máximo 36% frente al piso de 45%) se midió antes de ese cambio.'
    ]},
   {id:"qu", title:"Quadratic Utility", file:"~/AM-PM/quadratic_utility.py · Parámetros configurables", live:"hoy: Agresivo",
-   summary:"La auditoría anterior lo marcaba como el más desordenado. Hoy está en Agresivo salvo n_pre_filter y n_filter_candidates, que siguen cerca de Moderado.",
+   summary:"Agresivo en todos los campos registrados. La aversión al riesgo del optimizador vive solo en lambda_: se eliminaron el premio a la vol baja del puntaje QUBO y el multiplicador de μ por delta. Los filtros de vol (volatility_percentile, delta_min) se mantienen como límites de elegibilidad por perfil.",
    rows:[
-    {p:"lambda_", v:["6.0","3.0","1.5"], live:"0.5", st:"change", lab:"antes = Agr", note:GAMMA_NOTE("6.0 / 2.5 / 0.5")},
+    {p:"lambda_", v:["6.0","3.0","1.5"], live:"1.5", st:"match", lab:"= Agr", note:GAMMA_NOTE("6.0 / 2.5 / 0.5") + LAMBDA_NOTE},
     ...quCommon,
-    {p:"volatility_percentile", v:["0.45","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr"},
+    {p:"volatility_percentile", v:["0.45","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr", note:"Filtro de elegibilidad (quién entra), no premio: se mantiene como límite de mandato."},
     {p:"correlation_percentile", v:["0.50","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr"},
-    {p:"n_pre_filter", v:["80","65","45"], live:"65", st:"drift", lab:"= Mod"},
-    {p:"n_filter_candidates", v:["50","42","30"], live:"40", st:"drift", lab:"≈ Mod"},
+    {p:"n_pre_filter", v:["80","65","45"], live:"45", st:"match", lab:"= Agr"},
+    {p:"n_filter_candidates", v:["50","42","30"], live:"30", st:"match", lab:"= Agr"},
     {p:"recent_vol_window_min_weeks", v:["20","15","13"], live:"13", st:"match", lab:"= Agr"},
     {p:"recent_vol_window_max_weeks", v:["26","24","18"], live:"18", st:"match", lab:"= Agr"},
     {p:"recent_vol_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr"},
@@ -305,16 +320,18 @@ const SECTIONS = [
     {p:"options_dte_cap_days", v:["90","90","90"], live:"90", st:"match", lab:"todos"},
     {p:"iv_vs_realized_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr", note:"Los rellenos de candidatos ya no reintroducen nombres que este filtro descartó."},
     {p:"iv_min_survivors", v:["16","14","10"], live:"10", st:"match", lab:"= Agr"},
-    {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"change", lab:"= Agr", note:DELTA_NOTE("0.55 / 0.42 / 0.30")},
+    {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"change", lab:"= Agr", note:DELTA_NOTE("0.55 / 0.42 / 0.30") + " Solo filtra: el colchón ya no multiplica a μ."},
     {p:"pct_etf_deseado", v:["0.55","0.30","0.10"], live:"0.10", st:"match", lab:"= Agr", note:"La banda del Conservador (0.55 ± 0.10 con max_weight 0.12) se mantiene. El código garantiza que lleguen suficientes ETF para el piso: ceil(piso / max_weight) = 4 en el Conservador."},
     {p:"pct_etf_tolerancia", v:["0.10","0.08","0.10"], live:"0.1", st:"match", lab:"= Agr"},
     {p:"max_region_weight", v:["0.35","0.55","0.80"], live:"0.80", st:"match", lab:"= Agr", note:REGION_NOTE},
     {p:"iv_outlier_multiplier", v:["3.0","4.0","6.0"], live:"6.0", st:"match", lab:"= Agr", note:MV_EST},
-    {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"1.75", st:"new", lab:"= Mod", note:Z_NOTE},
+    {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"2.00", st:"new", lab:"= Agr", note:Z_NOTE},
     {p:"bkm_min_survivors", v:["16","14","12"], live:"12", st:"new", lab:"= Agr", note:"Piso tras el filtro MFIS."},
    ],
-   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","210"],["horizon_months","2"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["delta_scale_mode",'"relative"'],["delta_rel_lo / hi","0.75 / 1.25"],["etf_band_relax_if_infeasible","True"]],
+   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","210"],["horizon_months","2"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["etf_band_relax_if_infeasible","True"]],
    obs:[
+    LAMBDA_OBS,
+    MU_OBS,
     '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual (ver la fila de delta_min).',
     '<b>Banda de ETF y factibilidad.</b> El código garantiza que lleguen suficientes ETF para cumplir el piso (ceil(piso / max_weight), 4 en el Conservador) y revisa que las restricciones se puedan cumplir antes de optimizar. Parámetro nuevo, común a los tres perfiles: etf_band_relax_if_infeasible = True.',
     '<b>Rellenos de candidatos.</b> Ya no reintroducen nombres que el filtro de IV frente a la vol realizada descartó.'
