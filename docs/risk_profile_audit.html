@@ -1,0 +1,467 @@
+<title>Risk Profile Audit</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --paper:#f6f4ef; --ink:#1d2420; --ink-soft:#4c5650; --line:#d9d4c6; --panel:#ffffff;
+    --accent:#8a6a3f; --accent-soft:#f0e6d4; --sel:#efe2c8; --sel-ink:#5e4520;
+    --match:#3f7a52; --match-bg:#e6f0e6; --drift:#b5701e; --drift-bg:#fbead2;
+    --new:#3a6a8a; --new-bg:#e3edf3; --dead:#a24444; --dead-bg:#f5e2e2;
+    --override:#7d5490; --override-bg:#efe4f2; --change:#9a4f2a; --change-bg:#f7e3d8;
+    --code-bg:#f1eee6;
+    --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:'IBM Plex Sans',ui-sans-serif,system-ui,sans-serif;
+    --disp:'Archivo',ui-sans-serif,system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      color-scheme:dark;
+      --paper:#15181a; --ink:#eae6dc; --ink-soft:#a8a89c; --line:#33372f; --panel:#1c201f;
+      --accent:#d3ad7a; --accent-soft:#2b2418; --sel:#352a19; --sel-ink:#f0cf9f;
+      --match:#7fbf8f; --match-bg:#1c2e20; --drift:#e0a44e; --drift-bg:#332711;
+      --new:#7fb2d3; --new-bg:#182732; --dead:#e08585; --dead-bg:#301c1c;
+      --override:#cb9ada; --override-bg:#2c2033; --change:#e79a74; --change-bg:#35211a;
+      --code-bg:#111415;
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    --paper:#15181a; --ink:#eae6dc; --ink-soft:#a8a89c; --line:#33372f; --panel:#1c201f;
+    --accent:#d3ad7a; --accent-soft:#2b2418; --sel:#352a19; --sel-ink:#f0cf9f;
+    --match:#7fbf8f; --match-bg:#1c2e20; --drift:#e0a44e; --drift-bg:#332711;
+    --new:#7fb2d3; --new-bg:#182732; --dead:#e08585; --dead-bg:#301c1c;
+    --override:#cb9ada; --override-bg:#2c2033; --change:#e79a74; --change-bg:#35211a;
+    --code-bg:#111415;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto;padding-inline:clamp(16px,3vw,28px);padding-block:2.5rem 6rem}
+  code{font-family:var(--mono);font-size:0.9em}
+
+  header.top{border-bottom:1px solid var(--line);padding-bottom:1.5rem;margin-bottom:1.5rem;display:flex;flex-wrap:wrap;gap:1.25rem;justify-content:space-between;align-items:flex-end}
+  .eyebrow{font-family:var(--mono);font-size:0.72rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--accent);margin:0 0 0.5rem}
+  h1{font-family:var(--disp);font-weight:700;font-size:clamp(1.6rem,3vw,2.3rem);margin:0;text-wrap:balance;letter-spacing:-0.01em}
+  .top-note{font-size:0.9rem;color:var(--ink-soft);max-width:44ch;margin:0}
+
+  .bar{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--paper);border-bottom:1px solid var(--line);padding-block:0.7rem;margin-bottom:1.75rem;display:flex;flex-wrap:wrap;gap:0.6rem 1.2rem;align-items:center}
+  .bar-label{font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--ink-soft)}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--panel)}
+  .seg button{font:600 0.82rem var(--sans);color:var(--ink-soft);background:transparent;border:0;padding:0.45rem 0.95rem;cursor:pointer}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button[aria-pressed="true"]{background:var(--sel);color:var(--sel-ink)}
+  .seg button:focus-visible,.copy:focus-visible,.nav a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .nav{display:flex;flex-wrap:wrap;gap:0.35rem}
+  .nav a{font-family:var(--mono);font-size:0.72rem;color:var(--ink);text-decoration:none;border:1px solid var(--line);border-radius:4px;padding:0.2rem 0.5rem;background:var(--panel)}
+  .nav a:hover{border-color:var(--accent)}
+
+  .decisions{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1rem;margin-bottom:2.25rem}
+  .dec{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:1rem 1.1rem}
+  .dec h3{font-family:var(--disp);font-size:0.98rem;margin:0 0 0.4rem;text-wrap:balance}
+  .dec p{margin:0;font-size:0.86rem;color:var(--ink-soft)}
+  .dec p+p{margin-top:0.45rem}
+  .dec b{color:var(--ink);font-weight:600}
+
+  .legend{display:flex;flex-wrap:wrap;gap:0.5rem 1rem;margin-bottom:2rem}
+  .legend-item{display:flex;align-items:center;gap:0.4rem;font-size:0.8rem;color:var(--ink-soft)}
+  .pill{display:inline-block;font-family:var(--mono);font-size:0.66rem;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;padding:0.18em 0.55em;border-radius:3px;white-space:nowrap}
+  .pill.match{color:var(--match);background:var(--match-bg)}
+  .pill.drift{color:var(--drift);background:var(--drift-bg)}
+  .pill.new{color:var(--new);background:var(--new-bg)}
+  .pill.dead{color:var(--dead);background:var(--dead-bg)}
+  .pill.override{color:var(--override);background:var(--override-bg)}
+  .pill.change{color:var(--change);background:var(--change-bg)}
+  .pill.code{color:var(--accent);background:var(--accent-soft)}
+
+  .repo{font-family:var(--mono);font-size:0.72rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--accent);margin:3rem 0 0.25rem;padding-top:1rem;border-top:2px solid var(--line)}
+  section.block{margin-top:1.75rem;scroll-margin-top:5rem}
+  .block-head{display:flex;flex-wrap:wrap;align-items:center;gap:0.5rem 0.9rem;margin-bottom:0.3rem}
+  .block-head h2{font-family:var(--disp);font-size:1.25rem;font-weight:700;margin:0}
+  .livechip{font-family:var(--mono);font-size:0.72rem;color:var(--ink-soft);border:1px dashed var(--line);border-radius:4px;padding:0.1rem 0.45rem}
+  .file{font-family:var(--mono);font-size:0.8rem;color:var(--ink-soft);margin:0 0 0.8rem;overflow-wrap:anywhere}
+  .summary{font-size:0.88rem;margin:0 0 0.9rem;max-width:80ch}
+
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+  table{border-collapse:collapse;width:100%;min-width:780px;font-size:0.84rem}
+  thead th{text-align:left;font-family:var(--mono);font-size:0.67rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-soft);padding:0.6rem 0.8rem;border-bottom:1px solid var(--line);white-space:nowrap}
+  tbody td{padding:0.5rem 0.8rem;border-bottom:1px solid var(--line);font-family:var(--mono);font-variant-numeric:tabular-nums;vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  td.param{font-family:var(--sans);font-weight:500;color:var(--ink);min-width:15rem}
+  td.num{color:var(--ink-soft)}
+  th.on,td.on{background:var(--sel);color:var(--sel-ink);font-weight:600}
+  td.live{color:var(--ink)}
+  td.status{white-space:nowrap}
+  .note{font-family:var(--sans);font-size:0.77rem;color:var(--ink-soft);display:block;margin-top:0.2rem;font-weight:400;max-width:62ch}
+
+  .tools{display:flex;flex-wrap:wrap;gap:0.6rem;align-items:center;margin-top:0.8rem}
+  .copy{font:600 0.8rem var(--sans);color:var(--paper);background:var(--ink);border:0;border-radius:5px;padding:0.45rem 0.85rem;cursor:pointer}
+  .copy.done{background:var(--match)}
+  details{margin-top:0.6rem}
+  summary{cursor:pointer;font-size:0.82rem;color:var(--ink-soft);width:max-content;max-width:100%}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:6px;padding:0.9rem 1rem;overflow-x:auto;font:0.8rem/1.55 var(--mono);color:var(--ink);margin:0.5rem 0 0}
+  .globals{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:0.25rem 1.25rem;margin-top:0.5rem;font-family:var(--mono);font-size:0.76rem;color:var(--ink-soft)}
+  .globals span b{color:var(--ink);font-weight:500}
+  .obs{margin-top:0.7rem;font-size:0.82rem;color:var(--ink-soft);max-width:85ch}
+  .obs+.obs{margin-top:0.45rem}
+  .obs b{color:var(--drift)}
+
+  footer.end{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--line);font-size:0.86rem;color:var(--ink-soft);max-width:85ch}
+  footer.end ul{padding-left:1.1rem;margin:0.4rem 0 0}
+  @media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div>
+      <p class="eyebrow">8 optimizadores &middot; 4 repositorios &middot; revisado 2026-10-04</p>
+      <h1>Configuración por perfil de inversor</h1>
+    </div>
+    <p class="top-note">Valores Conservador / Moderado / Agresivo para cada bloque editable, contrastados con lo que está hoy en el código. Elige un perfil para resaltar su columna y copiar el bloque listo para pegar.</p>
+  </header>
+
+  <div class="bar" role="group" aria-label="Perfil">
+    <span class="bar-label">Perfil</span>
+    <div class="seg" id="seg">
+      <button type="button" id="p0" data-i="0">Conservador</button>
+      <button type="button" id="p1" data-i="1">Moderado</button>
+      <button type="button" id="p2" data-i="2">Agresivo</button>
+    </div>
+    <nav class="nav" id="nav" aria-label="Scripts"></nav>
+  </div>
+
+  <div class="decisions">
+    <div class="dec">
+      <h3>Una sola aversión al riesgo γ por perfil: 6 / 3 / 1.5</h3>
+      <p>QU, BL y US maximizan la misma forma <code>μ'w − (γ/2)·w'Σw</code> con μ y Σ en unidades consistentes (QU mensual/mensual; BL y US anual/anual), así que γ es adimensional y comparable. Hoy el mismo inversor agresivo tenía γ = 0.5, 0.8, 1.5 o 2 según el script.</p>
+      <p>Se adopta la escalera de BL (6 / 3 / 1.5). Cambia <b>lambda_</b> en ambos QU (Mod 2.5→3, Agr 0.5/0.8→1.5) y <b>risk_aversion</b> en US (8/4/2→6/3/1.5).</p>
+    </div>
+    <div class="dec">
+      <h3>λ3 y λ4 de BL en forma cerrada desde γ</h3>
+      <p>MVSK usa momentos centrales crudos, así que la expansión de Taylor de una CRRA da <b>λ3 = γ(γ+1)/2</b> y <b>λ4 = γ(γ+1)(γ+2)/6</b>: 21/56, 6/10 y 1.875/2.19.</p>
+      <p>Con σ = 10% al horizonte y curtosis 4, el término de curtosis pesa hoy (λ4 = 1, γ = 1.5) el 1.3% del de varianza; con los valores derivados pesa 2.9% (Agr) y 19% (Con). Con λ3 = λ4 = 1 fijos los momentos superiores no cambian nada entre perfiles.</p>
+    </div>
+    <div class="dec">
+      <h3>Preferencias por perfil; estimadores iguales para todos</h3>
+      <p>Solo se escalonan palancas de preferencia: tolerancia al riesgo, concentración, filtros de elegibilidad y confianzas de cola. Los parámetros de estimación (vida media EWMA, cotas VRP, integración BKM, panel) buscan la misma verdad para todos los perfiles y quedan globales.</p>
+      <p>Excepción heredada: <b>shrinkage_min/max</b>, <b>ratio_band</b> e <b>iv_outlier_multiplier</b> son de estimación, pero ya los tenías escalonados; se conservan y quedan marcados.</p>
+    </div>
+    <div class="dec">
+      <h3>Los scripts colombianos siguen el mandato de la casa</h3>
+      <p>COL Portfolio Architecture no tenía perfiles. Sus bandas RV/RF salen de <code>am_pm/profiles.py</code> (RV 0–10% / 20–40% / 50–85%), y <b>RF_TENOR_YEARS</b> sigue el horizonte del mandato (12 / 36 / 60 meses → 1 / 3 / 5 años).</p>
+      <p>Su objetivo es máximo Sharpe, que no depende del perfil: el perfil entra solo por bandas, topes y screening de bonos.</p>
+    </div>
+    <div class="dec">
+      <h3>Filtro delta de QU: cada umbral es un tope de IV anual</h3>
+      <p>Los dos QU usan el mismo filtro: <b>delta_strike_mode = "otm"</b>, delta_otm_log_m = 0.08, delta_otm_ref_months = 2, delta_scale_mode = "relative" (delta_rel_lo / hi = 0.75 / 1.25) y options_dte_cap_days = 90. <b>delta_min</b> pasa a 0.24 / 0.18 / 0.15; el default del código es el Agresivo.</p>
+      <p>El colchón OTM depende solo de la volatilidad, así que cada umbral funciona como un tope de IV anual: 0.24 ≈ 31,5%, 0.18 ≈ 43%, 0.15 ≈ 52%. En el seasonal el horizonte es el número de meses de <code>rebalance_months</code> (1 con [10], 2 con [10, 11]) y el corte casi no cambia con el horizonte.</p>
+    </div>
+    <div class="dec">
+      <h3>Tickers internacionales: filtro de formato solo en domésticos</h3>
+      <p>Aplica a los optimizadores de AM-PM-Architecture (QU normal, QU seasonal, MV, MV seasonal y Black-Litterman), no a los scripts de US ni a los colombianos. Filtran el formato de EE. UU. solo en los domésticos y después agregan los internacionales (helper compartido en <code>market_data.py</code>). No hay peso mínimo forzado para internacionales.</p>
+      <p>El tope por región aplica en QU: .TO = Canadá; .DE / .L / .PA / .MC = Europa; .T = Japón; HSBC y BP cuentan como EE. UU. <b>MV y BL no tienen tope por región.</b></p>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><span class="pill match">match</span> el código coincide con un perfil registrado</div>
+    <div class="legend-item"><span class="pill drift">drift</span> no coincide con ningún perfil</div>
+    <div class="legend-item"><span class="pill override">override</span> fuera de perfil a propósito</div>
+    <div class="legend-item"><span class="pill change">cambio</span> se modificó el valor registrado del perfil</div>
+    <div class="legend-item"><span class="pill new">nuevo</span> parámetro escalonado por primera vez</div>
+    <div class="legend-item"><span class="pill dead">muerto</span> registrado, sin uso en el script</div>
+    <div class="legend-item"><span class="pill code">en código</span> el perfil ya vive en el código</div>
+  </div>
+
+  <div id="sections"></div>
+
+  <p class="repo">Validación</p>
+  <section class="block" id="validacion">
+    <div class="block-head"><h2>Resultados de validación (3 y 4 de octubre de 2026)</h2></div>
+    <p class="file">AM-PM-Architecture · main · commits 46b4259, 8ddfdbc, f7550ca y d5ea641</p>
+    <p class="summary">Corridas con datos reales de los dos QU en los tres perfiles, con el filtro delta nuevo (delta_min 0.24 / 0.18 / 0.15).</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Script / perfil</th><th>delta_min</th><th>Descartados por delta</th><th>Retorno anual</th><th>Vol anual</th><th>Sharpe mensual</th><th>MDD</th></tr></thead>
+      <tbody>
+        <tr><td class="param">QU normal conservador</td><td>0.24</td><td>4 de 52 †</td><td>15,1%</td><td>8,5%</td><td>0,353</td><td>−24,7%</td></tr>
+        <tr><td class="param">QU normal moderado</td><td>0.18</td><td>3 de 65 †</td><td>18,6% †</td><td>10,3% †</td><td>0,390 †</td><td>−23,1% †</td></tr>
+        <tr><td class="param">QU normal agresivo</td><td>0.15</td><td>7 de 45</td><td>29,1%</td><td>16,3%</td><td>0,430</td><td>−26,0%</td></tr>
+        <tr><td class="param">QU seasonal conservador</td><td>0.24</td><td>10 de 50</td><td><span class="pill dead">falla por la banda de ETF</span></td><td>–</td><td>–</td><td>–</td></tr>
+        <tr><td class="param">QU seasonal moderado</td><td>0.18</td><td>3 de 60</td><td>19,3%</td><td>10,7%</td><td>0,394</td><td>−24,4%</td></tr>
+        <tr><td class="param">QU seasonal agresivo</td><td>0.15</td><td>7 de 45</td><td>28,9%</td><td>16,6%</td><td>0,422</td><td>−23,9%</td></tr>
+      </tbody>
+    </table></div>
+    <p class="obs">† Medido antes del commit 8ddfdbc. Los descartes de QU normal conservador y moderado se midieron antes de ese commit, y las métricas de QU normal moderado también. Las métricas de QU normal conservador y agresivo son de después.</p>
+    <p class="obs"><b>QU seasonal conservador</b> falla por la banda de ETF: solo llegan 3 ETF, máximo 36% frente al piso de 45% (pendiente, ver el bloque de QU estacional).</p>
+  </section>
+
+  <footer class="end">
+    <b>Eliminado desde la auditoría del 2026-09-01</b> (ya no existe en el código, no se escalona):
+    <ul>
+      <li><code>bkm_mfis_clip</code> / <code>bkm_mfik_clip</code> y <code>cornish_fisher_mfis_clip</code> / <code>mfik_clip</code>: reemplazados por <code>bkm_mfik_max = 20</code> y la condición K ≥ 1 + S², global en todos los scripts.</li>
+      <li><code>tail_risk_alpha</code> / <code>beta</code> (MV) y <code>tail_penalty_theta1</code> / <code>theta2</code> (QU): penalizaciones de cola eliminadas por estar sin calibrar y bajo la medida Q.</li>
+      <li><code>skew_z_threshold</code> (QU): nunca se usó; su función la cumple <code>bkm_z_threshold</code>, que hereda la misma intención con valores 1.50 / 1.75 / 2.00.</li>
+    </ul>
+  </footer>
+</div>
+
+<script>
+const P = ["Conservador", "Moderado", "Agresivo"];
+const LBL = {match:"match", drift:"drift", override:"override", change:"cambio", new:"nuevo", dead:"muerto", code:"en código"};
+
+const MV_EST = "parámetro de estimación escalonado por decisión previa; se conserva";
+const CF_MV = "Define alpha_final de la poda por CVaR marginal Cornish-Fisher: es una palanca de riesgo, no solo de reporte.";
+const Z_NOTE = "Sustituye a skew_z_threshold. Descarte esperado bajo normalidad (una cola): 6.7% / 4.0% / 2.3% de los candidatos.";
+const GAMMA_NOTE = (a) => `Antes ${a}. Escalera común γ = 6 / 3 / 1.5 (ver arriba).`;
+const DELTA_NOTE = (a) => `Antes ${a}. Con strike OTM el colchón depende solo de la vol: cada umbral es un tope de IV anual (0.24 ≈ 31,5%, 0.18 ≈ 43%, 0.15 ≈ 52%). El default del código es el Agresivo.`;
+const DELTA_SEAS = " El horizonte es el número de meses de rebalance_months (1 con [10], 2 con [10, 11]); el corte casi no cambia con el horizonte. Hoy rebalance_months = [10] (commit 005bd59, perfil agresivo), así que el horizonte es de 1 mes.";
+const REGION_NOTE = "Región por sufijo: .TO = Canadá; .DE / .L / .PA / .MC = Europa; .T = Japón; HSBC y BP cuentan como EE. UU.";
+const OBS_MV = [
+  "<b>Sin filtro delta.</b> MV no tiene filtro delta; delta_strike_mode = 'atm' solo afecta la tabla de griegas que se imprime.",
+  '<b>Internacionales: pendiente de decisión.</b> Con n_top_international = 15 (valor del perfil Agresivo) solo entran canadienses, y con tail_risk_hist_fallback = False ninguno pasa el filtro de cola. Hoy MV no usa internacionales en la práctica. Sin tope por región ni peso mínimo forzado.'
+];
+
+const mvCommon = (seasonal) => [
+  {p:"volatility_percentile", v:["0.55","0.85","0.97"], live:"0.55", st:"match", lab:"= Con"},
+  {p:"correlation_percentile", v:["0.60","0.75","0.90"], live:"0.60", st:"match", lab:"= Con"},
+  {p:"max_assets_in_portfolio", v:["15","10","6"], live:"15", st:"match", lab:"= Con"},
+  {p:"max_weight_per_asset", v:["0.12","0.22","0.35"], live:"0.12", st:"match", lab:"= Con"},
+  {p:"etf_min_weight", v:["0.30","0.00","0.00"], live:"0.30", st:"match", lab:"= Con"},
+  {p:"etf_max_weight", v:["0.55","0.20","0.05"], live:"0.55", st:"match", lab:"= Con"},
+  {p:"shrinkage_min", v:["0.35","0.02","0.02"], live:"0.35", st:"match", lab:"= Con", note:MV_EST},
+  {p:"shrinkage_max", v:["0.85","0.70","0.40"], live:"0.85", st:"match", lab:"= Con", note:MV_EST},
+  {p:"ratio_band", v:["0.30","0.25","0.20"], live:"0.30", st:"match", lab:"= Con", note:MV_EST},
+  {p:"n_pre_seasonal", v:["70","60","45"], live:"70", st:"match", lab:"= Con"},
+  seasonal
+    ? {p:"seasonal_min_weeks", v:["20","15","10"], live:"20", st:"match", lab:"= Con"}
+    : {p:"seasonal_min_weeks", v:["20","15","10"], live:"—", st:"dead", lab:"", note:"El script no lo usa; solo existe n_pre_seasonal.", skip:true},
+  seasonal
+    ? {p:"n_top_international", v:["5","10","15"], live:"20", st:"drift", lab:"> Agr", note:"El script está en Conservador pero con 20 internacionales; el perfil pide 5."}
+    : {p:"n_top_international", v:["5","10","15"], live:"5", st:"match", lab:"= Con"},
+  seasonal
+    ? {p:"n_divers_candidates", v:["45","40","30"], live:"45", st:"new", lab:"= Con", note:"Escala con n_pre_seasonal: pool más amplio para el perfil que más diversifica."}
+    : {p:"n_divers_candidates", v:["45","40","30"], live:"35", st:"new", lab:"entre Mod/Agr", note:"Escala con n_pre_seasonal. El script está en Conservador pero con 35."},
+  seasonal
+    ? {p:"max_fx_exposure", v:["0.20","0.35","0.50"], live:"0.45", st:"new", lab:"≈ Agr", note:"Techo de exposición a tickers no denominados en USD. Es un techo, no genera infactibilidad."}
+    : {p:"max_fx_exposure", v:["0.20","0.35","0.50"], live:"0.35", st:"new", lab:"= Mod", note:"Techo de exposición a tickers no denominados en USD."},
+  {p:"tail_risk_filter_confidence", v:["0.99","0.975","0.95"], live:"0.99", st:"new", lab:"= Con", note:"Confianza del VaR_CF con que se rankean y filtran candidatos."},
+  {p:"cornish_fisher_confidence", v:["0.99","0.975","0.95"], live:"0.95", st:"new", lab:"= Agr", note:CF_MV},
+];
+
+const quCommon = [
+  {p:"max_weight", v:["0.12","0.18","0.30"], live:"0.30", st:"match", lab:"= Agr"},
+  {p:"weight_sharpe", v:["0.30","0.40","0.55"], live:"0.55", st:"match", lab:"= Agr"},
+  {p:"weight_low_vol", v:["0.50","0.35","0.15"], live:"0.15", st:"match", lab:"= Agr"},
+  {p:"weight_decorr", v:["0.20","0.25","0.30"], live:"0.30", st:"match", lab:"= Agr"},
+];
+
+const SECTIONS = [
+  {repo:"AM-PM"},
+  {id:"mv-seasonal", title:"Minimum Variance (estacional)", file:"~/AM-PM/minimum_variance_(seasonal_version).py · Sección 1", live:"hoy: Conservador",
+   summary:"Conservador en todos los campos registrados salvo n_top_international, que quedó en 20. Los tres parámetros nuevos de cola y FX quedan escalonados.",
+   rows: mvCommon(true),
+   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["target_total_tickers","130"],["execution_months","[9]"],["risk_free_rate","0.045"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["use_etf_constraint / use_fx_factor","True / True"],["delta_strike_mode",'"atm"'],["target_dte_iv / dte_tol_iv","30 / 7"],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["use_lw_shrinkage / use_daily_cov","True / True"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
+   obs:OBS_MV},
+  {id:"mv", title:"Minimum Variance", file:"~/AM-PM/minimum_variance.py · Sección 1", live:"hoy: Conservador",
+   summary:"Conservador en todos los campos registrados. n_divers_candidates y max_fx_exposure quedan fuera de perfil frente a los valores nuevos.",
+   rows: mvCommon(false),
+   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["target_total_tickers","200"],["horizon_months","1"],["options_horizon_cap_months","3"],["risk_free_rate","0.047"],["tail_risk_min_hist_weeks","26"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["delta_strike_mode",'"atm"'],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
+   obs:OBS_MV},
+  {id:"qu-seasonal", title:"Quadratic Utility (estacional)", file:"~/AM-PM/quadratic_utility_(seasonal_version).py · Parámetros configurables", live:"hoy: Agresivo",
+   summary:"Pasó de Moderado (auditoría anterior) a Agresivo en todos los campos registrados. Los cuatro parámetros nuevos quedaron en valores de Moderado, así que el script está mezclado.",
+   rows:[
+    {p:"lambda_", v:["6.0","3.0","1.5"], live:"0.8", st:"change", lab:"antes = Agr", note:GAMMA_NOTE("6.0 / 2.5 / 0.8")},
+    ...quCommon,
+    {p:"volatility_percentile", v:["0.45","0.60","0.85"], live:"0.85", st:"match", lab:"= Agr"},
+    {p:"correlation_percentile", v:["0.50","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr"},
+    {p:"n_pre_seasonal", v:["80","60","45"], live:"45", st:"match", lab:"= Agr"},
+    {p:"n_divers_candidates", v:["50","40","30"], live:"30", st:"match", lab:"= Agr"},
+    {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"change", lab:"= Agr", note:DELTA_NOTE("0.55 / 0.45 / 0.30") + DELTA_SEAS},
+    {p:"pct_etf_deseado", v:["0.55","0.40","0.10"], live:"0.10", st:"match", lab:"= Agr", note:"La banda del Conservador (0.55 ± 0.10 con max_weight 0.12) se mantiene. Pendiente: hoy el Conservador falla (ver abajo)."},
+    {p:"pct_etf_tolerancia", v:["0.10","0.05","0.10"], live:"0.10", st:"match", lab:"= Agr"},
+    {p:"max_region_weight", v:["0.35","0.60","0.80"], live:"0.80", st:"match", lab:"= Agr", note:REGION_NOTE},
+    {p:"seasonal_vol_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr"},
+    {p:"iv_outlier_multiplier", v:["3.0","4.0","6.0"], live:"6.0", st:"match", lab:"= Agr", note:MV_EST},
+    {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"1.75", st:"new", lab:"= Mod", note:Z_NOTE},
+    {p:"bkm_min_survivors", v:["16","14","12"], live:"14", st:"new", lab:"= Mod", note:"Piso tras el filtro MFIS; acompaña a max_weight (1/0.12 ≈ 9 nombres mínimos en Con)."},
+    {p:"seasonal_min_weeks", v:["40","35","30"], live:"35", st:"new", lab:"= Mod", note:"Más historia estacional exigida al perfil que más valora la robustez."},
+    {p:"seasonal_min_survivors", v:["22","18","14"], live:"18", st:"new", lab:"= Mod", note:"Misma escalera que recent_vol_min_survivors del QU sin horizonte."},
+   ],
+   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","500"],["rebalance_months","[10]"],["rf_rate","0.046"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["delta_scale_mode",'"relative"'],["delta_rel_lo / hi","0.75 / 1.25"],["options_dte_cap_days","90"]],
+   obs:[
+    '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual (ver la fila de delta_min).',
+    '<b>Pendiente: banda de ETF del Conservador.</b> La garantía de que lleguen suficientes ETF para cumplir el piso (ceil(piso / max_weight), ya presente en QU normal) todavía no está portada a este script. Hoy el perfil Conservador falla: solo llegan 3 ETF, máximo 36% frente al piso de 45%.'
+   ]},
+  {id:"qu", title:"Quadratic Utility", file:"~/AM-PM/quadratic_utility.py · Parámetros configurables", live:"hoy: Agresivo",
+   summary:"La auditoría anterior lo marcaba como el más desordenado. Hoy está en Agresivo salvo n_pre_filter y n_filter_candidates, que siguen cerca de Moderado.",
+   rows:[
+    {p:"lambda_", v:["6.0","3.0","1.5"], live:"0.5", st:"change", lab:"antes = Agr", note:GAMMA_NOTE("6.0 / 2.5 / 0.5")},
+    ...quCommon,
+    {p:"volatility_percentile", v:["0.45","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr"},
+    {p:"correlation_percentile", v:["0.50","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr"},
+    {p:"n_pre_filter", v:["80","65","45"], live:"65", st:"drift", lab:"= Mod"},
+    {p:"n_filter_candidates", v:["50","42","30"], live:"40", st:"drift", lab:"≈ Mod"},
+    {p:"recent_vol_window_min_weeks", v:["20","15","13"], live:"13", st:"match", lab:"= Agr"},
+    {p:"recent_vol_window_max_weeks", v:["26","24","18"], live:"18", st:"match", lab:"= Agr"},
+    {p:"recent_vol_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr"},
+    {p:"recent_vol_min_survivors", v:["22","18","14"], live:"14", st:"match", lab:"= Agr"},
+    {p:"options_dte_cap_days", v:["90","90","90"], live:"90", st:"match", lab:"todos"},
+    {p:"iv_vs_realized_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr", note:"Los rellenos de candidatos ya no reintroducen nombres que este filtro descartó."},
+    {p:"iv_min_survivors", v:["16","14","10"], live:"10", st:"match", lab:"= Agr"},
+    {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"change", lab:"= Agr", note:DELTA_NOTE("0.55 / 0.42 / 0.30")},
+    {p:"pct_etf_deseado", v:["0.55","0.30","0.10"], live:"0.10", st:"match", lab:"= Agr", note:"La banda del Conservador (0.55 ± 0.10 con max_weight 0.12) se mantiene. El código garantiza que lleguen suficientes ETF para el piso: ceil(piso / max_weight) = 4 en el Conservador."},
+    {p:"pct_etf_tolerancia", v:["0.10","0.08","0.10"], live:"0.1", st:"match", lab:"= Agr"},
+    {p:"max_region_weight", v:["0.35","0.55","0.80"], live:"0.80", st:"match", lab:"= Agr", note:REGION_NOTE},
+    {p:"iv_outlier_multiplier", v:["3.0","4.0","6.0"], live:"6.0", st:"match", lab:"= Agr", note:MV_EST},
+    {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"1.75", st:"new", lab:"= Mod", note:Z_NOTE},
+    {p:"bkm_min_survivors", v:["16","14","12"], live:"12", st:"new", lab:"= Agr", note:"Piso tras el filtro MFIS."},
+   ],
+   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["target_total_tickers","210"],["horizon_months","2"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["min / ideal_observations","24 / 60"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["delta_scale_mode",'"relative"'],["delta_rel_lo / hi","0.75 / 1.25"],["etf_band_relax_if_infeasible","True"]],
+   obs:[
+    '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual (ver la fila de delta_min).',
+    '<b>Banda de ETF y factibilidad.</b> El código garantiza que lleguen suficientes ETF para cumplir el piso (ceil(piso / max_weight), 4 en el Conservador) y revisa que las restricciones se puedan cumplir antes de optimizar. Parámetro nuevo, común a los tres perfiles: etf_band_relax_if_infeasible = True.',
+    '<b>Rellenos de candidatos.</b> Ya no reintroducen nombres que el filtro de IV frente a la vol realizada descartó.'
+   ]},
+  {id:"bl", title:"Black-Litterman", file:"~/AM-PM/black_litterman.py · Bloques 3–5 y 11", live:"hoy: agresivo",
+   summary:"PERFILES ya escalona omega_scale, tau y gamma_ra. Faltaban la cardinalidad, el tope por activo y los coeficientes de momentos superiores, que hoy son iguales para los tres perfiles.",
+   rows:[
+    {p:"PERFIL_RIESGO", v:['"conservador"','"moderado"','"agresivo"'], live:'"agresivo"', st:"match", lab:"selector"},
+    {p:"omega_scale", v:["5.0","1.0","0.25"], live:"0.25", st:"code", lab:"en PERFILES", note:"Menor confianza en las vistas para el conservador: el posterior se queda cerca del equilibrio.", skip:true},
+    {p:"tau", v:["0.025","0.05","0.10"], live:"0.10", st:"code", lab:"en PERFILES", skip:true},
+    {p:"gamma_ra", v:["6.0","3.0","1.5"], live:"1.5", st:"code", lab:"en PERFILES", note:"Escalera de referencia para γ en QU y US.", skip:true},
+    {p:"LAMBDA3", v:["21.0","6.0","1.875"], live:"1.0", st:"new", lab:"≈ Agr", note:"γ(γ+1)/2 — preferencia por asimetría de una CRRA."},
+    {p:"LAMBDA4", v:["56.0","10.0","2.1875"], live:"1.0", st:"new", lab:"≈ Agr", note:"γ(γ+1)(γ+2)/6 — aversión a la curtosis de una CRRA."},
+    {p:"MAX_TICKERS_FINAL", v:["12","10","8"], live:"10", st:"new", lab:"= Mod"},
+    {p:"PESO_MAX_ACTIVO", v:["0.15","0.25","0.35"], live:"0.35", st:"new", lab:"= Agr", note:"Factible en los tres: 12×0.15, 10×0.25 y 8×0.35 superan 1."},
+    {p:"ALPHA_CVAR_OBJETIVO", v:["0.99","0.975","0.95"], live:"0.95", st:"new", lab:"= Agr", note:'Solo actúa con MODO_OPTIMIZACION = "cvar".'},
+   ],
+   globals:[["TICKERS","19 nombres"],["MESES_HORIZONTE","4"],["Rf","0.046"],["UMBRAL_PESO_MIN","0.005"],["MODO_OPTIMIZACION",'"mvsk"'],["METODO_POSTERIOR",'"entropy_pooling"'],["N_ESCENARIOS","12000"],["HALF_LIFE_PRIOR","252"],["THETA_ESSCHER_COTA","(0.0, 25.0)"],["MAX_PRIMA_HM_SIGMA","0.35"],["COTA_SKEW_P / KURT_P","(-2.5,1.5) / (1.8,12.0)"],["NIVEL_CONFIANZA_VAR","0.95"],["BKM_MFIK_MAX","20.0"],["COV_HALFLIFE_DIAS","120"]],
+   obs:'<b>Internacionales:</b> BL agrega los internacionales con el mismo helper compartido (market_data.py), sin tope por región y sin peso mínimo forzado.'},
+  {repo:"US Asset Allocation"},
+  {id:"us", title:"US Asset Manager", file:"~/US Asset Allocation/US Asset Manager.py · Perfil y PROFILES", live:"hoy: Crecimiento",
+   summary:"Ya tiene tres perfiles (Crecimiento hace de Moderado). Solo cambia risk_aversion para usar la misma escalera que QU y BL; topes y objetivos de factor se mantienen.",
+   rows:[
+    {p:"INVESTMENT_PROFILE", v:['"Conservador"','"Crecimiento"','"Momentum/Agresivo"'], live:'"Crecimiento"', st:"match", lab:"selector"},
+    {p:"risk_aversion", v:["6.0","3.0","1.5"], live:"4.0", st:"change", lab:"antes = Mod", note:GAMMA_NOTE("8.0 / 4.0 / 2.0")},
+    {p:"max_weight", v:["0.15","0.20","0.25"], live:"0.20", st:"match", lab:"= Mod"},
+    {p:"targets · Value", v:["0.45","0.00","0.00"], live:"0.00", st:"match", lab:"= Mod"},
+    {p:"targets · Growth", v:["0.00","0.60","0.55"], live:"0.60", st:"match", lab:"= Mod"},
+    {p:"targets · Momentum", v:["0.00","0.45","0.70"], live:"0.45", st:"match", lab:"= Mod"},
+    {p:"targets · Quality", v:["0.55","0.55","0.00"], live:"0.55", st:"match", lab:"= Mod"},
+    {p:"targets · LowVol", v:["0.70","0.00","0.00"], live:"0.00", st:"match", lab:"= Mod"},
+   ],
+   globals:[["SOLVER",'"cvxpy"'],["RISK_FREE_RATE","0.040"],["EQUITY_RISK_PREMIUM","0.050"],["HISTORICAL_MU_BLEND","0.25"],["PRICE_HISTORY_YEARS","3"],["DYNAMIC_CANDIDATE_POOL","90"],["MAX_DYNAMIC_ETFS","25"],["EXCLUDE_LEVERAGED_INVERSE","True"],["OPTIONS_TARGET_DAYS","60"],["BKM_MFIK_MAX","20.0"],["COVARIANCE_HALFLIFE_DAYS","120"],["VRP_RATIO_BOUNDS","(0.70, 1.00)"],["SA_ITERATIONS","80000"]],
+   obs:'<b>Conservador sin piso de renta fija.</b> El universo incluye TLT, IEF, SHY y AGG, pero no hay restricción por clase de activo: la postura defensiva descansa solo en γ y en el objetivo LowVol 0.70. Con γ bajando de 8 a 6 vale revisar si hace falta un mínimo en Fixed Income.'},
+  {repo:"Colombian Portfolio Architecture"},
+  {id:"col-arch", title:"COL Portfolio Architecture", file:"~/Colombian Portfolio Architecture/COL_Portfolio_architecture.py · Parámetros editables", live:"hoy: sin perfil",
+   summary:"Hoy tiene una sola configuración (RV y RF entre 40% y 60%), que cae entre Moderado y Agresivo. Se proponen tres perfiles alineados con el mandato de la casa.",
+   rows:[
+    {p:"BANDA_RV", v:["(0.00, 0.10)","(0.20, 0.40)","(0.50, 0.85)"], live:"(0.40, 0.60)", st:"new", lab:"entre Mod/Agr", note:"rv_min / rv_max de am_pm/profiles.py."},
+    {p:"BANDA_RF", v:["(0.90, 1.00)","(0.60, 0.80)","(0.15, 0.50)"], live:"(0.40, 0.60)", st:"new", lab:"entre Mod/Agr", note:"Complemento de BANDA_RV; mínimos y máximos cierran en 100% en los tres perfiles."},
+    {p:"RF_TENOR_YEARS", v:["1.0","3.0","5.0"], live:"1.0", st:"new", lab:"= Con", note:"El propio código pide que refleje el horizonte: 12 / 36 / 60 meses."},
+    {p:"MAX_PESO_ACCION_INDIVIDUAL", v:["0.05","0.10","0.15"], live:"0.15", st:"new", lab:"= Agr"},
+    {p:"MAX_PESO_ETF_RV", v:["0.10","0.20","0.30"], live:"0.20", st:"new", lab:"= Mod"},
+    {p:"MAX_PESO_ETF_RF", v:["0.10","0.15","0.20"], live:"0.20", st:"new", lab:"= Agr", note:"El único ETF de RF es TLT: dólar y duración larga, riesgo que el conservador acota."},
+    {p:"MAX_PESO_NODO_TES", v:["0.30","0.25","0.20"], live:"0.20", st:"new", lab:"= Agr", note:"Sube para el conservador porque la RF debe llenar 90%: 4 nodos × 0.30 = 120% de capacidad."},
+    {p:"MAX_PESO_BONO_INDIVIDUAL", v:["0.10","0.15","0.15"], live:"0.15", st:"new", lab:"= Mod/Agr"},
+    {p:"NODOS_TES", v:["[1.0, 2.0, 3.0, 5.0]","[1.0, 3.0, 5.0, 10.0]","[1.0, 3.0, 5.0, 10.0, 15.0]"], live:"[1.0, 3.0, 5.0, 10.0]", st:"new", lab:"= Mod", note:"Duración máxima de la curva soberana: 5 / 10 / 15 años."},
+    {p:"BONOS_MIN_RATING", v:['"AAA"','"AA+"','"AA"'], live:'"AA+"', st:"new", lab:"= Mod"},
+    {p:"BONOS_PLAZO_MAX_ANIOS", v:["5.0","10.0","15.0"], live:"10.0", st:"new", lab:"= Mod"},
+    {p:"BONOS_MIN_LIQUIDEZ", v:["0.50","0.35","0.25"], live:"0.35", st:"new", lab:"= Mod"},
+    {p:"BONOS_MAX_SPREAD_BP", v:["250.0","450.0","600.0"], live:"450.0", st:"new", lab:"= Mod"},
+    {p:"BONOS_MAX_POR_EMISOR", v:["1","2","3"], live:"2", st:"new", lab:"= Mod"},
+   ],
+   globals:[["FECHA_INICIO / FIN",'"2021-01-01" / "2024-12-31"'],["ACCIONES_BVC","28 emisores"],["ETFS_RV_LOCALES",'["ICOLCAP.CL", "HCOLSEL.CL"]'],["ETFS_RV_GLOBALES",'["SPY", "QQQ"]'],["ETFS_RF_GLOBALES",'["TLT"]'],["BENCHMARK",'"^GSPC"'],["BONOS_PLAZO_MIN_ANIOS","1.0"],["BONOS_INDEXACIONES_PERMITIDAS",'{"TF"}'],["LOOKBACK_DIAS","252"],["FRECUENCIA_REBALANCEO",'"ME"'],["USAR_SHRINKAGE_LEDOIT_WOLF","True"],["EXCLUIR_ACTIVOS_SIN_PRECIO_REAL","True"],["CURVA_VOL_NIVEL / PEND / CURV","5.5 / 3.5 / 2.5 bp"]],
+   obs:'<b>Máximo Sharpe no depende del perfil.</b> La cartera tangente es la misma para los tres; el perfil solo actúa si las bandas se activan. En Conservador la banda RV ≤ 10% casi seguro se activa, así que ese perfil queda definido por las restricciones más que por el optimizador.'},
+  {repo:"Colombian Asset Allocation"},
+  {id:"col-aa", title:"Asset Allocation (FICs)", file:"~/Colombian Asset Allocation/am_pm/profiles.py · PERFILES", live:"los 3 en cada corrida",
+   summary:"Es el único script donde los perfiles ya viven en el código: sin --perfil calcula los tres. Los mandatos son coherentes (mínimos ≤ 100% ≤ máximos, max_peso_fondo × max_fondos > 1) y son la referencia para COL Portfolio Architecture.",
+   rows:[
+    {p:"horizonte_meses", v:["12","36","60"], live:"—", st:"code", lab:""},
+    {p:"rv_min / rv_max", v:["0.00 / 0.10","0.20 / 0.40","0.50 / 0.85"], live:"—", st:"code", lab:""},
+    {p:"RF_CORTO", v:["(0.35, 0.80)","(0.10, 0.40)","(0.02, 0.15)"], live:"—", st:"code", lab:""},
+    {p:"RF_MEDIANO_LARGO", v:["(0.15, 0.55)","(0.15, 0.45)","(0.00, 0.20)"], live:"—", st:"code", lab:""},
+    {p:"MIXTO", v:["(0.00, 0.15)","(0.00, 0.30)","(0.00, 0.25)"], live:"—", st:"code", lab:""},
+    {p:"RV_LOCAL", v:["(0.00, 0.06)","(0.05, 0.25)","(0.15, 0.45)"], live:"—", st:"code", lab:""},
+    {p:"RV_INTERNACIONAL", v:["(0.00, 0.08)","(0.05, 0.30)","(0.15, 0.55)"], live:"—", st:"code", lab:""},
+    {p:"max_peso_fondo", v:["0.20","0.15","0.12"], live:"—", st:"code", lab:""},
+    {p:"max_peso_gestor", v:["0.35","0.30","0.25"], live:"—", st:"code", lab:""},
+    {p:"max_fondos", v:["8","10","12"], live:"—", st:"code", lab:""},
+    {p:"banda_rebalanceo", v:["0.05","0.05","0.05"], live:"—", st:"code", lab:""},
+   ],
+   globals:[["top_n_fondos","70"],["aum_minimo_cop","30e9"],["lookback_anios","4.0"],["min_inversionistas","25"],["shrinkage_mu","0.60"],["rf_fallback","0.085"],["peso_minimo_operativo","0.01"],["banda_fondo","0.03"],["costo_bps","25"],["ventana_estimacion / paso","252 / 63"],["métodos","Markowitz Sharpe, Risk Parity, HRP, 1/N"]],
+   obs:'Aquí max_peso_fondo <b>baja</b> con la agresividad (0.20 → 0.12), al revés que en AM-PM y US. Tiene sentido: el agresivo concentra más en fondos RV, donde se quiere más dispersión por riesgo fiduciario. Se deja como está.',
+   copy:(i) => `# Asset Allocation (FICs): el perfil se elige por consola\npython "Asset Allocation.py" --perfil ${["CONSERVADOR","MODERADO","AGRESIVO"][i]}`},
+];
+
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+
+function blockFor(s, i){
+  if (s.copy) return s.copy(i);
+  const head = `# ${P[i]} · ${s.file.replace(/^~\//,"")}`;
+  if (s.id === "us"){
+    return `${head}\nINVESTMENT_PROFILE = ${s.rows[0].v[i]}\n\nPROFILES = {\n    "Conservador": {\n        "risk_aversion": 6.0,\n        "max_weight": 0.15,\n        "targets": {"Value": 0.45, "Growth": 0.00, "Momentum": 0.00, "Quality": 0.55, "LowVol": 0.70},\n    },\n    "Crecimiento": {\n        "risk_aversion": 3.0,\n        "max_weight": 0.20,\n        "targets": {"Value": 0.00, "Growth": 0.60, "Momentum": 0.45, "Quality": 0.55, "LowVol": 0.00},\n    },\n    "Momentum/Agresivo": {\n        "risk_aversion": 1.5,\n        "max_weight": 0.25,\n        "targets": {"Value": 0.00, "Growth": 0.55, "Momentum": 0.70, "Quality": 0.00, "LowVol": 0.00},\n    },\n}`;
+  }
+  const lines = s.rows.filter(r => !r.skip && r.st !== "dead").map(r => `${r.p} = ${r.v[i]}`);
+  return `${head}\n${lines.join("\n")}`;
+}
+
+let sel = 0;
+try { const v = parseInt(localStorage.getItem("perfil-sel"), 10); if (v >= 0 && v <= 2) sel = v; } catch(e) {}
+
+function render(){
+  document.querySelectorAll("#seg button").forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.i === sel)));
+  const out = [];
+  const nav = [];
+  for (const s of SECTIONS){
+    if (s.repo){ out.push(`<p class="repo">${esc(s.repo)}</p>`); continue; }
+    nav.push(`<a href="#${s.id}">${esc(s.title)}</a>`);
+    const th = P.map((p,j) => `<th class="${j===sel?"on":""}">${p}</th>`).join("");
+    const rows = s.rows.map(r => {
+      const tds = r.v.map((v,j) => `<td class="num ${j===sel?"on":""}">${esc(v)}</td>`).join("");
+      const lab = r.lab ? ` &middot; ${esc(r.lab)}` : "";
+      const note = r.note ? `<span class="note">${esc(r.note)}</span>` : "";
+      return `<tr><td class="param">${esc(r.p)}${note}</td>${tds}<td class="live">${esc(r.live)}</td><td class="status"><span class="pill ${r.st}">${LBL[r.st]}${lab}</span></td></tr>`;
+    }).join("");
+    const globals = s.globals.map(([k,v]) => `<span>${esc(k)} = <b>${esc(v)}</b></span>`).join("");
+    const obs = s.obs ? [].concat(s.obs).map(o => `<p class="obs">${o}</p>`).join("") : "";
+    out.push(`<section class="block" id="${s.id}">
+      <div class="block-head"><h2>${esc(s.title)}</h2><span class="livechip">${esc(s.live)}</span></div>
+      <p class="file">${esc(s.file)}</p>
+      <p class="summary">${esc(s.summary)}</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Parámetro</th>${th}<th>En el código</th><th>Estado</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      ${obs}
+      <div class="tools"><button type="button" class="copy" id="copy-${s.id}" data-s="${s.id}">Copiar bloque · ${P[sel]}</button></div>
+      <details><summary>Ver bloque ${P[sel]}</summary><pre id="pre-${s.id}">${esc(blockFor(s, sel))}</pre></details>
+      <details><summary>Parámetros globales (mismo valor en los tres perfiles)</summary><div class="globals">${globals}</div></details>
+    </section>`);
+  }
+  nav.push(`<a href="#validacion">Validación</a>`);
+  document.getElementById("sections").innerHTML = out.join("");
+  document.getElementById("nav").innerHTML = nav.join("");
+}
+
+document.getElementById("seg").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  sel = +b.dataset.i;
+  try { localStorage.setItem("perfil-sel", String(sel)); } catch(err) {}
+  render();
+});
+
+document.getElementById("sections").addEventListener("click", e => {
+  const b = e.target.closest(".copy"); if (!b) return;
+  const s = SECTIONS.find(x => x.id === b.dataset.s);
+  const text = blockFor(s, sel);
+  const ok = () => { b.textContent = "Copiado"; b.classList.add("done"); setTimeout(() => { b.textContent = `Copiar bloque · ${P[sel]}`; b.classList.remove("done"); }, 1600); };
+  const fallback = () => {
+    const pre = document.getElementById(`pre-${s.id}`);
+    pre.closest("details").open = true;
+    const r = document.createRange(); r.selectNodeContents(pre);
+    const sl = window.getSelection(); sl.removeAllRanges(); sl.addRange(r);
+    b.textContent = "Seleccionado: usa Cmd+C";
+  };
+  try { navigator.clipboard.writeText(text).then(ok, fallback); } catch(err) { fallback(); }
+});
+
+render();
+</script>
