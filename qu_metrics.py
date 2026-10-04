@@ -78,6 +78,7 @@ __all__ = [
     "restricciones_factibles",
     "diagnostico_banda_etf",
     "relajar_banda_etf",
+    "filtro_delta_otm",
 ]
 
 
@@ -476,6 +477,24 @@ def pasa_filtro_delta(delta, delta_min):
     if not math.isfinite(valor):
         return True
     return valor >= float(delta_min)
+
+
+def filtro_delta_otm(tickers, iv_polygon, vol_hist, years, rate, delta_min, log_m=0.08, ref_years=None):
+    """Colchon OTM por ticker y si pasa `delta_min` (filtro de minimum_variance).
+
+    `iv_polygon` y `vol_hist` son {ticker: vol anual}. La IV de Polygon manda
+    si es positiva; si no, la vol historica; sin ninguna el colchon es NaN y
+    el nombre se conserva. Columnas: symbol, delta, strike_mode, iv_used, pasa.
+    """
+    iv_polygon = iv_polygon or {}
+    vol_hist = vol_hist or {}
+    filas = []
+    for t in dict.fromkeys(tickers):
+        fila = evaluar_delta_candidato(
+            vol_hist.get(t), years, rate, mode="otm", log_m=log_m, ref_years=ref_years,
+            polygon_iv=iv_polygon.get(t))
+        filas.append(dict(symbol=t, **fila, pasa=pasa_filtro_delta(fila["delta"], delta_min)))
+    return pd.DataFrame(filas, columns=["symbol", "delta", "strike_mode", "iv_used", "pasa"])
 
 
 def sector_implied_ready(n_names, min_names=4):

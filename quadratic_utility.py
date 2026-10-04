@@ -913,8 +913,6 @@ international_tickers_full = [
     "6902.T", "4502.T", "8031.T",
 ]
 
-international_tickers = international_tickers_full[:n_top_int]
-
 # ==============================================================================
 # MAPEO DE MONEDA POR SUFIJO DE TICKER + PARES FX (para conversion a USD)
 # ==============================================================================
@@ -951,6 +949,19 @@ def get_currency_for_ticker(ticker):
         if ticker.endswith(suf):
             return cur
     return "USD"
+
+
+# Top n_top_int por market cap en USD, no por la posicion en la lista. Sin
+# market cap van al final en su orden; si yfinance falla por completo se usa
+# el orden de la lista. No hay peso minimo internacional.
+_mc_intl = md.ordenar_por_market_cap(international_tickers_full, n_top_int,
+                                     ticker_currency_by_suffix, fx_pairs)
+international_tickers = _mc_intl["seleccion"]
+print(f"\nInternacionales: top {len(international_tickers)} de {len(international_tickers_full)} "
+      "por market cap (USD):")
+print(md.tabla_market_cap_texto(_mc_intl))
+if _mc_intl["aviso"]:
+    print(f"ADVERTENCIA: market cap internacional: {_mc_intl['aviso']}")
 
 # ==============================================================================
 # COMBINAR Y LIMPIAR

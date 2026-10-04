@@ -28,6 +28,7 @@ import plotly.graph_objects as go
 import risk_estimators as rk
 import polygon_client as pc
 import market_data as md
+import qu_metrics as qm
 import portfolio_constraints as pq
 
 # ==============================================================================
@@ -96,7 +97,7 @@ cornish_fisher_confidence = 0.95
 # False: solo pasan el filtro los activos con momentos BKM validos.
 # True: los activos sin BKM (sin cobertura de opciones, no-USD o MFIS/MFIK
 # inadmisibles) usan asimetria y curtosis historicas llevadas al horizonte.
-tail_risk_hist_fallback = False
+tail_risk_hist_fallback = True
 tail_risk_min_survivors = 5
 
 # ------------------------------------------------------------------------------
@@ -165,13 +166,21 @@ max_fx_exposure = 0.50
 annualization_factor = 52
 
 # ------------------------------------------------------------------------------
-# IV ATM (~30 DTE) Y GRIEGAS DE DIAGNOSTICO
+# FILTRO DELTA (COLCHON OTM), IV ATM (~30 DTE) Y GRIEGAS DE DIAGNOSTICO
 # ------------------------------------------------------------------------------
-# El antiguo "filtro Delta" (delta BS de una call ATM >= delta_min) se elimino
-# (M-3): con K = S la delta es N(d1) con d1 = (r + sigma^2/2) sqrt(T) / sigma
-# > 0, asi que siempre supera 0.5 y nunca descartaba nada. El riesgo de cola
-# se filtra mas abajo con BKM + Cornish-Fisher. La IV ATM se sigue
-# consultando para el shrinkage de la covarianza y las griegas de diagnostico.
+# El filtro viejo (delta BS de una call ATM >= delta_min) no separaba nada
+# (M-3): con K = S la delta siempre supera 0.5. Este usa el diseno de QU:
+# colchon = delta(K=S) - delta(K=S*exp(m)), m = delta_otm_log_m * sqrt(T / T_ref),
+# con T = horizon_months / 12. Alto si la vol es baja. Solo filtra; no
+# escala los retornos. IV de Polygon si hay cadena; si no, vol historica.
+# Los nombres sin vol se conservan.
+use_delta_filter = True
+# Conservador 0.24, moderado 0.18, agresivo 0.15.
+delta_min = 0.15
+delta_otm_log_m = 0.08
+delta_otm_ref_months = 2
+# La tabla de griegas usa la delta real de la call ATM (diagnostico, no filtra).
+# La IV ATM tambien entra al shrinkage de la covarianza.
 delta_strike_mode = "atm"
 target_dte_iv = 30
 dte_tol_iv = 21
@@ -240,6 +249,12 @@ if not (1 <= horizon_months <= 12):
     raise ValueError("Error: horizon_months debe ser un entero entre 1 y 12.")
 if not (1 <= options_horizon_cap_months <= 12):
     raise ValueError("Error: options_horizon_cap_months debe ser un entero entre 1 y 12.")
+if not (math.isfinite(delta_min) and delta_min >= 0):
+    raise ValueError("Error: delta_min debe ser finito y >= 0")
+if not (math.isfinite(delta_otm_log_m) and delta_otm_log_m > 0):
+    raise ValueError("Error: delta_otm_log_m debe ser finito y > 0")
+if not (delta_otm_ref_months > 0):
+    raise ValueError("Error: delta_otm_ref_months debe ser > 0")
 
 horizon_weeks = horizon_months * (52 / 12)
 horizon_factor = horizon_weeks
@@ -385,39 +400,6 @@ international_tickers_full = [
     "6902.T", "4502.T", "8031.T",
 ]
 
-n_top_international = min(n_top_international, len(international_tickers_full))
-international_tickers = international_tickers_full[:n_top_international]
-
-etf_universe_tickers = list(dict.fromkeys(etf_tickers + commodity_tickers))
-
-print("\n[INFO] Combinando y limpiando tickers...")
-
-sp500_tickers_clean = list(dict.fromkeys(t.upper() for t in sp500_tickers))
-nasdaq_tickers_clean = list(dict.fromkeys(t.upper() for t in nasdaq_tickers))
-etf_tickers_clean = list(dict.fromkeys(t.upper() for t in etf_tickers))
-commodity_tickers_clean = list(dict.fromkeys(t.upper() for t in commodity_tickers))
-international_tickers_clean = list(dict.fromkeys(t.upper() for t in international_tickers))
-
-tickers_domesticos = list(dict.fromkeys(
-    sp500_tickers_clean + nasdaq_tickers_clean + etf_tickers_clean + commodity_tickers_clean
-))
-# El formato US solo en domesticos. En la lista mezclada tiraba SHOP.TO,
-# ULVR.L, TTE.PA y 7203.T. No hay piso de peso internacional.
-all_tickers = md.combinar_tickers(tickers_domesticos, international_tickers_clean)
-
-# Sin relleno hasta un total objetivo: el universo es exactamente el top N por
-# market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
-# mid-caps que el optimizador terminaba favoreciendo.
-all_tickers = list(dict.fromkeys(all_tickers))
-if dedupe_share_classes:
-    all_tickers, _clases = md.dedupe_share_classes(all_tickers, share_class_groups)
-    for se_queda, se_van in _clases:
-        print(f"[INFO] Clase duplicada: se queda {se_queda}, sale {', '.join(se_van)}")
-_intl_set = set(international_tickers_clean)
-_n_intl_universo = sum(1 for t in all_tickers if t in _intl_set)
-print(f"[INFO] Total de tickers FINAL (unicos): {len(all_tickers)} | "
-      f"internacionales en el universo: {_n_intl_universo} de {len(international_tickers_clean)}\n")
-
 # ==============================================================================
 # MAPEO DE MONEDA POR SUFIJO DE TICKER + PARES FX (para conversion a USD)
 # ==============================================================================
@@ -457,6 +439,49 @@ def get_currency_for_ticker(ticker):
         return md.normalize_currency(ticker_currency_override[ticker])
     return md.currency_from_suffix(ticker, ticker_currency_by_suffix) or "USD"
 
+
+n_top_international = min(n_top_international, len(international_tickers_full))
+# Top N por market cap en USD, no por la posicion en la lista (los primeros 15
+# eran todos .TO). Sin market cap van al final en su orden; si yfinance falla
+# por completo se usa el orden de la lista. No hay peso minimo internacional.
+_mc_intl = md.ordenar_por_market_cap(international_tickers_full, n_top_international,
+                                     ticker_currency_by_suffix, fx_pairs)
+international_tickers = _mc_intl["seleccion"]
+print(f"\n[INFO] Internacionales: top {n_top_international} de {len(international_tickers_full)} "
+      "por market cap (USD):")
+print(md.tabla_market_cap_texto(_mc_intl))
+if _mc_intl["aviso"]:
+    print(f"[ADVERTENCIA] Market cap internacional: {_mc_intl['aviso']}")
+
+etf_universe_tickers = list(dict.fromkeys(etf_tickers + commodity_tickers))
+
+print("\n[INFO] Combinando y limpiando tickers...")
+
+sp500_tickers_clean = list(dict.fromkeys(t.upper() for t in sp500_tickers))
+nasdaq_tickers_clean = list(dict.fromkeys(t.upper() for t in nasdaq_tickers))
+etf_tickers_clean = list(dict.fromkeys(t.upper() for t in etf_tickers))
+commodity_tickers_clean = list(dict.fromkeys(t.upper() for t in commodity_tickers))
+international_tickers_clean = list(dict.fromkeys(t.upper() for t in international_tickers))
+
+tickers_domesticos = list(dict.fromkeys(
+    sp500_tickers_clean + nasdaq_tickers_clean + etf_tickers_clean + commodity_tickers_clean
+))
+# El formato US solo en domesticos. En la lista mezclada tiraba SHOP.TO,
+# ULVR.L, TTE.PA y 7203.T. No hay piso de peso internacional.
+all_tickers = md.combinar_tickers(tickers_domesticos, international_tickers_clean)
+
+# Sin relleno hasta un total objetivo: el universo es exactamente el top N por
+# market cap de cada fuente. Rellenar con NASDAQ mas alla del top N metia
+# mid-caps que el optimizador terminaba favoreciendo.
+all_tickers = list(dict.fromkeys(all_tickers))
+if dedupe_share_classes:
+    all_tickers, _clases = md.dedupe_share_classes(all_tickers, share_class_groups)
+    for se_queda, se_van in _clases:
+        print(f"[INFO] Clase duplicada: se queda {se_queda}, sale {', '.join(se_van)}")
+_intl_set = set(international_tickers_clean)
+_n_intl_universo = sum(1 for t in all_tickers if t in _intl_set)
+print(f"[INFO] Total de tickers FINAL (unicos): {len(all_tickers)} | "
+      f"internacionales en el universo: {_n_intl_universo} de {len(international_tickers_clean)}\n")
 
 # ==============================================================================
 # SECCION 4: REPORTE DEL UNIVERSO
@@ -1031,11 +1056,8 @@ def bkm_resumen_fallbacks(tickers, titulo):
 # ==============================================================================
 # SPOT E IV ATM (~30 DTE) PARA SHRINKAGE Y GRIEGAS DE DIAGNOSTICO
 # ==============================================================================
-# El filtro Delta BS que vivia aqui se elimino (M-3): con K = S la delta de la
-# call era siempre > 0.5 (observado: 0.535-0.563) y delta_min = 0.30 no
-# descartaba ningun activo. Una version "con sentido" (probabilidad implicita
-# de caer mas de x%) seria la version gaussiana del filtro de cola BKM +
-# Cornish-Fisher que sigue, asi que se evita duplicarlo.
+# La IV ATM de Polygon alimenta el filtro Delta (colchon OTM) que sigue, el
+# shrinkage de la covarianza y las griegas de diagnostico.
 print(f"\nConsultando spot + IV ATM (~{target_dte_iv} DTE) para {len(selected_pre_seasonal)} activos "
       "(uso: shrinkage de covarianza y griegas de diagnostico)...")
 spot_cache = {t: get_spot_safe(t) for t in selected_pre_seasonal}
@@ -1047,6 +1069,55 @@ else:
     print(f"  Horizonte > cap de opciones ({options_horizon_cap_months} meses) - se omite consulta de IV, "
           f"solo HV para {len(selected_pre_seasonal)} activos...\n")
     iv_cache = {t: np.nan for t in selected_pre_seasonal}
+
+# ==============================================================================
+# FILTRO DELTA: COLCHON OTM
+# ==============================================================================
+# Mismo diseno que quadratic_utility.
+# Va antes del filtro de cola, donde estaba el filtro ATM eliminado (M-3).
+# colchon = delta(K=S) - delta(K=S*exp(m)); un umbral alto se queda con la vol
+# baja. La delta ATM de Polygon no se usa aqui: ronda 0.5 y no separa.
+if use_delta_filter:
+    T_delta = horizon_months / 12
+    m_otm = qm.otm_log_moneyness(delta_otm_log_m, T_delta, delta_otm_ref_months / 12.0)
+    print(f"\nAplicando filtro Delta (colchon OTM, delta_min={delta_min:.2f}, "
+          f"T={T_delta:.3f} anios = {horizon_months} mes(es))...")
+    print(f"   Log-moneyness OTM efectiva: {m_otm:.4f} "
+          f"(base {delta_otm_log_m:.4f} a {delta_otm_ref_months:g} meses)")
+    print("   IV: Polygon si hay cadena; si no, vol historica. Nombres sin vol se conservan.")
+    vol_hist_delta = {
+        t: log_returns[t].dropna().std() * math.sqrt(annualization_factor)
+        for t in selected_pre_seasonal if t in log_returns.columns
+    }
+    delta_df = qm.filtro_delta_otm(
+        selected_pre_seasonal, iv_cache, vol_hist_delta, T_delta, risk_free_rate, delta_min,
+        log_m=delta_otm_log_m, ref_years=delta_otm_ref_months / 12.0)
+
+    vista = delta_df.sort_values("delta", na_position="last").copy()
+    vista["Colchon"] = vista["delta"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "sin_vol")
+    vista["IV_anual"] = vista["iv_used"].map(lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "-")
+    vista["Fuente"] = vista["strike_mode"].map(
+        {"bs_otm_polygon_iv": "IV Polygon", "bs_otm_hist": "vol historica", "sin_datos": "sin vol"})
+    vista["Resultado"] = vista["pasa"].map({True: "pasa", False: "descartado"})
+    print("\n  Colchon y fuente de vol por ticker:")
+    print("  " + vista.rename(columns={"symbol": "Symbol"})
+          [["Symbol", "Colchon", "IV_anual", "Fuente", "Resultado"]]
+          .to_string(index=False).replace("\n", "\n  "))
+
+    n_poly = int((delta_df["strike_mode"] == "bs_otm_polygon_iv").sum())
+    n_hist = int((delta_df["strike_mode"] == "bs_otm_hist").sum())
+    n_sin_vol = int((delta_df["strike_mode"] == "sin_datos").sum())
+    n_desc_delta = int((~delta_df["pasa"]).sum())
+    print(f"\n  Fuente de vol: IV Polygon {n_poly} | historica {n_hist} | sin vol (se conservan) {n_sin_vol}")
+    print(f"  Descartados (colchon < {delta_min:.2f}): {n_desc_delta} de {len(delta_df)} | "
+          f"Superan el filtro: {len(delta_df) - n_desc_delta}")
+
+    selected_pre_seasonal = delta_df.loc[delta_df["pasa"], "symbol"].tolist()
+    spot_cache = {t: spot_cache[t] for t in selected_pre_seasonal}
+    iv_cache = {t: iv_cache.get(t, np.nan) for t in selected_pre_seasonal}
+    print(f"  OK Tras filtro Delta: {len(selected_pre_seasonal)} candidatos para el filtro de cola\n")
+else:
+    print("Filtro Delta desactivado\n")
 
 # ==============================================================================
 # FILTRO DE TAIL RISK BKM: VaR Cornish-Fisher para rankear/filtrar candidatos

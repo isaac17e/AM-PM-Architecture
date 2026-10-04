@@ -26,6 +26,9 @@ SCRIPTS = [
     "minimum_variance_(seasonal_version).py",
     "black_litterman.py",
 ]
+# Black-Litterman no tiene lista internacional fija: su universo es TICKERS
+# (ver tests/test_bl_universo.py).
+SCRIPTS_CON_LISTA_INTL = [n for n in SCRIPTS if n != "black_litterman.py"]
 
 SUFIJOS_MONEDA = {
     ".TO": "CAD",
@@ -103,7 +106,7 @@ def _descartados(years, umbral, ref_years=_T_REF):
 # Universo: sufijos que el filtro US tiraba
 # ------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("nombre", SCRIPTS)
+@pytest.mark.parametrize("nombre", SCRIPTS_CON_LISTA_INTL)
 def test_script_conserva_sufijos_internacionales(nombre):
     fuente = _fuente(nombre)
     assert "combinar_tickers(" in fuente
@@ -123,7 +126,7 @@ def test_script_conserva_sufijos_internacionales(nombre):
         assert basura not in unidos
 
 
-@pytest.mark.parametrize("nombre", SCRIPTS)
+@pytest.mark.parametrize("nombre", SCRIPTS_CON_LISTA_INTL)
 def test_script_mapea_sufijo_y_region(nombre):
     fuente = _fuente(nombre)
     vals = _literales(fuente)

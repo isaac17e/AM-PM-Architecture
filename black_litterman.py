@@ -49,28 +49,17 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 # ------------------------------------------------------------------------------
 # 1. UNIVERSO DE TICKERS
 # ------------------------------------------------------------------------------
+# El universo es exactamente esta lista: no hay listas paralelas de ETFs ni de
+# internacionales. Vale cualquier ticker de Yahoo Finance: acciones, ETFs o
+# commodities de EE. UU., y de otras bolsas con su sufijo (RY.TO, AZN.L,
+# 7203.T, ASML.AS, 0700.HK...). Un internacional se convierte a USD con la
+# moneda que reporta Yahoo y no se consulta en Polygon (sin opciones en
+# EE. UU.): usa vol y momentos historicos. Los ADRs (HSBC, BP) son de EE. UU.
 TICKERS = [
     "META", "GOOGL", "ORCL", "DELL", "MSFT",
     "BLK", "CRM", "CMCSA", "GS", "REGN",
     "ABNB", "ARES", "LVS", "BXP", "CRWD",
     "YELP", "EBAY", "IT", "EL"
-]
-
-# Misma lista que el resto de optimizadores. El formato US no se les aplica:
-# SHOP.TO, ULVR.L, TTE.PA, los .DE/.MC y los .T que empiezan por digito
-# seguirian si el predicado de largo 1-5 se corriera sobre la lista mezclada.
-# No hay piso de peso internacional.
-INTERNATIONAL_TICKERS = [
-    "RY.TO", "SHOP.TO", "TD.TO", "BN.TO", "ENB.TO", "TRI.TO", "BNS.TO",
-    "CP.TO", "CNQ.TO", "AEM.TO", "SU.TO", "TRP.TO", "WCN.TO", "FNV.TO",
-    "SAP.TO", "SIE.DE", "DTE.DE", "ALV.DE", "MBG.DE", "IFX.DE", "BMW.DE",
-    "DB1.DE", "DHL.DE", "DBK.DE", "MUV2.DE", "AZN.L", "HSBC", "ULVR.L",
-    "BP", "GSK.L", "RIO.L", "BATS.L", "GLEN.L", "DGE.L", "NG.L", "MC.PA",
-    "TTE.PA", "SAN.PA", "OR.PA", "SU.PA", "AI.PA", "BNP.PA", "RMS.PA",
-    "CS.PA", "SAF.PA", "CAP.PA", "ITX.MC", "IBE.MC", "BBVA.MC", "SAN.MC",
-    "7203.T", "6758.T", "6861.T", "8306.T", "9984.T", "6367.T", "6098.T",
-    "4063.T", "7974.T", "9432.T", "6501.T", "7267.T", "8316.T", "4568.T",
-    "6902.T", "4502.T", "8031.T",
 ]
 
 # ------------------------------------------------------------------------------
@@ -102,51 +91,14 @@ MAX_TICKERS_FINAL = 10
 PESO_MAX_ACTIVO = 0.35
 
 # ------------------------------------------------------------------------------
-# VALIDACION DE FACTIBILIDAD DE CARDINALIDAD
-# ------------------------------------------------------------------------------
-_cap_cardinalidad = MAX_TICKERS_FINAL * PESO_MAX_ACTIVO
-if _cap_cardinalidad < 1.0:
-    _peso_max_previo = PESO_MAX_ACTIVO
-    PESO_MAX_ACTIVO = min(1.0, (1.0 / MAX_TICKERS_FINAL) * 1.05)
-    print(f"  AVISO: MAX_TICKERS_FINAL({MAX_TICKERS_FINAL}) x "
-          f"PESO_MAX_ACTIVO({_peso_max_previo:.4f}) = {_cap_cardinalidad:.4f} < 1.0 "
-          f"=> el optimizador quedaria infactible en sum(w)=1. "
-          f"Se ajusta PESO_MAX_ACTIVO a {PESO_MAX_ACTIVO:.4f}.")
-
-# ------------------------------------------------------------------------------
-# ETFs EN EL PORTAFOLIO RESULTANTE
-# ------------------------------------------------------------------------------
-INCLUIR_ETFS = True
-PESO_MAX_ETFS = 1.00
-
-ETF_TICKERS = [
-    "SPY", "QQQ", "VOO", "VTI", "VYM", "IWM", "GLD", "SLV", "USO", "PDBC", "HYG", "VNQ",
-    "XLK", "XLV", "XLF", "XLE", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC", "VOX",
-    "SMH", "SOXX", "IGV", "CIBR", "HACK", "SKYY", "BOTZ", "ROBO", "BUG",
-    "XBI", "IBB", "PPH", "IHI", "IHF", "ARKG",
-    "KBE", "KRE", "KIE", "IAI", "FINX",
-    "XOP", "AMLP", "MLPX", "OIH", "ICLN", "TAN", "FAN",
-    "XRT", "XHB", "ITB", "PEJ", "ONLN", "CARZ",
-    "MOO",
-    "ITA", "PPA", "IYT", "PAVE",
-    "GDX", "GDXJ", "LIT", "SLX", "COPX",
-    "REM",
-    "ARKW", "ARKF",
-    "VWO", "EEM", "EFA", "VGK", "EZU", "AAXJ", "EWJ", "MCHI", "FXI", "INDA",
-    "ILF", "EWZ", "VXUS", "ACWX", "VT", "EWC", "EWG", "EWU", "EWQ", "EWP",
-]
-COMMODITY_TICKERS = ["SLV", "UNG"]
-
-if not (0.0 < PESO_MAX_ETFS <= 1.0):
-    raise ValueError("Error: PESO_MAX_ETFS debe estar en (0, 1] (ej. 0.30 = 30%)")
-
-# ------------------------------------------------------------------------------
 # 6. TASA LIBRE DE RIESGO - FALLBACK
 # ------------------------------------------------------------------------------
 Rf = 0.046
 
 # ------------------------------------------------------------------------------
-# DELTA DE MERCADO (M-12). Independiente del perfil.
+# 7. DELTA DE MERCADO
+# ------------------------------------------------------------------------------
+# Independiente del perfil (M-12).
 # "historical" es el comportamiento de siempre: exceso de ~2 anos / varianza,
 # ambos al horizonte. La media corta puede ser negativa y pi hereda el signo.
 # "fixed" usa DELTA_MKT_FIJO (rango habitual de aversion 2-4).
@@ -155,17 +107,16 @@ Rf = 0.046
 # esa cartera) ya disponible en la cadena Q -> P. No es el default: ese
 # cociente suele quedar cerca de 1, no en 2.5, porque la prima ya esta en
 # unidades de varianza.
-# ------------------------------------------------------------------------------
 DELTA_MKT_MODO = "historical"
 DELTA_MKT_FIJO = 2.5
 
 # ------------------------------------------------------------------------------
-# 7. ANALISIS DE MAXIMUM DRAWDOWN (MDD)
+# 8. ANALISIS DE MAXIMUM DRAWDOWN (MDD)
 # ------------------------------------------------------------------------------
 MDD_START_YEAR = date.today().year - 2
 
 # ------------------------------------------------------------------------------
-# 8. VOLATILIDAD IMPLICITA VIA POLYGON - SSVI
+# 9. VOLATILIDAD IMPLICITA VIA POLYGON - SSVI
 # ------------------------------------------------------------------------------
 USAR_IV_POLYGON = True
 MIN_STRIKES_SLICE = 5
@@ -198,22 +149,16 @@ SSVI_MIN_PER_SIDE = 2
 # Momentos cuando la sonrisa se rechaza (rmse, rho en la cota, cadena rota).
 # "historico": skew y curtosis fisicos del ticker al horizonte.
 # "neutro": MFIS=0, MFIK=3.
-# "sector": sonrisa del ETF en FALLBACK_ETF_POR_TICKER; si no calibra, historico.
+# "sector": sonrisa del ETF sectorial que asignes en FALLBACK_ETF_POR_TICKER
+# ({ticker: ETF}, p. ej. {"MSFT": "XLK"}). Los tickers sin entrada, o cuyo ETF
+# no calibra, usan el historico. Vacio por defecto: depende de tu universo.
 FALLBACK_MOMENTOS = "historico"
-FALLBACK_ETF_POR_TICKER = {
-    "META": "XLK", "GOOGL": "XLK", "ORCL": "XLK", "DELL": "XLK", "MSFT": "XLK",
-    "CRM": "XLK", "CRWD": "XLK", "IT": "XLK",
-    "CMCSA": "XLC", "YELP": "XLC",
-    "BLK": "XLF", "GS": "XLF", "ARES": "XLF",
-    "REGN": "XLV",
-    "ABNB": "XLY", "LVS": "XLY", "EBAY": "XLY",
-    "BXP": "XLRE",
-    "EL": "XLP",
-}
+FALLBACK_ETF_POR_TICKER = {}
 
 # ------------------------------------------------------------------------------
-# 9. MODULO ECONOMETRICO Q -> P (BLOQUE 1D)
+# 10. MODULO ECONOMETRICO Q -> P
 # ------------------------------------------------------------------------------
+# Parametros del Bloque 1D.
 PASO_VENTANA_ROLLING = 5
 MIN_VENTANAS_ROLLING = 12
 NW_LAGS_AUTO = True
@@ -236,15 +181,16 @@ COTA_KURT_P = (1.8, 12.0)
 COTA_RATIO_VOL_P = (0.70, 1.00)
 
 # ------------------------------------------------------------------------------
-# COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF
+# 11. COVARIANZA HISTORICA: DIARIA + EWMA + SHRINKAGE LEDOIT-WOLF
 # ------------------------------------------------------------------------------
 USAR_COV_DIARIA = True
 COV_HALFLIFE_DIAS = 120
 USAR_SHRINKAGE_LW = True
 
 # ------------------------------------------------------------------------------
-# 10. [NUEVO] INTEGRACION BAYESIANA NO GAUSSIANA (BLOQUE 7)
+# 12. INTEGRACION BAYESIANA NO GAUSSIANA
 # ------------------------------------------------------------------------------
+# Parametros del Bloque 7.
 METODO_POSTERIOR = "entropy_pooling"
 N_ESCENARIOS = 12000
 BOOTSTRAP_BLOQUE = max(21, (MESES_HORIZONTE * DIAS_HABILES_MES) // 4)
@@ -254,8 +200,9 @@ EP_IMPONER_CURTOSIS = True
 EP_TOL_ENS = 0.10
 
 # ------------------------------------------------------------------------------
-# 11. [NUEVO] RIESGO DE COLA Y MODO DE OPTIMIZACION (BLOQUES 7B / 8B)
+# 13. RIESGO DE COLA Y MODO DE OPTIMIZACION
 # ------------------------------------------------------------------------------
+# Parametros de los Bloques 7B y 8B.
 NIVEL_CONFIANZA_VAR = 0.95
 BKM_MFIK_MAX = 20.0
 # Tope de MFIK: 20 con cadena corta, hasta BKM_MFIK_MAX_HARD si hay muchos
@@ -282,7 +229,7 @@ RETORNO_MIN_CVAR = None
 MAX_ESCENARIOS_LP = 4000
 
 # ------------------------------------------------------------------------------
-# VALIDACION DE API KEY Y SEMILLA GLOBAL
+# MODO SMOKE
 # ------------------------------------------------------------------------------
 # AMPM_SMOKE=1 ejecuta el script con universo chico y sin Polygon, para que
 # un test pueda recorrer el camino hasta Cornish-Fisher (el alias `rk` no
@@ -290,7 +237,8 @@ MAX_ESCENARIOS_LP = 4000
 _es_smoke = os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}
 if _es_smoke:
     USAR_IV_POLYGON = False
-    TICKERS = ["AAPL", "MSFT", "SPY"]
+    # AMPM_SMOKE_TICKERS="AAPL,AZN.L" cambia el universo del smoke.
+    TICKERS = os.environ.get("AMPM_SMOKE_TICKERS", "AAPL,MSFT,SPY").split(",")
     N_ESCENARIOS = 60
     N_REP_BOOTSTRAP_MOM = 2
     J_POR_REPLICA_MOM = 30
@@ -298,14 +246,9 @@ if _es_smoke:
     MAX_ESCENARIOS_LP = 30
     MIN_VENTANAS_ROLLING = 4
 
-# El smoke deja el universo chico. Fuera de el, los internacionales se
-# concatenan despues del filtro de formato US (que esta lista fija no
-# dispara, pero un sufijo de bolsa futuro no se descarta).
-_intl_para_universo = [] if _es_smoke else list(INTERNATIONAL_TICKERS)
-TICKERS = md.combinar_tickers(TICKERS, _intl_para_universo)
-_intl_set = set(_intl_para_universo)
-_n_intl_universo = sum(1 for t in TICKERS if t in _intl_set)
-
+# ------------------------------------------------------------------------------
+# VALIDACION DE PARAMETROS Y SEMILLA GLOBAL
+# ------------------------------------------------------------------------------
 if USAR_IV_POLYGON and not POLYGON_API_KEY:
     raise ValueError(
         "USAR_IV_POLYGON = True pero POLYGON_API_KEY no esta definida. "
@@ -326,12 +269,28 @@ if SSVI_PRECIO_MIN < 0 or SSVI_OI_MIN < 0:
 if SSVI_K_SD_MAX is not None and (not np.isfinite(SSVI_K_SD_MAX) or SSVI_K_SD_MAX <= 0):
     raise ValueError("SSVI_K_SD_MAX debe ser positivo")
 
+_cap_cardinalidad = MAX_TICKERS_FINAL * PESO_MAX_ACTIVO
+if _cap_cardinalidad < 1.0:
+    _peso_max_previo = PESO_MAX_ACTIVO
+    PESO_MAX_ACTIVO = min(1.0, (1.0 / MAX_TICKERS_FINAL) * 1.05)
+    print(f"  AVISO: MAX_TICKERS_FINAL({MAX_TICKERS_FINAL}) x "
+          f"PESO_MAX_ACTIVO({_peso_max_previo:.4f}) = {_cap_cardinalidad:.4f} < 1.0 "
+          f"=> el optimizador quedaria infactible en sum(w)=1. "
+          f"Se ajusta PESO_MAX_ACTIVO a {PESO_MAX_ACTIVO:.4f}.")
+
 rng_global = np.random.default_rng(SEMILLA)
 
 
 # ==============================================================================
 # BLOQUE 0B: HORIZONTE Y UNIVERSO
 # ==============================================================================
+# El universo es TICKERS tal cual, sin duplicados. No se le aplica el filtro
+# de formato US: un sufijo de bolsa (.TO, .L, .T, .HK...) se conserva.
+TICKERS = list(dict.fromkeys(str(t).strip().upper() for t in TICKERS if str(t).strip()))
+if len(TICKERS) < 2:
+    raise ValueError("TICKERS debe tener al menos 2 tickers distintos")
+# Internacional = cotiza fuera de EE. UU. (sin cadena de opciones en Polygon).
+_intl_universo = [t for t in TICKERS if not pc.is_us_ticker(t)]
 
 horizonte_dias = MESES_HORIZONTE * DIAS_HABILES_MES
 horizonte_semanas = MESES_HORIZONTE * SEMANAS_MES
@@ -343,15 +302,19 @@ print(f"Dias habiles: {horizonte_dias}")
 print(f"Factor de escala (semanas): {factor_anualizacion}\n")
 
 print("=== UNIVERSO ===")
-print(f"Tickers: {len(TICKERS)} | internacionales en el universo: "
-      f"{_n_intl_universo} de {len(_intl_para_universo)}")
+print(f"Tickers: {len(TICKERS)} | internacionales en el universo (sin opciones US): "
+      f"{len(_intl_universo)}{' (' + ', '.join(_intl_universo) + ')' if _intl_universo else ''}")
 print(TICKERS)
 print()
 
 # ==============================================================================
-# MAPEO DE MONEDA POR SUFIJO + PARES FX (conversion a USD)
+# MAPEO DE MONEDA POR SUFIJO + PARES FX
 # ==============================================================================
-# HSBC y BP son ADRs en USD: no van en el override. .TO es CAD, no JPY.
+# Para la conversion a USD.
+# La moneda sale de Yahoo (history_metadata). El sufijo es el respaldo si
+# Yahoo no la informa. HSBC y BP son ADRs en USD: no van en el override.
+# .TO es CAD, no JPY. Solo se descarga el FX de las monedas del universo; una
+# moneda sin par en fx_pairs usa {MONEDA}USD=X (USD por unidad).
 fx_pairs = {
     "CAD": {"ticker": "CAD=X", "invert": True},
     "EUR": {"ticker": "EURUSD=X", "invert": False},
@@ -365,6 +328,12 @@ ticker_currency_by_suffix = {
     ".MC": "EUR",
     ".L": "GBP",
     ".T": "JPY",
+    ".AS": "EUR", ".BR": "EUR", ".MI": "EUR", ".F": "EUR", ".HE": "EUR",
+    ".LS": "EUR", ".IR": "EUR", ".VI": "EUR",
+    ".SW": "CHF", ".ST": "SEK", ".CO": "DKK", ".OL": "NOK",
+    ".HK": "HKD", ".SS": "CNY", ".SZ": "CNY", ".KS": "KRW", ".TW": "TWD",
+    ".AX": "AUD", ".NZ": "NZD", ".SI": "SGD", ".NS": "INR", ".BO": "INR",
+    ".SA": "BRL", ".MX": "MXN", ".JO": "ZAR", ".V": "CAD", ".NE": "CAD",
 }
 ticker_currency_override = {}
 provider_currency = {}
@@ -381,23 +350,41 @@ print("=== Descargando precios ===")
 print(f"Desde: {fecha_inicio} | Hasta: {fecha_fin}\n")
 
 
-def descargar_fx(start, end):
-    """Series FX en USD por unidad de moneda local."""
-    fx_prices = {}
+def _par_fx(cur):
+    """Par de Yahoo para `cur`: el de fx_pairs o {CUR}USD=X (USD por unidad)."""
+    return fx_pairs.get(cur) or {"ticker": f"{cur}USD=X", "invert": False}
+
+
+def descargar_fx_moneda(cur, start, end):
+    """Serie FX en USD por unidad de `cur`, o None."""
+    info = _par_fx(cur)
     fin = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
-    for cur, info in fx_pairs.items():
-        try:
-            hist = yf.Ticker(info["ticker"]).history(start=start, end=fin.date(), auto_adjust=True)
-            if hist is None or hist.empty:
-                continue
-            s = hist["Close"].copy()
-            s.index = pd.to_datetime(s.index).tz_localize(None)
-            if info["invert"]:
-                s = 1.0 / s
-            fx_prices[cur] = s.sort_index()
-        except Exception:
-            pass
-    return fx_prices
+    try:
+        hist = yf.Ticker(info["ticker"]).history(start=start, end=fin.date(), auto_adjust=True)
+        if hist is None or hist.empty:
+            return None
+        s = hist["Close"].copy()
+        s.index = pd.to_datetime(s.index).tz_localize(None)
+        if info["invert"]:
+            s = 1.0 / s
+        return s.sort_index()
+    except Exception:
+        return None
+
+
+_fx_fallidos = set()
+
+
+def asegurar_fx(cur, fx_prices):
+    """Descarga el FX de `cur` una sola vez por corrida (tambien si falla)."""
+    if fx_prices is None or not cur or cur == "USD" or cur in fx_prices or cur in _fx_fallidos:
+        return
+    s = descargar_fx_moneda(cur, _fx_desde.date(), fecha_fin)
+    if s is not None and len(s):
+        fx_prices[cur] = s
+        print(f"  FX {cur}: {_par_fx(cur)['ticker']}")
+    else:
+        _fx_fallidos.add(cur)
 
 
 def descargar_precio(ticker, start, end, max_retries=3, fx_prices=None):
@@ -432,6 +419,7 @@ def descargar_precio(ticker, start, end, max_retries=3, fx_prices=None):
                           f"contradice al proveedor {c['proveedor']}; se usa {c['proveedor']}")
                 cur = ticker_currency[ticker]
                 if cur != "USD":
+                    asegurar_fx(cur, fx_prices)
                     if fx_prices is not None and cur in fx_prices:
                         s = md.convertir_serie_a_usd(s, fx_prices[cur])
                     else:
@@ -442,10 +430,9 @@ def descargar_precio(ticker, start, end, max_retries=3, fx_prices=None):
     return None
 
 
-print("Descargando pares FX para conversion a USD...")
+# FX solo de las monedas que aparezcan en el universo, al descargar cada precio.
 _fx_desde = min(pd.Timestamp(fecha_inicio), pd.Timestamp(date(MDD_START_YEAR, 1, 1)))
-fx_prices_diarios = descargar_fx(_fx_desde.date(), fecha_fin)
-print(f"  Pares FX disponibles: {', '.join(fx_prices_diarios) if fx_prices_diarios else '(ninguno)'}")
+fx_prices_diarios = {}
 
 tickers_ok = []
 precios_dict = {}
@@ -458,6 +445,10 @@ for tk in TICKERS:
     tickers_ok.append(tk)
 
 print(f"Tickers descargados: {len(tickers_ok)} / {len(TICKERS)}")
+_no_usd = {t: ticker_currency.get(t) for t in tickers_ok if ticker_currency.get(t, "USD") != "USD"}
+if _no_usd:
+    print("  Convertidos a USD: " + ", ".join(f"{t} ({c})" for t, c in _no_usd.items())
+          + (f" | sin FX (quedan en moneda local): {', '.join(sorted(_fx_fallidos))}" if _fx_fallidos else ""))
 
 precios_diarios = pd.DataFrame(precios_dict)[tickers_ok]
 if len(precios_diarios) == 0 or pd.isna(precios_diarios.index.max()):
@@ -714,6 +705,9 @@ if USAR_IV_POLYGON:
             if etf and etf not in etfs_sector:
                 etfs_sector.append(etf)
         print(f"\n  Sonrisas sectoriales para el fallback ({', '.join(etfs_sector) or 'ninguna'}):")
+        _sin_etf = [tk for tk in tickers if tk not in FALLBACK_ETF_POR_TICKER]
+        if _sin_etf:
+            print(f"  Sin ETF en FALLBACK_ETF_POR_TICKER (usan historico): {', '.join(_sin_etf)}")
         for etf in etfs_sector:
             if etf in detalle_ssvi and detalle_ssvi[etf].get("usar_alas"):
                 detalle_sector[etf] = detalle_ssvi[etf]
@@ -942,8 +936,9 @@ peso_tiempo = peso_tiempo / peso_tiempo.sum()
 
 
 # ==============================================================================
-# 1D.0  BOOTSTRAP ESTACIONARIO POR BLOQUES (COMPARTIDO CON EL BLOQUE 7)
+# 1D.0  BOOTSTRAP ESTACIONARIO POR BLOQUES
 # ==============================================================================
+# Compartido con el Bloque 7.
 
 def bootstrap_estacionario(R, J, H, L_bloque, pesos_inicio, rng, chunk=2000):
     """Panel (J x n) de log-retornos agregados a H dias.
@@ -974,8 +969,9 @@ def bootstrap_estacionario(R, J, H, L_bloque, pesos_inicio, rng, chunk=2000):
 
 
 # ==============================================================================
-# 1D.1a  ESTIMADOR DE VENTANAS RODANTES (DIAGNOSTICO)
+# 1D.1a  ESTIMADOR DE VENTANAS RODANTES
 # ==============================================================================
+# Diagnostico.
 
 def momentos_realizados_rolling(serie_diaria, H=H_VENTANA, paso=PASO_VENTANA_ROLLING):
     """Momentos realizados del retorno agregado a H dias, en ventanas rodantes.
@@ -1075,8 +1071,9 @@ for tk in tickers:
 rolling = pd.DataFrame(filas_roll).set_index("ticker").loc[tickers]
 
 # ==============================================================================
-# 1D.1b  ESTIMADOR BOOTSTRAP DE LA DISTRIBUCION A H DIAS (PRIMARIO)
+# 1D.1b  ESTIMADOR BOOTSTRAP DE LA DISTRIBUCION A H DIAS
 # ==============================================================================
+# Estimador primario.
 
 def momentos_horizonte_bootstrap(R, H, n_rep=N_REP_BOOTSTRAP_MOM,
                                  J_rep=J_POR_REPLICA_MOM, rng=None):
@@ -1504,28 +1501,24 @@ print(f"\n  Sigma_P construida. Vol media Q: {np.mean(np.sqrt(MFIV_vec)):.4f} | 
 print("\n=== Extrayendo market caps via Yahoo Finance ===")
 
 
-def get_market_cap(ticker):
-    try:
-        fi = yf.Ticker(ticker).fast_info
-        mc = fi.get("marketCap") if hasattr(fi, "get") else None
-        if mc is None:
-            mc = getattr(fi, "market_cap", None)
-        if mc is None or (isinstance(mc, float) and np.isnan(mc)):
-            raise ValueError
-        return float(mc)
-    except Exception:
-        try:
-            info = yf.Ticker(ticker).info
-            mc = info.get("marketCap")
-            return float(mc) if mc is not None else np.nan
-        except Exception:
-            return np.nan
-
-
-market_caps_raw = pd.Series({t: get_market_cap(t) for t in tickers})
+# Market cap en USD con la misma moneda de los precios: yfinance lo da en la
+# moneda de cotizacion (AZN.L en peniques via fast_info, 7203.T en yenes) y
+# sin convertir un internacional dominaba w_mkt.
+_monedas_bl = {t: ticker_currency.get(t) for t in tickers}
+_fx_spot_bl = {m: float(s.dropna().iloc[-1]) for m, s in fx_prices_diarios.items() if len(s.dropna())}
+_caps_bl = md.market_caps_usd(
+    tickers, ticker_currency_by_suffix,
+    {m: _par_fx(m) for m in set(filter(None, _monedas_bl.values())) if m != "USD"},
+    fx_provider=lambda pares: {m: _fx_spot_bl[m] for m in pares if m in _fx_spot_bl},
+    monedas=_monedas_bl, cap_ttl_hours=24)
+market_caps_raw = pd.Series({t: np.nan if _caps_bl["usd"][t] is None else _caps_bl["usd"][t]
+                             for t in tickers})
 
 print("Market caps extraidos (USD):")
-print(market_caps_raw.map(lambda x: f"{x:,.0f}" if not pd.isna(x) else "NA"))
+print(pd.DataFrame({
+    "moneda": pd.Series(_caps_bl["moneda"]),
+    "market_cap_usd": market_caps_raw.map(lambda x: f"{x:,.0f}" if not pd.isna(x) else "NA"),
+}).to_string())
 
 if market_caps_raw.isna().all():
     print("  Yahoo Finance no devolvio datos - usando pesos iguales")
@@ -1556,8 +1549,9 @@ desc_perfiles = dict(
 )
 
 # ==============================================================================
-# DELTA DE MERCADO (NO DEPENDE DEL PERFIL). Modo: DELTA_MKT_MODO (M-12)
+# DELTA DE MERCADO
 # ==============================================================================
+# No depende del perfil. Modo: DELTA_MKT_MODO (M-12).
 Rf_h = Rf * (MESES_HORIZONTE / 12)
 ret_mkt_hist = float(w_mkt @ mu_historico)
 var_mkt_hist = float(w_mkt @ Sigma_hist @ w_mkt)
@@ -1695,8 +1689,9 @@ n_topados = int(np.sum(np.abs(prima_hm) > tope_hm))
 prima_hm = np.clip(prima_hm, -tope_hm, tope_hm)
 
 # ==============================================================================
-# 4B.2  INCERTIDUMBRE DE LA PRIMA NO GAUSSIANA (ALIMENTA OMEGA)
+# 4B.2  INCERTIDUMBRE DE LA PRIMA NO GAUSSIANA
 # ==============================================================================
+# Alimenta Omega.
 
 se_prima_hm = np.zeros(n)
 for i in range(n):
@@ -1766,8 +1761,9 @@ print("(Diff > 0: retorno historico supera el equilibrio de mercado)")
 print(referencia_views.sort_values("Diff_Hist_Pi", ascending=False).to_string(index=False))
 
 # ==============================================================================
-# BLOQUE 6: VIEWS DEL GESTOR <- EDITA AQUI
+# BLOQUE 6: VIEWS DEL GESTOR
 # ==============================================================================
+# Edita aqui los views: pasos 1 a 3.
 
 # ==============================================================================
 # PASO 1: DEFINE CUANTOS VIEWS TIENES
@@ -1888,8 +1884,9 @@ print("BLOQUE 7: POSTERIOR NO GAUSSIANO")
 print("=" * 79)
 
 # ==============================================================================
-# 7.1  PANEL DE ESCENARIOS PRIOR (BOOTSTRAP ESTACIONARIO, FUNCION DEL BLOQUE 1D)
+# 7.1  PANEL DE ESCENARIOS PRIOR
 # ==============================================================================
+# Bootstrap estacionario, funcion del Bloque 1D.
 
 print(f"\nGenerando panel de {N_ESCENARIOS} escenarios "
       f"(bootstrap estacionario, bloque medio {BOOTSTRAP_BLOQUE} dias, "
@@ -2279,30 +2276,6 @@ print("=" * 79)
 
 mu_opt = mu_post.copy()
 
-# ==============================================================================
-# ELEGIBILIDAD DE ETFs EN EL PORTAFOLIO RESULTANTE
-# ==============================================================================
-_etfs_excluibles = set(ETF_TICKERS) - set(COMMODITY_TICKERS)
-es_etf_banda = np.array([t in set(ETF_TICKERS) | set(COMMODITY_TICKERS) for t in tickers])
-activos_elegibles = np.array([INCLUIR_ETFS or t not in _etfs_excluibles for t in tickers])
-usar_tope_etf = INCLUIR_ETFS and PESO_MAX_ETFS < 1.0 and bool(es_etf_banda.any())
-
-if not INCLUIR_ETFS:
-    _etfs_fuera = [t for t, ok in zip(tickers, activos_elegibles) if not ok]
-    print("\n  INCLUIR_ETFS = False: el portafolio resultante solo tendra acciones y commodities")
-    print(f"  ETFs con peso fijado en 0 ({len(_etfs_fuera)}): "
-          f"{', '.join(_etfs_fuera) if _etfs_fuera else 'ninguno'}")
-    n_elegibles = int(activos_elegibles.sum())
-    if n_elegibles == 0 or min(n_elegibles, MAX_TICKERS_FINAL) * PESO_MAX_ACTIVO < 1.0 - 1e-9:
-        raise RuntimeError(
-            f"Error: con INCLUIR_ETFS = False quedan {n_elegibles} acciones/commodities elegibles, "
-            f"insuficientes para sumar 100% con PESO_MAX_ACTIVO = {PESO_MAX_ACTIVO:.2f} y "
-            f"MAX_TICKERS_FINAL = {MAX_TICKERS_FINAL}. Agrega acciones a TICKERS o sube PESO_MAX_ACTIVO.")
-elif usar_tope_etf:
-    print(f"\n  Tope de ETFs + commodities: {PESO_MAX_ETFS:.0%} del portafolio "
-          f"({int(es_etf_banda.sum())} en el universo)")
-
-
 def utilidad_mvsk_negativa(w, X, p, gamma, lam3, lam4):
     """-U(w) con U = E[r] - (g/2)m2 + (l3/3)m3 - (l4/4)m4."""
     mu_w, m2, m3, m4 = momentos_portafolio(w, X, p)
@@ -2312,16 +2285,13 @@ def utilidad_mvsk_negativa(w, X, p, gamma, lam3, lam4):
 def optimizar_mvsk(X, p, gamma, lam3, lam4, activos_permitidos=None, w_ini=None):
     n_ = X.shape[1]
     if activos_permitidos is None:
-        activos_permitidos = activos_elegibles
-    activos_permitidos = activos_permitidos & activos_elegibles
+        activos_permitidos = np.ones(n_, dtype=bool)
     bounds = [(0.0, PESO_MAX_ACTIVO) if activos_permitidos[i] else (0.0, 0.0)
               for i in range(n_)]
     if w_ini is None:
         w_ini = activos_permitidos.astype(float)
         w_ini = w_ini / w_ini.sum()
     cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-    if usar_tope_etf:
-        cons.append({"type": "ineq", "fun": lambda w: PESO_MAX_ETFS - np.sum(w[es_etf_banda])})
     res = minimize(utilidad_mvsk_negativa, w_ini, args=(X, p, gamma, lam3, lam4),
                    method="SLSQP", bounds=bounds, constraints=cons,
                    options=dict(maxiter=600, ftol=1e-11))
@@ -2350,8 +2320,7 @@ def optimizar_min_cvar(X, p, alpha, retorno_min, mu_vec,
     rng = rng_global if rng is None else rng
     J_, n_ = X.shape
     if activos_permitidos is None:
-        activos_permitidos = activos_elegibles
-    activos_permitidos = activos_permitidos & activos_elegibles
+        activos_permitidos = np.ones(n_, dtype=bool)
 
     if J_ > max_escenarios:
         idx = rng.choice(J_, size=max_escenarios, replace=True, p=p)
@@ -2376,12 +2345,6 @@ def optimizar_min_cvar(X, p, alpha, retorno_min, mu_vec,
 
     A_ub = sparse.vstack([A1, A2], format="csr")
     b_ub = np.concatenate([b1, b2])
-
-    if usar_tope_etf:
-        A3 = sparse.csr_matrix(
-            np.concatenate([es_etf_banda.astype(float), [0.0], np.zeros(M)]).reshape(1, -1))
-        A_ub = sparse.vstack([A_ub, A3], format="csr")
-        b_ub = np.concatenate([b_ub, [PESO_MAX_ETFS]])
 
     A_eq = sparse.csr_matrix(
         np.concatenate([np.ones(n_), [0.0], np.zeros(M)]).reshape(1, -1))
@@ -2438,7 +2401,6 @@ def _retorno_min_factible(retorno_deseado, mu_vec, activos_permitidos=None, etiq
 retorno_min_deseado = (float(w_mkt @ mu_opt) if RETORNO_MIN_CVAR is None
                        else float(RETORNO_MIN_CVAR))
 retorno_min_efectivo = _retorno_min_factible(retorno_min_deseado, mu_opt,
-                                             activos_permitidos=activos_elegibles,
                                              etiqueta=" en el universo completo")
 
 # ==============================================================================
@@ -2467,7 +2429,7 @@ else:
 # ==============================================================================
 # SEGUNDA PASADA: RE-OPTIMIZACION SOBRE EL SOPORTE FINAL
 # ==============================================================================
-mask_final = aplicar_limites_cartera(w_bruto) & activos_elegibles
+mask_final = aplicar_limites_cartera(w_bruto)
 print(f"  Soporte final: {int(mask_final.sum())} activos "
       f"(umbral {UMBRAL_PESO_MIN:.1%}, maximo {MAX_TICKERS_FINAL})")
 
@@ -2497,32 +2459,37 @@ print(w_mvsk[w_mvsk > 0].sort_values(ascending=False).round(4).to_string())
 
 _regiones_bl = {}
 for _tk in tickers:
-    _regiones_bl.setdefault(md.region_de_ticker(_tk), []).append(_tk)
-for _region in ("Canada", "Europa", "Japon", "US"):
+    _reg = md.region_de_ticker(_tk)
+    if _reg == "US" and not pc.is_us_ticker(_tk):
+        _reg = "Otras bolsas"
+    _regiones_bl.setdefault(_reg, []).append(_tk)
+for _region in ("US", "Canada", "Europa", "Japon", "Otras bolsas"):
     _idx = _regiones_bl.get(_region, [])
     if _idx:
         print(f"  Peso {_region}: {w_mvsk.loc[_idx].sum() * 100:.1f}% "
               f"({len(_idx)} en la optimizacion)")
 
-_intl_en_opt = [a for a in tickers if a in _intl_set]
+_intl_en_opt = [a for a in tickers if not pc.is_us_ticker(a)]
 _intl_con_peso = [a for a in _intl_en_opt if w_mvsk[a] > 1e-4]
-print(f"  Internacionales en el universo: {_n_intl_universo} | "
-      f"en la optimizacion: {len(_intl_en_opt)} | con peso > 0: {len(_intl_con_peso)}")
-if _intl_con_peso:
-    print("  " + ", ".join(f"{a} {w_mvsk[a] * 100:.1f}%" for a in _intl_con_peso))
-else:
-    print("  Ningun internacional tiene peso. No hay piso de asignacion internacional.")
+if _intl_universo:
+    print(f"  Internacionales en el universo: {len(_intl_universo)} | "
+          f"en la optimizacion: {len(_intl_en_opt)} | con peso > 0: {len(_intl_con_peso)}")
+    if _intl_con_peso:
+        print("  " + ", ".join(f"{a} {w_mvsk[a] * 100:.1f}%" for a in _intl_con_peso))
+    else:
+        print("  Ningun internacional tiene peso. No hay piso de asignacion internacional.")
 
 # ==============================================================================
-# BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL (CONTROL)
+# BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL
 # ==============================================================================
+# Portafolio de control.
 
 print("\n" + "=" * 79)
 print("BLOQUE 8C: PORTAFOLIO MARKOWITZ TRADICIONAL (CONTROL)")
 print("=" * 79)
 
 
-def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO, mask_etf=None):
+def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO):
     """QP de media-varianza long-only con el MISMO tope por activo que el
     optimizador del Bloque 8B, para que la comparacion sea justa.
 
@@ -2533,38 +2500,27 @@ def markowitz_clasico(mu_vec, Sigma_arr, gamma, w_max=PESO_MAX_ACTIVO, mask_etf=
     """
     n_ = len(mu_vec)
     w_max = min(max(w_max, 1.0 / n_), 1.0)
-    tope_etf = usar_tope_etf and mask_etf is not None and bool(mask_etf.any())
     try:
         G = gamma * (Sigma_arr + Sigma_arr.T) / 2.0 + np.eye(n_) * 1e-8
         Amat = np.column_stack([np.ones(n_), np.eye(n_), -np.eye(n_)])
         bvec = np.concatenate([[1.0], np.zeros(n_), np.full(n_, -w_max)])
-        if tope_etf:
-            Amat = np.column_stack([Amat, -mask_etf.astype(float)])
-            bvec = np.concatenate([bvec, [-PESO_MAX_ETFS]])
         w = quadprog.solve_qp(G, mu_vec, Amat, bvec, meq=1)[0]
         return bm.clip_negligible_weights(w)
     except Exception as e:
         print(f"  quadprog fallo ({e}); se usa SLSQP")
         obj = lambda w: -(w @ mu_vec - (gamma / 2.0) * w @ Sigma_arr @ w)
         cons = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
-        if tope_etf:
-            cons.append({"type": "ineq", "fun": lambda w: PESO_MAX_ETFS - w[mask_etf].sum()})
         res = minimize(obj, np.full(n_, 1.0 / n_), method="SLSQP",
                        bounds=[(0.0, w_max)] * n_, constraints=cons)
         return bm.clip_negligible_weights(res.x)
 
 
-idx_eleg = np.where(activos_elegibles)[0]
-w_mkw_bruto = np.zeros(n)
-w_mkw_bruto[idx_eleg] = markowitz_clasico(mu_historico[idx_eleg],
-                                          Sigma_hist[np.ix_(idx_eleg, idx_eleg)], gamma_ra,
-                                          mask_etf=es_etf_banda[idx_eleg])
-mask_mkw = aplicar_limites_cartera(w_mkw_bruto) & activos_elegibles
+w_mkw_bruto = markowitz_clasico(mu_historico, Sigma_hist, gamma_ra)
+mask_mkw = aplicar_limites_cartera(w_mkw_bruto)
 
 idx_mkw = np.where(mask_mkw)[0]
 w_sub = markowitz_clasico(mu_historico[idx_mkw],
-                          Sigma_hist[np.ix_(idx_mkw, idx_mkw)], gamma_ra,
-                          mask_etf=es_etf_banda[idx_mkw])
+                          Sigma_hist[np.ix_(idx_mkw, idx_mkw)], gamma_ra)
 w_mkw = np.zeros(n)
 w_mkw[idx_mkw] = w_sub
 w_markowitz = pd.Series(w_mkw, index=tickers)
@@ -2583,8 +2539,9 @@ print(f"BLOQUE 9: METRICAS DE RIESGO DE COLA ({etiqueta_horizonte})")
 print("=" * 79)
 
 # ==============================================================================
-# PANEL HISTORICO DE RETORNOS AL HORIZONTE (VENTANAS SOLAPADAS)
+# PANEL HISTORICO DE RETORNOS AL HORIZONTE
 # ==============================================================================
+# Ventanas solapadas.
 ret_hist_horizonte = (retornos_dia[tickers]
                       .rolling(horizonte_dias)
                       .sum()
@@ -2808,14 +2765,15 @@ fecha_mdd_inicio = date(MDD_START_YEAR, 1, 1)
 series_ok = {}
 for tk in tickers_bl:
     serie = descargar_precio(tk, fecha_mdd_inicio, date.today(), fx_prices=fx_prices_diarios)
-    if serie is None or len(serie) == 0:
+    # BRK.B <-> BRK-B solo en EE. UU.: en un internacional el punto es la bolsa.
+    if (serie is None or len(serie) == 0) and pc.is_us_ticker(tk):
         alt = tk.replace(".", "-") if "." in tk else tk.replace("-", ".")
         serie = descargar_precio(alt, fecha_mdd_inicio, date.today(), fx_prices=fx_prices_diarios)
         if serie is not None and len(serie) > 0:
             print(f"  Nota: {tk} recuperado como {alt}")
-        else:
-            print(f"  Aviso: no se pudo obtener precio de {tk} para MDD - se excluye de este analisis")
-            continue
+    if serie is None or len(serie) == 0:
+        print(f"  Aviso: no se pudo obtener precio de {tk} para MDD - se excluye de este analisis")
+        continue
     series_ok[tk] = serie
 
 if len(series_ok) == 0:
@@ -2873,13 +2831,15 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
         mdd_clean = mdd_anual
 
     mdd_mediana = mdd_clean["mdd"].median()
-    mdd_p90 = mdd_clean["mdd"].quantile(0.90)
+    # MDD es negativo: el escenario conservador es la cola baja (P10). El P90
+    # quedaba mas leve que la mediana.
+    mdd_p10 = mdd_clean["mdd"].quantile(0.10)
     mdd_media = mdd_clean["mdd"].mean()
     mdd_peor = mdd_clean["mdd"].min()
     mdd_mejor = mdd_clean["mdd"].max()
 
     print(f"  Peor escenario historico:      {mdd_peor * 100:.2f}%")
-    print(f"  Escenario conservador (P90):   {mdd_p90 * 100:.2f}%")
+    print(f"  Escenario conservador (P10):   {mdd_p10 * 100:.2f}%")
     print(f"  Escenario tipico (mediana):    {mdd_mediana * 100:.2f}%")
     print(f"  Promedio:                      {mdd_media * 100:.2f}%")
     print(f"  Mejor escenario historico:     {mdd_mejor * 100:.2f}%")
@@ -2902,8 +2862,8 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
     fig.add_hline(y=mdd_mediana * 100, line_dash="dash", line_color="steelblue",
                   annotation_text=f"Mediana: {mdd_mediana * 100:.2f}%", annotation_position="top left",
                   annotation_font_color="steelblue")
-    fig.add_hline(y=mdd_p90 * 100, line_dash="dash", line_color="darkorange",
-                  annotation_text=f"P90: {mdd_p90 * 100:.2f}%", annotation_position="bottom left",
+    fig.add_hline(y=mdd_p10 * 100, line_dash="dash", line_color="darkorange",
+                  annotation_text=f"P10: {mdd_p10 * 100:.2f}%", annotation_position="bottom left",
                   annotation_font_color="darkorange")
     fig.update_layout(
         title=dict(text="Maximum Drawdown Historico - Portafolio BL + BKM<br>"

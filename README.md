@@ -119,18 +119,17 @@ POLYGON_CALLS_PER_MIN=1200
 
 ### ETFs in the resulting portfolio
 
-Every optimizer has a `True`/`False` switch that decides whether ETFs may appear in the **final portfolio**:
+Minimum variance and quadratic utility have a `True`/`False` switch that decides whether ETFs may appear in the **final portfolio**. Black-Litterman has none: its universe is whatever you put in `TICKERS`, ETFs included.
 
 | Script | Switch | ETF limit applied when `True` |
 |---|---|---|
 | `minimum_variance.py`, `minimum_variance_(seasonal_version).py` | `include_etfs_in_portfolio` | `etf_min_weight` – `etf_max_weight` (if `use_etf_constraint = True`) |
 | `quadratic_utility.py`, `quadratic_utility_(seasonal_version).py` | `include_etfs_in_portfolio` | `pct_etf_deseado` ± `pct_etf_tolerancia` |
-| `black_litterman.py` | `INCLUIR_ETFS` | `PESO_MAX_ETFS` (defaults to `1.00`, no cap) |
 
 - `True`: ETFs can be held, and their share stays within the limit shown above.
-- `False`: the final portfolio holds only stocks and commodities (`commodity_tickers` / `COMMODITY_TICKERS`, e.g. `SLV`, `UNG`, which stay eligible even though they trade as ETFs). The ETF limit no longer applies.
+- `False`: the final portfolio holds only stocks and commodities (`commodity_tickers`, e.g. `SLV`, `UNG`, which stay eligible even though they trade as ETFs). The ETF limit no longer applies.
 
-The switch only affects the final optimization. ETFs are still downloaded and used everywhere else: sector and country factors, covariance matrices, candidate filters and, in Black-Litterman, the market prior and the posterior. With `False` their weight is simply set to 0. Because this makes the eligible pool smaller, the scripts stop with a clear error if too few stocks/commodities remain to add up to 100% under the per-asset cap.
+The switch only affects the final optimization. ETFs are still downloaded and used everywhere else: sector and country factors, covariance matrices and candidate filters. With `False` their weight is simply set to 0. Because this makes the eligible pool smaller, the scripts stop with a clear error if too few stocks/commodities remain to add up to 100% under the per-asset cap.
 
 ---
 
@@ -178,7 +177,7 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 - The delta screen is off: an ATM call delta is above 0.5 whenever the strike is the spot, so `delta_min = 0.30` never removed a name.
 
 #### `black_litterman.py`
-**Black-Litterman** on a fixed domestic list (19 names) plus the shared international list. Exchange suffixes are not dropped by the US ticker-length check. Non-US names are not sent to Polygon (`sin_opciones_us`); their prices are converted to USD. There is no regional weight cap and no minimum international weight. `AMPM_SMOKE=1` keeps the three-name US universe.
+**Black-Litterman** on exactly the names in `TICKERS` (Block 0, section 1): stocks, ETFs or commodities, US or any other exchange with its Yahoo suffix (`AZN.L`, `7203.T`, `ASML.AS`, `0700.HK`). There is no separate international or ETF list and no ETF cap. Prices and market caps are converted to USD with the currency Yahoo reports (suffix as fallback); FX is downloaded only for the currencies in the universe, using `{CUR}USD=X` when the pair is not in `fx_pairs`. Non-US names are not sent to Polygon (`sin_opciones_us`) and use historical vol and moments. There is no regional weight cap and no minimum international weight. `FALLBACK_ETF_POR_TICKER` is empty by default; fill it only if you use `FALLBACK_MOMENTOS = "sector"`. `AMPM_SMOKE=1` runs a three-name US universe (`AMPM_SMOKE_TICKERS` overrides it).
 
 - Equilibrium returns `π = δ Σ w` from reverse CAPM. Market-cap weights are the reference. δ defaults to the historical estimate; see the methodology table.
 - Implied volatility from Polygon with an **SSVI** fit on `|k| <= 0.5` (`SSVI_K_ABS_MAX`), weighted by relative vega and open interest. The ATM vol is annual (`sqrt(total variance / T)`) and is **kept when the smile is rejected**. A fit with `|rho| >= 0.95` or without both wings (`SSVI_K_SIDE_MIN`, `SSVI_MIN_PER_SIDE`) is logged as degenerate and falls back to the ATM source: the wings are not integrated. An accepted smile feeds BKM over **±3 sigma** of the SSVI wings (`BKM_N_STD`), not over the `|k| <= 0.5` calibration window. Σ and the MFIV fallback are the horizon quantities (`bl_metrics`). The Q→P vol ratio is applied only when the vol source is implied (`ssvi` or `atm`). A historical vol is left as the horizon variance. MFIV-vs-ATM and the MFIK cap still apply.

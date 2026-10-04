@@ -14,11 +14,17 @@
 #      dia para los ~200 tickers.
 #   3. Semana parcial: la ultima observacion de un resample("W") se descarta
 #      si la semana no esta completa (B-6).
+#   4. Orden de los internacionales por market cap en USD antes de tomar el
+#      top N: la lista fija ponia primero los 15 .TO.
 # ==============================================================================
 
+import json
+import math
+import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import yfinance as yf
@@ -42,6 +48,12 @@ __all__ = [
     "default_spot_providers",
     "get_spot_history",
     "spot_series_for",
+    "default_market_cap_cache_path",
+    "yfinance_market_caps",
+    "yfinance_fx_rates",
+    "market_caps_usd",
+    "ordenar_por_market_cap",
+    "tabla_market_cap_texto",
 ]
 
 # Un solo hilo toca el reintento de un ticker. La descarga en bloque va
@@ -305,7 +317,6 @@ def dedupe_share_classes(tickers, groups=(("GOOGL", "GOOG"),)):
 # todos los tickers; lo que falte se reintenta en serie, bajo un lock.
 # Otro proveedor (FMP, mas adelante) entra como otro elemento de `providers`:
 # {"name", "batch", "single"}. No hay un segundo proveedor cableado ahora.
-# ==============================================================================
 
 def _naive_dates(values):
     dt = pd.to_datetime(values)
@@ -520,3 +531,279 @@ def spot_series_for(store, ticker):
     if not store:
         return None
     return store.get(ticker)
+
+
+# ==============================================================================
+# 4. ORDEN DE INTERNACIONALES POR MARKET CAP (USD)
+# ==============================================================================
+# yfinance da el market cap en la moneda de cotizacion. fast_info lo calcula
+# con el ultimo precio, asi que en unidad menor (GBp) viene x100: AZN.L da
+# 1.84e13 en fast_info y 1.84e11 en info. Se escala con price_scale_factor
+# de la moneda de fast_info; info ya viene en unidad mayor. La conversion a
+# USD usa la moneda del sufijo (currency_from_suffix) y los mismos pares FX
+# de los scripts. La cache guarda el cap local y el FX, cada uno con su TTL.
+
+MARKET_CAP_TTL_HORAS = 24 * 7
+FX_SPOT_TTL_HORAS = 24
+_CACHE_LOCK = threading.Lock()
+
+
+def default_market_cap_cache_path():
+    """Cache compartida entre corridas, fuera del repositorio. "" la desactiva."""
+    ruta = os.environ.get("AMPM_MARKET_CAP_CACHE")
+    if ruta is not None:
+        return ruta or None
+    return os.path.join(os.path.expanduser("~"), ".cache", "am-pm", "market_cap.json")
+
+
+def _leer_cache(ruta):
+    if not ruta:
+        return {}
+    try:
+        with open(ruta, encoding="utf-8") as fh:
+            datos = json.load(fh)
+        return datos if isinstance(datos, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _escribir_cache(ruta, datos):
+    if not ruta:
+        return
+    try:
+        os.makedirs(os.path.dirname(ruta) or ".", exist_ok=True)
+        tmp = f"{ruta}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(datos, fh)
+        os.replace(tmp, ruta)
+    except OSError:
+        pass
+
+
+def _vigente(entrada, ahora, ttl_horas):
+    try:
+        return ahora - float(entrada["ts"]) <= ttl_horas * 3600.0 and math.isfinite(float(entrada["valor"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _positivo(valor):
+    try:
+        num = float(valor)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) and num > 0 else None
+
+
+def _campo(obj, *nombres):
+    for nombre in nombres:
+        try:
+            valor = obj[nombre] if hasattr(obj, "__getitem__") else getattr(obj, nombre)
+        except Exception:
+            valor = getattr(obj, nombre, None)
+        if valor is not None:
+            return valor
+    return None
+
+
+def _market_cap_yf(ticker_obj):
+    """Market cap en unidad mayor de la moneda de cotizacion, o None."""
+    try:
+        fi = ticker_obj.fast_info
+        cap = _positivo(_campo(fi, "marketCap", "market_cap"))
+        if cap is not None:
+            return cap * price_scale_factor(_campo(fi, "currency"))
+    except Exception:
+        pass
+    try:
+        return _positivo((ticker_obj.info or {}).get("marketCap"))
+    except Exception:
+        return None
+
+
+def yfinance_market_caps(tickers, max_workers=8):
+    """{ticker: cap en unidad mayor local}, todo el lote en hilos.
+
+    Los que no traen dato no aparecen.
+    """
+    tickers = list(dict.fromkeys(tickers))
+    if not tickers:
+        return {}
+
+    def _uno(t):
+        return t, _market_cap_yf(yf.Ticker(t))
+
+    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), len(tickers)))) as ex:
+        return {t: cap for t, cap in ex.map(_uno, tickers) if cap is not None}
+
+
+def yfinance_fx_rates(fx_pairs):
+    """USD por unidad local con el ultimo cierre de cada par, en una descarga."""
+    if not fx_pairs:
+        return {}
+    pares = {cur: info["ticker"] for cur, info in fx_pairs.items()}
+    raw = yf.download(list(dict.fromkeys(pares.values())), period="10d", interval="1d",
+                      auto_adjust=True, progress=False, threads=False, group_by="column")
+    out = {}
+    if raw is None or len(raw) == 0:
+        return out
+    cierre = raw["Close"] if "Close" in raw.columns.get_level_values(0) else raw
+    for cur, tk in pares.items():
+        try:
+            serie = cierre[tk] if isinstance(cierre, pd.DataFrame) else cierre
+        except KeyError:
+            continue
+        serie = pd.to_numeric(serie, errors="coerce").dropna()
+        valor = _positivo(serie.iloc[-1]) if len(serie) else None
+        if valor is None:
+            continue
+        out[cur] = 1.0 / valor if fx_pairs[cur].get("invert") else valor
+    return out
+
+
+def _con_reintentos(funcion, pendientes, retries, backoff, sleep):
+    """Llama `funcion(pendientes)` hasta `retries` veces con los que sigan faltando.
+
+    Una excepcion cuenta como intento sin datos. Devuelve el dict acumulado.
+    """
+    obtenido = {}
+    faltan = list(pendientes)
+    espera = float(backoff)
+    for intento in range(max(1, int(retries))):
+        if not faltan:
+            break
+        if intento:
+            sleep(espera)
+            espera *= 2.0
+        try:
+            nuevo = funcion(list(faltan)) or {}
+        except Exception:
+            nuevo = {}
+        for k, v in nuevo.items():
+            if k in faltan and _positivo(v) is not None:
+                obtenido[k] = float(v)
+        faltan = [k for k in faltan if k not in obtenido]
+    return obtenido
+
+
+def market_caps_usd(tickers, suffix_map, fx_pairs, cap_provider=None, fx_provider=None,
+                    cache_path="default", retries=3, backoff=1.0, sleep=None, now=None,
+                    cap_ttl_hours=MARKET_CAP_TTL_HORAS, fx_ttl_hours=FX_SPOT_TTL_HORAS,
+                    monedas=None):
+    """Market cap en USD por ticker (None si falta el cap o el FX de su moneda).
+
+    `cap_provider(tickers) -> {ticker: cap local}` se llama en lote solo con
+    los que no estan en cache, y se reintenta con los que falten.
+    `fx_provider(fx_pairs) -> {moneda: USD por unidad}` igual. Moneda:
+    `monedas[ticker]` si se da (la que reporta el proveedor de precios); si
+    no, por sufijo; sin sufijo conocido (HSBC, BP) es USD.
+    Devuelve {"usd": {...}, "moneda": {...}, "llamadas": n}.
+    """
+    sleep = time.sleep if sleep is None else sleep
+    cap_provider = yfinance_market_caps if cap_provider is None else cap_provider
+    fx_provider = yfinance_fx_rates if fx_provider is None else fx_provider
+    ruta = default_market_cap_cache_path() if cache_path == "default" else cache_path
+    ahora = time.time() if now is None else float(now)
+    orden = list(dict.fromkeys(tickers))
+    monedas = monedas or {}
+    moneda = {t: normalize_currency(monedas.get(t)) or currency_from_suffix(t, suffix_map) or "USD"
+              for t in orden}
+    llamadas = 0
+
+    with _CACHE_LOCK:
+        cache = _leer_cache(ruta)
+    caps_cache = cache.get("cap", {}) if isinstance(cache.get("cap"), dict) else {}
+    fx_cache = cache.get("fx", {}) if isinstance(cache.get("fx"), dict) else {}
+
+    caps = {t: float(caps_cache[t]["valor"]) for t in orden
+            if t in caps_cache and _vigente(caps_cache[t], ahora, cap_ttl_hours)}
+    faltan = [t for t in orden if t not in caps]
+    if faltan:
+        def _llamar_caps(lista):
+            nonlocal llamadas
+            llamadas += 1
+            return cap_provider(lista)
+        nuevos = _con_reintentos(_llamar_caps, faltan, retries, backoff, sleep)
+        caps.update(nuevos)
+        for t, v in nuevos.items():
+            caps_cache[t] = {"valor": v, "ts": ahora}
+
+    monedas = sorted({m for m in moneda.values() if m != "USD"})
+    fx = {m: float(fx_cache[m]["valor"]) for m in monedas
+          if m in fx_cache and _vigente(fx_cache[m], ahora, fx_ttl_hours)}
+    fx_faltan = [m for m in monedas if m not in fx and m in (fx_pairs or {})]
+    if fx_faltan:
+        def _llamar_fx(lista):
+            nonlocal llamadas
+            llamadas += 1
+            return fx_provider({m: fx_pairs[m] for m in lista})
+        nuevos_fx = _con_reintentos(_llamar_fx, fx_faltan, retries, backoff, sleep)
+        fx.update(nuevos_fx)
+        for m, v in nuevos_fx.items():
+            fx_cache[m] = {"valor": v, "ts": ahora}
+    fx["USD"] = 1.0
+
+    if faltan or fx_faltan:
+        with _CACHE_LOCK:
+            _escribir_cache(ruta, {"cap": caps_cache, "fx": fx_cache})
+
+    usd = {}
+    for t in orden:
+        cap, tasa = caps.get(t), fx.get(moneda[t])
+        usd[t] = cap * tasa if cap is not None and tasa is not None else None
+    return {"usd": usd, "moneda": moneda, "llamadas": llamadas}
+
+
+def ordenar_por_market_cap(tickers, n_top, suffix_map, fx_pairs, **kwargs):
+    """Top `n_top` de `tickers` por market cap en USD, de mayor a menor.
+
+    Los que no traen market cap (o FX) van al final en su orden original.
+    Si ninguno trae dato (yfinance caido), se conserva el orden de la lista
+    y `aviso` lo explica. Los kwargs van a market_caps_usd.
+    Devuelve {"seleccion", "orden", "tabla", "aviso"}; `tabla` tiene
+    ticker, market_cap_usd, moneda y region de la seleccion.
+    """
+    orden_original = list(dict.fromkeys(tickers))
+    n = max(0, min(int(n_top), len(orden_original)))
+    aviso = None
+    try:
+        res = market_caps_usd(orden_original, suffix_map, fx_pairs, **kwargs)
+        usd, moneda = res["usd"], res["moneda"]
+    except Exception as exc:
+        usd = {t: None for t in orden_original}
+        moneda = {t: currency_from_suffix(t, suffix_map) or "USD" for t in orden_original}
+        aviso = f"fallo la consulta de market cap ({type(exc).__name__}: {exc})"
+
+    con_dato = [t for t in orden_original if usd.get(t) is not None]
+    if not con_dato:
+        orden = orden_original
+        aviso = (aviso or "yfinance no devolvio market cap para ningun internacional") + \
+            "; se usa el orden actual de la lista"
+    else:
+        pos = {t: i for i, t in enumerate(orden_original)}
+        con_dato = sorted(con_dato, key=lambda t: (-usd[t], pos[t]))
+        sin_dato = [t for t in orden_original if usd.get(t) is None]
+        orden = con_dato + sin_dato
+        if sin_dato:
+            aviso = (f"{len(sin_dato)} sin market cap en USD (van al final, en el orden de la lista): "
+                     + ", ".join(sin_dato))
+
+    seleccion = orden[:n]
+    tabla = pd.DataFrame({
+        "ticker": seleccion,
+        "market_cap_usd": [usd.get(t) for t in seleccion],
+        "moneda": [moneda.get(t) for t in seleccion],
+        "region": [region_de_ticker(t) for t in seleccion],
+    })
+    return {"seleccion": seleccion, "orden": orden, "tabla": tabla, "aviso": aviso}
+
+
+def tabla_market_cap_texto(resultado, sangria="  "):
+    """Tabla legible del top elegido: ticker, market cap en USD (miles de millones) y region."""
+    disp = resultado["tabla"].copy()
+    disp["market_cap_usd"] = disp["market_cap_usd"].map(
+        lambda x: f"{x / 1e9:,.1f} B" if x is not None and pd.notna(x) else "sin dato")
+    disp = disp.rename(columns={"ticker": "Ticker", "market_cap_usd": "MarketCap_USD",
+                                "moneda": "Moneda", "region": "Region"})
+    disp.index = range(1, len(disp) + 1)
+    return sangria + disp.to_string().replace("\n", "\n" + sangria)

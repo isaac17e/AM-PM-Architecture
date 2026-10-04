@@ -242,6 +242,16 @@ max_region_weight = 0.80
 # ------------------------------------------------------------------------------
 pct_etf_deseado = 0.10
 pct_etf_tolerancia = 0.10
+# Piso de la banda alcanzable: hacen falta ceil(piso / max_weight) ETF en el
+# optimizador. Si los filtros dejan menos, se completan con ETF de etapas
+# previas que superen los filtros duros (ver PRECEDENCIA en el filtro
+# estacional). Se reservan hasta este multiplo de los ETF necesarios desde el
+# pre-filtro.
+etf_floor_reserve_factor = 3
+# Si aun asi la banda no se puede cumplir: True baja el piso al maximo
+# alcanzable (n_ETF x max_weight) y lo avisa; False detiene la corrida con
+# el diagnostico en vez del "constraints are inconsistent" de quadprog.
+etf_band_relax_if_infeasible = True
 
 # ------------------------------------------------------------------------------
 # ETFs EN EL PORTAFOLIO RESULTANTE
@@ -264,6 +274,8 @@ if not (0 <= pct_etf_deseado <= 1):
     raise ValueError("Error: pct_etf_deseado debe estar entre 0 y 1 (ej. 0.30 = 30%)")
 if not (0 <= pct_etf_tolerancia <= 0.5):
     raise ValueError("Error: pct_etf_tolerancia debe estar entre 0 y 0.5")
+if not (isinstance(etf_floor_reserve_factor, int) and etf_floor_reserve_factor >= 1):
+    raise ValueError("Error: etf_floor_reserve_factor debe ser un entero >= 1")
 if delta_strike_mode not in ("atm", "mu", "rf", "otm"):
     raise ValueError("Error: delta_strike_mode debe ser atm, mu, rf u otm")
 if delta_scale_mode not in ("direct", "fixed", "minmax", "relative"):
@@ -902,8 +914,6 @@ international_tickers_full = [
     "6902.T", "4502.T", "8031.T",
 ]
 
-international_tickers = international_tickers_full[:n_top_int]
-
 # ==============================================================================
 # MAPEO DE MONEDA POR SUFIJO DE TICKER + PARES FX (para conversion a USD)
 # ==============================================================================
@@ -940,6 +950,19 @@ def get_currency_for_ticker(ticker):
         if ticker.endswith(suf):
             return cur
     return "USD"
+
+
+# Top n_top_int por market cap en USD, no por la posicion en la lista. Sin
+# market cap van al final en su orden; si yfinance falla por completo se usa
+# el orden de la lista. No hay peso minimo internacional.
+_mc_intl = md.ordenar_por_market_cap(international_tickers_full, n_top_int,
+                                     ticker_currency_by_suffix, fx_pairs)
+international_tickers = _mc_intl["seleccion"]
+print(f"\nInternacionales: top {len(international_tickers)} de {len(international_tickers_full)} "
+      "por market cap (USD):")
+print(md.tabla_market_cap_texto(_mc_intl))
+if _mc_intl["aviso"]:
+    print(f"ADVERTENCIA: market cap internacional: {_mc_intl['aviso']}")
 
 # ==============================================================================
 # COMBINAR Y LIMPIAR
@@ -1381,13 +1404,44 @@ def select_optimal_candidates(df, n_candidates):
              .sort_values("h_score", ascending=False)
              .head(10)[["symbol", "sharpe_ratio_adjusted", "sd_return", "avg_cor", "n_obs", "h_score"]])
     print(top10.to_string(index=False))
-    return selected
+    return selected, list(df_candidates["symbol"])
 
 
 # Una sola pasada QUBO (M-13). La primera llamada y el filtro estacional que
 # la seguia se sobreescribian de inmediato con esta misma seleccion.
-ticker_candidates = select_optimal_candidates(combined_stats, n_pre_seasonal)
+ticker_candidates, prefilter_ranking = select_optimal_candidates(combined_stats, n_pre_seasonal)
 print(f"\nPool pre-filtro estacional: {len(ticker_candidates)} candidatos\n")
+
+# ==============================================================================
+# PISO DE ETF: CUANTOS HACEN FALTA Y RESERVA DESDE EL PRE-FILTRO
+# ==============================================================================
+# Misma logica que quadratic_utility.py (E-1). La banda de ETF solo se aplica
+# con include_etfs_in_portfolio. Con piso 0.45 y max_weight 0.12 hacen falta
+# 4 ETF en el optimizador; con 3 (FXI, GLD, MCHI = 36%) quadprog fallaba con
+# "constraints are inconsistent". La reserva son ETF que la QUBO no eligio, en
+# orden de h_score, y luego el resto de ETF elegibles con el mismo criterio.
+# Pasan por Polygon y el filtro delta, pero solo entran al flujo si el piso
+# de ETF los necesita.
+etf_group_set = set(etf_tickers + commodity_tickers)
+etf_band_floor_cfg = max(0.0, pct_etf_deseado - pct_etf_tolerancia) if include_etfs_in_portfolio else 0.0
+n_etf_needed = qm.etfs_necesarios(etf_band_floor_cfg, max_weight)
+n_etf_prefilter = qm.contar_etfs(ticker_candidates, etf_group_set)
+etf_reserva = []
+if n_etf_needed > 0:
+    _eleg = combined_stats[(combined_stats["n_obs"] >= min_observations) & (combined_stats["sd_return"] > 0)
+                           & combined_stats["sharpe_ratio_adjusted"].notna()
+                           & np.isfinite(combined_stats["sharpe_ratio_adjusted"])].copy()
+    _sr, _sd = _eleg["sharpe_ratio_adjusted"], _eleg["sd_return"]
+    _h_eleg = (weight_sharpe * ((_sr - _sr.min()) / (_sr.max() - _sr.min())).fillna(0.5)
+               + weight_low_vol * (1 - (_sd - _sd.min()) / (_sd.max() - _sd.min())).fillna(0.5))
+    if "data_quality_penalty" in _eleg.columns:
+        _h_eleg = _h_eleg * _eleg["data_quality_penalty"]
+    _orden_eleg = _eleg.assign(_h=_h_eleg).sort_values("_h", ascending=False)["symbol"].tolist()
+    etf_reserva = qm.reserva_etf(prefilter_ranking + _orden_eleg, ticker_candidates, etf_group_set,
+                                 etf_floor_reserve_factor * n_etf_needed)
+    print(f"Piso de ETF: {etf_band_floor_cfg * 100:.0f}% con max_weight {max_weight:.2f} -> "
+          f"{n_etf_needed} ETF necesarios | en el pre-filtro: {n_etf_prefilter} | "
+          f"reserva: {len(etf_reserva)}{' (' + ', '.join(etf_reserva) + ')' if etf_reserva else ''}\n")
 
 # ==============================================================================
 # DATOS DE MERCADO VIA POLYGON (IV, GRIEGAS, SECTOR)
@@ -1414,6 +1468,16 @@ if "ok" not in polygon_market_df.columns:
 
 n_polygon_ok = polygon_market_df["ok"].fillna(False).sum()
 print(f"  Datos de opciones obtenidos: {n_polygon_ok} de {len(us_candidates)} tickers US")
+
+us_reserva = [t for t in etf_reserva if is_us_ticker(t) and t not in polygon_market_list]
+if us_reserva:
+    for tk in us_reserva:
+        polygon_market_list[tk] = {"symbol": tk, **polygon_get_atm_option(tk, target_dte_polygon, polygon_dte_tol)}
+    polygon_market_df = pd.DataFrame(list(polygon_market_list.values()))
+    if "ok" not in polygon_market_df.columns:
+        polygon_market_df["ok"] = False
+    n_res_ok = int(polygon_market_df.loc[polygon_market_df["symbol"].isin(us_reserva), "ok"].fillna(False).sum())
+    print(f"  Reserva de ETF: opciones de {n_res_ok} de {len(us_reserva)} (no cuentan en el pool)")
 
 stock_us_candidates = [t for t in us_candidates if t not in (etf_tickers + commodity_tickers)]
 print(f"  Clasificando sector de {len(stock_us_candidates)} acciones US (Polygon SIC)...")
@@ -1480,12 +1544,13 @@ if use_delta_filter:
 
     T_horizon = horizon_months / 12
 
+    _delta_universo = list(dict.fromkeys(ticker_candidates + etf_reserva))
     mu_for_delta = (
-        df_prices[df_prices["symbol"].isin(ticker_candidates)]
+        df_prices[df_prices["symbol"].isin(_delta_universo)]
         .groupby("symbol")["monthly_return"].mean().rename("mu_monthly").reset_index()
     )
     hist_vol_for_delta = (
-        df_prices[df_prices["symbol"].isin(ticker_candidates)]
+        df_prices[df_prices["symbol"].isin(_delta_universo)]
         .groupby("symbol")["monthly_return"].std().mul(math.sqrt(12)).rename("vol_hist").reset_index()
     )
 
@@ -1497,7 +1562,7 @@ if use_delta_filter:
         print(f"   Log-moneyness OTM efectiva: {m_otm:.4f} "
               f"(base {delta_otm_log_m:.4f} a {delta_otm_ref_months:g} meses)")
 
-    for ticker in ticker_candidates:
+    for ticker in _delta_universo:
         usa_polygon = ticker in poly_ok_set
         fila_poly = None
         if usa_polygon:
@@ -1523,6 +1588,14 @@ if use_delta_filter:
 
     delta_df = pd.DataFrame(delta_rows)
     delta_named = dict(zip(delta_df["symbol"], delta_df["delta"]))
+    # La reserva de ETF pasa el mismo filtro, pero no entra a los conteos.
+    _es_reserva = delta_df["symbol"].isin(set(etf_reserva) - set(ticker_candidates))
+    delta_df_reserva = delta_df[_es_reserva].copy()
+    delta_df = delta_df[~_es_reserva].copy()
+    etf_reserva = delta_df_reserva.loc[
+        delta_df_reserva["delta"].map(lambda d: qm.pasa_filtro_delta(d, delta_min)), "symbol"].tolist()
+    if len(delta_df_reserva):
+        print(f"  Reserva de ETF tras filtro Delta: {len(etf_reserva)} de {len(delta_df_reserva)}")
 
     n_delta_ok = delta_df["delta"].notna().sum()
     n_delta_na = delta_df["delta"].isna().sum()
@@ -1567,17 +1640,22 @@ else:
 # ==============================================================================
 print(f"Aplicando filtro estacional ({horizon_label}) - exclusion por umbral (ratio max={seasonal_vol_ratio_max:.2f}x)...")
 
-seasonal_ratio_stats = (
-    seasonal_sd_stats[seasonal_sd_stats["symbol"].isin(ticker_candidates)]
-    .merge(combined_stats[["symbol", "sharpe_ratio_adjusted", "sd_return", "n_obs"]], on="symbol", how="left")
-)
-seasonal_ratio_stats = seasonal_ratio_stats[seasonal_ratio_stats["sd_return"].notna() & (seasonal_ratio_stats["sd_return"] > 0)].copy()
-seasonal_ratio_stats["seasonal_vol_anual"] = seasonal_ratio_stats["seasonal_sd"] * math.sqrt(52)
-seasonal_ratio_stats["general_vol_anual"] = seasonal_ratio_stats["sd_return"] * math.sqrt(12)
-seasonal_ratio_stats["seasonal_vol_ratio"] = (
-    seasonal_ratio_stats["seasonal_vol_anual"] / seasonal_ratio_stats["general_vol_anual"]
-)
-seasonal_ratio_stats = seasonal_ratio_stats.sort_values("seasonal_vol_ratio")
+def tabla_ratio_estacional(tickers):
+    """Vol. estacional / vol. general anual de `tickers`, en orden ascendente de ratio."""
+    tabla = (
+        seasonal_sd_stats[seasonal_sd_stats["symbol"].isin(tickers)]
+        .merge(combined_stats[["symbol", "sharpe_ratio_adjusted", "sd_return", "n_obs"]], on="symbol", how="left")
+    )
+    tabla = tabla[tabla["sd_return"].notna() & (tabla["sd_return"] > 0)].copy()
+    tabla["seasonal_vol_anual"] = tabla["seasonal_sd"] * math.sqrt(52)
+    tabla["general_vol_anual"] = tabla["sd_return"] * math.sqrt(12)
+    tabla["seasonal_vol_ratio"] = tabla["seasonal_vol_anual"] / tabla["general_vol_anual"]
+    return tabla.sort_values("seasonal_vol_ratio")
+
+
+seasonal_ratio_stats = tabla_ratio_estacional(ticker_candidates)
+# Reserva de ETF (solo para el piso de ETF), con el mismo ratio para ordenarla.
+reserva_ratio_stats = tabla_ratio_estacional([t for t in etf_reserva if t not in set(ticker_candidates)])
 
 n_pool_post_delta = len(ticker_candidates)
 n_con_seasonal = len(seasonal_ratio_stats)
@@ -1610,7 +1688,37 @@ print(disp.rename(columns={"symbol": "Symbol", "seasonal_n_obs": "Semanas", "n_o
       [["Symbol", "SD_Estacional", "Semanas", "SD_General", "Ratio_Anualizado", "Sharpe", "Obs_Mensuales"]]
       .to_string(index=False))
 
-ticker_candidates = seasonal_candidates["symbol"].tolist()
+# PRECEDENCIA DE LAS REPOSICIONES (piso de ETF y MFIS), igual que en
+# quadratic_utility.py:
+#   1. Delta y MFIS son filtros duros. Ninguna reposicion trae de vuelta un
+#      nombre que alguno de ellos ya descarto: el pool es post-delta, la
+#      reserva paso el mismo filtro delta y los descartados por MFIS no
+#      vuelven. (Esta version no tiene filtro de IV vs vol. reciente.)
+#   2. El umbral estacional y el techo n_divers_candidates son blandos, igual
+#      que en su piso de sobrevivientes: se repone en orden ascendente de ratio.
+#   3. Piso de ETF: si quedan menos de n_etf_needed ETF, se completan ETF del
+#      pool post-delta y luego de la reserva del pre-filtro.
+#   4. Si el piso de ETF sigue sin alcanzarse, el chequeo previo a quadprog
+#      relaja la banda (o detiene la corrida) con un aviso explicito.
+orden_reposicion = seasonal_ratio_stats.sort_values("seasonal_vol_ratio")["symbol"].tolist()
+orden_reposicion_etf = orden_reposicion + reserva_ratio_stats["symbol"].tolist()
+
+seasonal_keep = seasonal_candidates["symbol"].tolist()
+etf_piso_agregados = []
+n_etf_estacional = qm.contar_etfs(seasonal_keep, etf_group_set)
+if n_etf_needed > n_etf_estacional:
+    pool_etf_piso = qm.candidatos_reposicion(orden_reposicion_etf, seasonal_keep)
+    etf_piso_agregados = qm.completar_etfs(seasonal_keep, pool_etf_piso, etf_group_set, n_etf_needed)
+    print(f"  Piso de ETF: {n_etf_estacional} ETF tras filtro estacional, se necesitan {n_etf_needed} "
+          f"(piso {etf_band_floor_cfg * 100:.0f}% / max_weight {max_weight:.2f})")
+    if etf_piso_agregados:
+        print(f"  Agregando {len(etf_piso_agregados)} ETF que superan los filtros duros: "
+              f"{', '.join(etf_piso_agregados)}")
+    if n_etf_estacional + len(etf_piso_agregados) < n_etf_needed:
+        print(f"  ADVERTENCIA: no quedan mas ETF que superen los filtros duros "
+              f"({n_etf_estacional + len(etf_piso_agregados)} de {n_etf_needed}); se revisa antes de optimizar")
+
+ticker_candidates = list(dict.fromkeys(seasonal_keep + etf_piso_agregados))
 print(f"\nConjunto FINAL para optimizacion: {len(ticker_candidates)} tickers\n")
 
 # ==============================================================================
@@ -1625,10 +1733,10 @@ sample_dates_bkm = sample_dates_bkm[sample_dates_bkm >= hoy_ts - relativedelta(m
 print(f"   Fechas de muestreo historico: {len(sample_dates_bkm)} (freq={bkm_hist_sample_freq}, "
       f"ancladas a {bkm_hist_anchor})")
 
-reponer_pool_bkm = (
-    seasonal_ratio_stats[~seasonal_ratio_stats["symbol"].isin(ticker_candidates)]
-    .sort_values("seasonal_vol_ratio")["symbol"].tolist()
-)
+# Mismo orden que la reposicion del filtro estacional (ver PRECEDENCIA).
+reponer_pool_bkm = qm.candidatos_reposicion(orden_reposicion, ticker_candidates)
+# Solo para el piso de ETF: incluye la reserva del pre-filtro.
+reponer_pool_bkm_etf = qm.candidatos_reposicion(orden_reposicion_etf, ticker_candidates)
 
 bkm_current_moments = {}
 bkm_spot_series = {}
@@ -1794,6 +1902,7 @@ print(f"   Presupuesto: {bkm_hist_max_minutes:g} min"
 full_set = list(ticker_candidates)
 resultados_log = []
 i_reponer = 0
+usados_reponer_bkm = set()
 por_evaluar = list(ticker_candidates)
 ronda_bkm = 1
 t0_bkm = time.perf_counter()
@@ -1847,10 +1956,21 @@ while por_evaluar:
         print(f"   Descartado por MFIS anomalo: {d['symbol']} (z={d['z']:.2f})")
         full_set = [s for s in full_set if s != d["symbol"]]
 
-        if len(full_set) + len(reemplazos_nuevos) < bkm_min_survivors and i_reponer < len(reponer_pool_bkm):
-            reemplazo = reponer_pool_bkm[i_reponer]
-            i_reponer += 1
-            print(f"   Reponiendo con: {reemplazo} (pool estacional validado)")
+        actuales_bkm = full_set + reemplazos_nuevos
+        ocupados_bkm = usados_reponer_bkm | set(actuales_bkm)
+        reemplazo = None
+        if qm.contar_etfs(actuales_bkm, etf_group_set) < n_etf_needed:
+            reemplazo = qm.siguiente_reposicion(
+                reponer_pool_bkm_etf, ocupados_bkm, etf_group_set, solo_etf=True)
+            if reemplazo is not None:
+                print(f"   Reponiendo con: {reemplazo} (ETF para el piso de la banda)")
+        if reemplazo is None and len(actuales_bkm) < bkm_min_survivors:
+            reemplazo = qm.siguiente_reposicion(reponer_pool_bkm, ocupados_bkm)
+            if reemplazo is not None:
+                print(f"   Reponiendo con: {reemplazo} (pool estacional validado)")
+        if reemplazo is not None:
+            usados_reponer_bkm.add(reemplazo)
+            i_reponer = len(usados_reponer_bkm)
             reemplazos_nuevos.append(reemplazo)
 
     if not reemplazos_nuevos:
@@ -2369,53 +2489,96 @@ print(f"   Delta scaling aplicado - activos con delta real: {int((~pd.isna(delta
       f"fallback (sin penalizacion): {int(pd.isna(delta_aligned).sum())}")
 print("   Penalizacion de cola sobre mu: ELIMINADA (MFIS/MFIK son momentos Q sin calibrar)")
 
-A_cols = []
-b_vals = []
-
-A_cols.append(np.ones(n))
-b_vals.append(1.0)
-
-for i in range(n):
-    v = np.zeros(n)
-    v[i] = 1
-    A_cols.append(v)
-    b_vals.append(0.0)
-
-for i in range(n):
-    v = np.zeros(n)
-    v[i] = -1
-    A_cols.append(v)
-    b_vals.append(0.0 if i in excluded_etf_set else -max_weight)
-
-if include_etfs_in_portfolio and len(etf_commodity_assets) > 0 and len(stock_assets) > 0:
-    etf_lo = max(0, pct_etf_deseado - pct_etf_tolerancia)
-    etf_hi = min(1, pct_etf_deseado + pct_etf_tolerancia)
-    stk_lo = 1 - etf_hi
-    stk_hi = 1 - etf_lo
-
-    v_etf_lo = np.zeros(n); v_etf_lo[etf_commodity_assets] = 1
-    v_etf_hi = np.zeros(n); v_etf_hi[etf_commodity_assets] = -1
-    v_stk_lo = np.zeros(n); v_stk_lo[stock_assets] = 1
-    v_stk_hi = np.zeros(n); v_stk_hi[stock_assets] = -1
-    A_cols += [v_etf_lo, v_etf_hi, v_stk_lo, v_stk_hi]
-    b_vals += [etf_lo, -etf_hi, stk_lo, -stk_hi]
-
-    print(f"   Restriccion ETFs: {etf_lo * 100:.0f}% - {etf_hi * 100:.0f}% del portafolio "
-          f"(objetivo {pct_etf_deseado * 100:.0f}% +/- {pct_etf_tolerancia * 100:.0f}%)")
-
+etf_band_active = include_etfs_in_portfolio and len(etf_commodity_assets) > 0 and len(stock_assets) > 0
+etf_lo = max(0, pct_etf_deseado - pct_etf_tolerancia)
+etf_hi = min(1, pct_etf_deseado + pct_etf_tolerancia)
+etf_band_relaxed = False
+if include_etfs_in_portfolio and not etf_band_active and etf_lo > 0:
+    print(f"   ADVERTENCIA: banda de ETF {etf_lo * 100:.0f}%-{etf_hi * 100:.0f}% sin aplicar: "
+          f"{len(etf_commodity_assets)} ETF y {len(stock_assets)} acciones en el optimizador")
 geo_groups = {"Canada": canada_assets, "Europa": europe_assets, "Japon": japan_assets}
 
-for region_name, idx_region in geo_groups.items():
-    if len(idx_region) > 0:
-        v_geo = np.zeros(n)
-        v_geo[idx_region] = -1
-        A_cols.append(v_geo)
-        b_vals.append(-max_region_weight)
-        print(f"   Restriccion {region_name}: max {max_region_weight * 100:.0f}% del portafolio")
 
-Amat = np.column_stack(A_cols)
-bvec = np.array(b_vals)
+def armar_restricciones(etf_lo_, etf_hi_, verbose=True):
+    """Columnas de quadprog: suma 1, 0 <= w <= max_weight, banda de ETF y regiones."""
+    A_cols = [np.ones(n)]
+    b_vals = [1.0]
+    for i in range(n):
+        v = np.zeros(n)
+        v[i] = 1
+        A_cols.append(v)
+        b_vals.append(0.0)
+    for i in range(n):
+        v = np.zeros(n)
+        v[i] = -1
+        A_cols.append(v)
+        b_vals.append(0.0 if i in excluded_etf_set else -max_weight)
+    if etf_band_active:
+        stk_lo = 1 - etf_hi_
+        stk_hi = 1 - etf_lo_
+        v_etf_lo = np.zeros(n); v_etf_lo[etf_commodity_assets] = 1
+        v_etf_hi = np.zeros(n); v_etf_hi[etf_commodity_assets] = -1
+        v_stk_lo = np.zeros(n); v_stk_lo[stock_assets] = 1
+        v_stk_hi = np.zeros(n); v_stk_hi[stock_assets] = -1
+        A_cols += [v_etf_lo, v_etf_hi, v_stk_lo, v_stk_hi]
+        b_vals += [etf_lo_, -etf_hi_, stk_lo, -stk_hi]
+        if verbose:
+            print(f"   Restriccion ETFs: {etf_lo_ * 100:.0f}% - {etf_hi_ * 100:.0f}% del portafolio "
+                  f"(objetivo {pct_etf_deseado * 100:.0f}% +/- {pct_etf_tolerancia * 100:.0f}%)")
+    for region_name, idx_region in geo_groups.items():
+        if len(idx_region) > 0:
+            v_geo = np.zeros(n)
+            v_geo[idx_region] = -1
+            A_cols.append(v_geo)
+            b_vals.append(-max_region_weight)
+            if verbose:
+                print(f"   Restriccion {region_name}: max {max_region_weight * 100:.0f}% del portafolio")
+    return np.column_stack(A_cols), np.array(b_vals)
+
+
 meq = 1
+Amat, bvec = armar_restricciones(etf_lo, etf_hi)
+
+# ------------------------------------------------------------------------------
+# CHEQUEO DE FACTIBILIDAD ANTES DE quadprog
+# ------------------------------------------------------------------------------
+# quadprog solo dice "constraints are inconsistent". Aqui se prueba el mismo
+# conjunto con un LP y, si no cierra, se explica por que. Con banda de ETF y
+# etf_band_relax_if_infeasible = True, la banda se lleva a lo alcanzable
+# (piso = n_ETF x max_weight; techo = 1 - n_acciones x max_weight) y se avisa.
+# Si las restricciones ya eran factibles, nada cambia.
+if not qm.restricciones_factibles(Amat, bvec, meq):
+    n_etf_opt = len(etf_commodity_assets) if etf_band_active else 0
+    n_acc_opt = n - len(excluded_etf_set) - n_etf_opt if etf_band_active else n - len(excluded_etf_set)
+    razones = qm.diagnostico_banda_etf(n_etf_opt, n_acc_opt, max_weight,
+                                       etf_lo if etf_band_active else 0.0,
+                                       etf_hi if etf_band_active else 1.0)
+    if not razones:
+        razones = [f"la combinacion de max_weight {max_weight:.2f}, la banda de ETF y el tope regional "
+                   f"{max_region_weight:.2f} no deja ninguna asignacion valida"]
+    print("\n   ADVERTENCIA: las restricciones del optimizador no se pueden cumplir:")
+    for r in razones:
+        print(f"      - {r}")
+    print(f"      ETF en el optimizador ({len(etf_commodity_assets)}): "
+          f"{', '.join(assets[i] for i in etf_commodity_assets) or 'ninguno'}")
+    if etf_band_active and etf_band_relax_if_infeasible:
+        etf_lo_rel, etf_hi_rel = qm.relajar_banda_etf(n_etf_opt, n_acc_opt, max_weight, etf_lo, etf_hi)
+        Amat_rel, bvec_rel = armar_restricciones(etf_lo_rel, etf_hi_rel, verbose=False)
+        if qm.restricciones_factibles(Amat_rel, bvec_rel, meq):
+            print(f"   Banda de ETF relajada (etf_band_relax_if_infeasible=True): "
+                  f"{etf_lo * 100:.0f}%-{etf_hi * 100:.0f}% -> {etf_lo_rel * 100:.0f}%-{etf_hi_rel * 100:.0f}%. "
+                  "Para cumplir la banda pedida hacen falta mas ETF en el pool o un max_weight mayor.\n")
+            etf_lo, etf_hi = etf_lo_rel, etf_hi_rel
+            Amat, bvec = Amat_rel, bvec_rel
+            etf_band_relaxed = True
+    if not etf_band_relaxed:
+        raise RuntimeError(
+            "Error: restricciones del optimizador infactibles ("
+            + "; ".join(razones)
+            + "). Amplia el pool (n_pre_seasonal, n_divers_candidates), sube max_weight o ajusta "
+              "pct_etf_deseado / pct_etf_tolerancia"
+            + ("" if etf_band_relax_if_infeasible else ", o activa etf_band_relax_if_infeasible")
+            + ".")
 
 try:
     sol = quadprog.solve_qp(Dmat, dvec, Amat, bvec, meq)
@@ -2432,6 +2595,10 @@ weights_opt = pd.Series(weights_opt, index=assets)
 print("  Optimizacion completada")
 print(f"  Activos con peso > 1%: {(weights_opt > 0.01).sum()}")
 print(f"  Peso maximo: {weights_opt.max() * 100:.2f}% ({weights_opt.idxmax()})")
+if etf_band_active:
+    _peso_etf = float(weights_opt.iloc[etf_commodity_assets].sum())
+    print(f"  Peso en ETF/commodities: {_peso_etf * 100:.2f}% (banda {etf_lo * 100:.0f}%-{etf_hi * 100:.0f}%"
+          f"{', relajada desde la pedida' if etf_band_relaxed else ''})")
 
 top_assets_idx = weights_opt.sort_values(ascending=False).head(min(10, n)).index.tolist()
 print("\n  Top activos - efecto delta scaling y penalizacion de cola en retorno esperado:")
