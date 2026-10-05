@@ -33,6 +33,7 @@ import risk_estimators as rk
 import polygon_client as pc
 import market_data as md
 import qu_metrics as qm
+import pipeline_io
 
 # ==============================================================================
 # PARAMETROS CONFIGURABLES
@@ -3061,3 +3062,36 @@ if (portfolio_data_quality["data_quality_penalty"] < 1.0).any():
           [["Symbol", "Peso", "Obs", "Penalizacion", "Sharpe"]].to_string(index=False))
 
 print("\nScript completado con exito!")
+
+_h_days, _h_end = pipeline_io.horizon_from_month_list(as_of_date, rebalance_months)
+pipeline_io.export_portfolio(
+    "quadratic_utility_seasonal",
+    dict(zip(pesos["symbol"], pesos["weight"])),
+    horizon_days=_h_days,
+    horizon_end=_h_end,
+    params={
+        "lambda": lambda_,
+        "lambda_annual": lambda_annual,
+        "max_weight": max_weight,
+        "max_region_weight": max_region_weight,
+        "etf_floor": etf_lo,
+        "etf_cap": etf_hi,
+        "include_etfs_in_portfolio": include_etfs_in_portfolio,
+        "n_pre_seasonal": n_pre_seasonal,
+        "n_divers_candidates": n_divers_candidates,
+        "mu_shrink_k": mu_shrink_k,
+        "use_lw_shrinkage": use_lw_shrinkage,
+        "cov_halflife_days": cov_halflife_days,
+        "horizon_months": horizon_months,
+        "rebalance_months": list(rebalance_months),
+        "bkm_z_threshold": bkm_z_threshold,
+        "seasonal_vol_ratio_max": seasonal_vol_ratio_max,
+        "seasonal_min_weeks": seasonal_min_weeks,
+        "volatility_percentile": volatility_percentile,
+        "correlation_percentile": correlation_percentile,
+    },
+    metrics={
+        "expected_return": float(_ann_opt["mu"]),
+        "volatility": float(_ann_opt["sd"]),
+    },
+)

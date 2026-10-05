@@ -33,6 +33,7 @@ import risk_estimators as rk
 import polygon_client as pc
 import market_data as md
 import qu_metrics as qm
+import pipeline_io
 
 # ==============================================================================
 # PARAMETROS CONFIGURABLES
@@ -3106,3 +3107,35 @@ if (portfolio_data_quality["data_quality_penalty"] < 1.0).any():
           [["Symbol", "Peso", "Obs", "Penalizacion", "Sharpe"]].to_string(index=False))
 
 print("\nScript completado con exito!")
+
+_h_days, _h_end = pipeline_io.horizon_from_months(as_of_date, horizon_months)
+pipeline_io.export_portfolio(
+    "quadratic_utility",
+    dict(zip(pesos["symbol"], pesos["weight"])),
+    horizon_days=_h_days,
+    horizon_end=_h_end,
+    params={
+        "lambda": lambda_,
+        "lambda_annual": lambda_annual,
+        "max_weight": max_weight,
+        "max_region_weight": max_region_weight,
+        "etf_floor": etf_lo,
+        "etf_cap": etf_hi,
+        "include_etfs_in_portfolio": include_etfs_in_portfolio,
+        "n_pre_filter": n_pre_filter,
+        "n_filter_candidates": n_filter_candidates,
+        "mu_shrink_k": mu_shrink_k,
+        "use_lw_shrinkage": use_lw_shrinkage,
+        "cov_halflife_days": cov_halflife_days,
+        "horizon_months": horizon_months,
+        "bkm_z_threshold": bkm_z_threshold,
+        "recent_vol_ratio_max": recent_vol_ratio_max,
+        "iv_vs_realized_ratio_max": iv_vs_realized_ratio_max,
+        "volatility_percentile": volatility_percentile,
+        "correlation_percentile": correlation_percentile,
+    },
+    metrics={
+        "expected_return": float(_ann_opt["mu"]),
+        "volatility": float(_ann_opt["sd"]),
+    },
+)

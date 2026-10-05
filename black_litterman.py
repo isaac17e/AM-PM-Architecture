@@ -26,6 +26,7 @@ import risk_estimators as rk
 import polygon_client as pc
 import market_data as md
 import bl_metrics as bm
+import pipeline_io
 
 try:
     import statsmodels.api as sm
@@ -177,12 +178,23 @@ RETORNO_MIN_CVAR = None
 MAX_ESCENARIOS_LP = 4000
 
 # ------------------------------------------------------------------------------
+# ENTRADA OPCIONAL: UNIVERSO O VIEWS (BL_INPUT_FILE)
+# ------------------------------------------------------------------------------
+_bl_entrada = pipeline_io.load_bl_input(os.environ.get("BL_INPUT_FILE"))
+if _bl_entrada is not None:
+    TICKERS = _bl_entrada["tickers"]
+    _origen = _bl_entrada.get("source") or "archivo"
+    _modo_views = "views del archivo" if _bl_entrada["views"] is not None else "views fijas del script"
+    print(f"BL_INPUT_FILE: {len(TICKERS)} tickers | source={_origen} | {_modo_views}")
+
+# ------------------------------------------------------------------------------
 # MODO SMOKE
 # ------------------------------------------------------------------------------
 _es_smoke = os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}
 if _es_smoke:
     USAR_IV_POLYGON = False
-    TICKERS = os.environ.get("AMPM_SMOKE_TICKERS", "AAPL,MSFT,SPY").split(",")
+    if _bl_entrada is None:
+        TICKERS = os.environ.get("AMPM_SMOKE_TICKERS", "AAPL,MSFT,SPY").split(",")
     N_ESCENARIOS = 60
     N_REP_BOOTSTRAP_MOM = 2
     J_POR_REPLICA_MOM = 30
@@ -1682,31 +1694,40 @@ print(referencia_views.sort_values("Diff_Hist_Pi", ascending=False).to_string(in
 # BLOQUE 6: VIEWS DEL GESTOR
 # ==============================================================================
 
-# ==============================================================================
-# PASO 1: DEFINE CUANTOS VIEWS TIENES
-# ==============================================================================
-N_VIEWS = 3
+# Cada view es una fila de P (coeficientes por ticker) y un q (retorno esperado
+# de esa combinacion, mismas unidades que el vector Q de siempre). Relativa:
+# {"name": "View_1", "p": {"DELL": 1.0, "META": -1.0}, "q": 0.15}. Absoluta:
+# {"name": "View_1", "p": {"AAPL": 1.0}, "q": 0.04}.
+_VISTAS_DEFECTO = [
+    {"name": "View_1", "p": {"DELL": 1.0, "META": -1.0}, "q": 0.15},
+    {"name": "View_2", "p": {"GS": 1.0, "REGN": -1.0}, "q": 0.10},
+    {"name": "View_3", "p": {"EBAY": 1.0, "ARES": -1.0}, "q": 0.08},
+]
 
-# ==============================================================================
-# PASO 2: CONSTRUYE LA MATRIZ P
-# ==============================================================================
-P = pd.DataFrame(0.0, index=[f"View_{i+1}" for i in range(N_VIEWS)], columns=tickers)
-
-if os.environ.get("AMPM_SMOKE", "").strip().lower() in {"1", "true", "yes"}:
+if _es_smoke and _bl_entrada is None:
+    N_VIEWS = 3
+    P = pd.DataFrame(0.0, index=[f"View_{i+1}" for i in range(N_VIEWS)], columns=tickers)
     cols = list(P.columns)
     for i, (a, b) in enumerate(((0, 1), (1, 2), (0, 2))):
         if i < len(P.index) and b < len(cols):
             P.iloc[i, a] = 1.0
             P.iloc[i, b] = -1.0
+    Q = pd.Series({"View_1": 0.15, "View_2": 0.10, "View_3": 0.08})
 else:
-    P.loc["View_1", "DELL"] = 1
-    P.loc["View_1", "META"] = -1
-
-    P.loc["View_2", "GS"] = 1
-    P.loc["View_2", "REGN"] = -1
-
-    P.loc["View_3", "EBAY"] = 1
-    P.loc["View_3", "ARES"] = -1
+    if _bl_entrada is not None and _bl_entrada["views"] is not None:
+        _fuente_vistas = _bl_entrada["views"]
+    else:
+        _fuente_vistas = _VISTAS_DEFECTO
+    _vistas_ok, _vistas_omitidas = pipeline_io.select_views(_fuente_vistas, tickers)
+    for _omitida in _vistas_omitidas:
+        print(f"Aviso: view {_omitida['name']} omitida; no estan en el universo: "
+              f"{', '.join(_omitida['missing'])}")
+    N_VIEWS = len(_vistas_ok)
+    P = pd.DataFrame(0.0, index=[v["name"] for v in _vistas_ok], columns=tickers)
+    for _v in _vistas_ok:
+        for _tk, _coef in _v["p"].items():
+            P.loc[_v["name"], _tk] = _coef
+    Q = pd.Series({v["name"]: v["q"] for v in _vistas_ok})
 
 print("\n=== Matriz P (views del gestor) ===")
 print(P.round(4))
@@ -1714,12 +1735,6 @@ print(P.round(4))
 # ==============================================================================
 # PASO 3: DEFINE EL VECTOR Q
 # ==============================================================================
-Q = pd.Series({
-    "View_1": 0.15,
-    "View_2": 0.10,
-    "View_3": 0.08,
-})
-
 print("\n=== Vector Q (magnitudes del gestor) ===")
 print(Q.round(4))
 
@@ -1727,54 +1742,56 @@ print(Q.round(4))
 # BLOQUE 6B: PUENTE Q -> P SOBRE (Q, Omega) + NUCLEO GAUSSIANO BL
 # ==============================================================================
 
-P_mat = P.values
-Q_vec = Q.values.reshape(-1, 1)
 pi_eq_col = pi_eq.reshape(-1, 1)
 tauSigma = tau * Sigma_mat
-
-# ==============================================================================
-# (i) Q BAJO LA MEDIDA FISICA
-# ==============================================================================
-ajuste_Q_hm = P_mat @ prima_hm
-Q_P = Q.values + ajuste_Q_hm
 
 print("\n" + "=" * 79)
 print("BLOQUE 6B: PUENTE ECONOMETRICO Q -> P")
 print("=" * 79)
-print("\n=== Ajuste vectorial de Q por prima de riesgo no gaussiana ===")
-print(pd.DataFrame({
-    "Q_riesgo_neutral": np.round(Q.values, 4),
-    "P.prima_HM": np.round(ajuste_Q_hm, 4),
-    "Q_fisico": np.round(Q_P, 4),
-}, index=Q.index).to_string())
 
-# ==============================================================================
-# (ii) OMEGA BAJO LA MEDIDA FISICA
-# ==============================================================================
-Omega_mercado = np.diag(np.diag(tau * P_mat @ Sigma_mat @ P_mat.T)) * perfil["omega_scale"]
-Var_prima = np.diag(se_prima_hm ** 2)
-Omega_estimacion = np.diag(np.diag(P_mat @ Var_prima @ P_mat.T))
-Omega_P = Omega_mercado + Omega_estimacion
+if N_VIEWS == 0:
+    print("\nAviso: no hay views aplicables. El posterior gaussiano queda en el "
+          "equilibrio (mu = pi, Sigma_BL = Sigma_P * (1 + tau)).")
+    mu_BL = pi_eq.copy()
+    Sigma_BL = pd.DataFrame(Sigma_mat + tauSigma, index=tickers, columns=tickers)
+else:
+    P_mat = P.values
+    Q_vec = Q.values.reshape(-1, 1)
 
-print("\n=== Descomposicion de Omega (varianzas, no desviaciones) ===")
-print(pd.DataFrame({
-    "Riesgo_mercado": np.diag(Omega_mercado),
-    "Riesgo_estimacion": np.diag(Omega_estimacion),
-    "Omega_total": np.diag(Omega_P),
-    "%_estimacion": np.round(100 * np.diag(Omega_estimacion) /
-                             np.maximum(np.diag(Omega_P), 1e-18), 1),
-}, index=Q.index).to_string())
+    # ==============================================================================
+    # (i) Q BAJO LA MEDIDA FISICA
+    # ==============================================================================
+    ajuste_Q_hm = P_mat @ prima_hm
+    Q_P = Q.values + ajuste_Q_hm
 
-# ==============================================================================
-# NUCLEO GAUSSIANO DE BLACK-LITTERMAN
-# ==============================================================================
-Q_P_col = Q_P.reshape(-1, 1)
-sorpresa = Q_P_col - P_mat @ pi_eq_col
-M_bl = P_mat @ tauSigma @ P_mat.T + Omega_P
-M_bl_inv = np.linalg.inv(M_bl)
-mu_BL = (pi_eq_col + tauSigma @ P_mat.T @ M_bl_inv @ sorpresa).flatten()
-Sigma_BL = Sigma_mat + tauSigma - tauSigma @ P_mat.T @ M_bl_inv @ P_mat @ tauSigma
-Sigma_BL = pd.DataFrame(Sigma_BL, index=tickers, columns=tickers)
+    print("\n=== Ajuste vectorial de Q por prima de riesgo no gaussiana ===")
+    print(pd.DataFrame({
+        "Q_riesgo_neutral": np.round(Q.values, 4),
+        "P.prima_HM": np.round(ajuste_Q_hm, 4),
+        "Q_fisico": np.round(Q_P, 4),
+    }, index=Q.index).to_string())
+
+    Omega_mercado = np.diag(np.diag(tau * P_mat @ Sigma_mat @ P_mat.T)) * perfil["omega_scale"]
+    Var_prima = np.diag(se_prima_hm ** 2)
+    Omega_estimacion = np.diag(np.diag(P_mat @ Var_prima @ P_mat.T))
+    Omega_P = Omega_mercado + Omega_estimacion
+
+    print("\n=== Descomposicion de Omega (varianzas, no desviaciones) ===")
+    print(pd.DataFrame({
+        "Riesgo_mercado": np.diag(Omega_mercado),
+        "Riesgo_estimacion": np.diag(Omega_estimacion),
+        "Omega_total": np.diag(Omega_P),
+        "%_estimacion": np.round(100 * np.diag(Omega_estimacion) /
+                                 np.maximum(np.diag(Omega_P), 1e-18), 1),
+    }, index=Q.index).to_string())
+
+    Q_P_col = Q_P.reshape(-1, 1)
+    sorpresa = Q_P_col - P_mat @ pi_eq_col
+    M_bl = P_mat @ tauSigma @ P_mat.T + Omega_P
+    M_bl_inv = np.linalg.inv(M_bl)
+    mu_BL = (pi_eq_col + tauSigma @ P_mat.T @ M_bl_inv @ sorpresa).flatten()
+    Sigma_BL = Sigma_mat + tauSigma - tauSigma @ P_mat.T @ M_bl_inv @ P_mat @ tauSigma
+    Sigma_BL = pd.DataFrame(Sigma_BL, index=tickers, columns=tickers)
 
 comparacion = pd.DataFrame({
     "Ticker": tickers,
@@ -2827,3 +2844,32 @@ print(f"  MDD analizado desde:    {MDD_START_YEAR}")
 if USAR_IV_POLYGON:
     print("\nDiagnostico de llamadas a Polygon:")
     pc.print_diagnostics()
+
+_h_days, _h_end = pipeline_io.horizon_from_months(date.today(), MESES_HORIZONTE)
+_esc_ann = 12.0 / MESES_HORIZONTE
+pipeline_io.export_portfolio(
+    "black_litterman",
+    w_mvsk,
+    risk_profile=PERFIL_RIESGO,
+    horizon_days=_h_days,
+    horizon_end=_h_end,
+    params={
+        "gamma": gamma_ra,
+        "lambda3": lambda3,
+        "lambda4": lambda4,
+        "peso_max_activo": PESO_MAX_ACTIVO,
+        "umbral_peso_min": UMBRAL_PESO_MIN,
+        "max_tickers_final": MAX_TICKERS_FINAL,
+        "tau": tau,
+        "omega_scale": perfil["omega_scale"],
+        "meses_horizonte": MESES_HORIZONTE,
+        "usar_shrinkage_lw": USAR_SHRINKAGE_LW,
+        "cov_halflife_dias": COV_HALFLIFE_DIAS,
+        "cota_ratio_vol_p": COTA_RATIO_VOL_P,
+        "nivel_confianza_var": NIVEL_CONFIANZA_VAR,
+    },
+    metrics={
+        "expected_return": ret_port * _esc_ann,
+        "volatility": vol_port * math.sqrt(_esc_ann),
+    },
+)

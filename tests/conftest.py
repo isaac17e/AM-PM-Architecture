@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if RAIZ not in sys.path:
@@ -7,6 +8,12 @@ if RAIZ not in sys.path:
 
 # Los tests nunca deben tocar la red ni la cache real del repositorio.
 os.environ.pop("POLYGON_API_KEY", None)
+os.environ.pop("BL_INPUT_FILE", None)
 os.environ.setdefault("POLYGON_SNAPSHOT_TTL_MIN", "60")
 # Vacio desactiva la cache de disco de market cap (market_data).
 os.environ.setdefault("AMPM_MARKET_CAP_CACHE", "")
+# La exportacion de portafolio no escribe en /workspace durante pytest.
+os.environ.setdefault(
+    "PORTFOLIO_OUT_DIR",
+    os.path.join(tempfile.gettempdir(), "am-pm-pytest-portfolio"),
+)

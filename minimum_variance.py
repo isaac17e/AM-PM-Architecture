@@ -30,6 +30,7 @@ import polygon_client as pc
 import market_data as md
 import qu_metrics as qm
 import portfolio_constraints as pq
+import pipeline_io
 
 # ==============================================================================
 # SECCION 1: PARAMETROS CONFIGURABLES
@@ -2408,3 +2409,38 @@ print("\nDiagnostico de llamadas a Polygon:")
 pc.print_diagnostics()
 
 print("\nScript completado con exito!")
+
+_h_days, _h_end = pipeline_io.horizon_from_months(execution_date, horizon_months)
+pipeline_io.export_portfolio(
+    "minimum_variance",
+    w_final,
+    horizon_days=_h_days,
+    horizon_end=_h_end,
+    params={
+        "max_weight_per_asset": max_weight_per_asset,
+        "min_weight_per_asset": min_weight_per_asset,
+        "max_assets_in_portfolio": max_assets_in_portfolio,
+        "etf_min_weight": etf_min_weight,
+        "etf_max_weight": etf_max_weight,
+        "include_etfs_in_portfolio": include_etfs_in_portfolio,
+        "use_etf_constraint": use_etf_constraint,
+        "max_fx_exposure": max_fx_exposure,
+        "shrinkage_min": shrinkage_min,
+        "shrinkage_max": shrinkage_max,
+        "use_iv_shrinkage": use_iv_shrinkage,
+        "use_lw_shrinkage": use_lw_shrinkage,
+        "hist_shrink_alpha": hist_shrink_alpha,
+        "ratio_band": ratio_band,
+        "cov_halflife_days": cov_halflife_days,
+        "horizon_months": horizon_months,
+        "prune_below_weight": prune_below_weight,
+        "volatility_percentile": volatility_percentile,
+        "correlation_percentile": correlation_percentile,
+        "cornish_fisher_confidence": cornish_fisher_confidence,
+        "delta_min": delta_min,
+    },
+    metrics={
+        "expected_return": float(metrics_minvar["Return_Annual"]),
+        "volatility": float(metrics_minvar["Risk_Annual"]),
+    },
+)

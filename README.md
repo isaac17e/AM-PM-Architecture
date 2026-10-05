@@ -36,6 +36,7 @@ Each optimizer is a standalone script. Shared estimation lives in imported modul
    portfolio_constraints.py   quadprog weight bands (minimum variance)
    qu_metrics.py              quadratic-utility helpers (correlation, horizon, lambda, tails)
    bl_metrics.py              Black-Litterman units, market delta, log-return drawdown
+   pipeline_io.py             portfolio JSON export and optional BL input file
                  │
    quadratic_utility.py              (+ quadratic_utility_(seasonal_version).py)
    minimum_variance.py               (+ minimum_variance_(seasonal_version).py)
@@ -112,6 +113,8 @@ POLYGON_CALLS_PER_MIN=1200
 | `POLYGON_CALLS_PER_MIN` | Rate cap. Default **1200** (20 calls/second). The paid options plan does not publish a hard cap; stay under 100 requests/second. Use `5` on the free tier. `0`, `none`, or `unlimited` turns the limiter off. |
 | `POLYGON_SNAPSHOT_TTL_MIN` | Kept for compatibility. Live snapshots and anything dated today are not written to the cache. |
 | `POLYGON_CACHE_DIR` | Cache directory, shared across runs. Default `~/.cache/am-pm/polygon` (outside the repo and the run folder). |
+| `PORTFOLIO_OUT_DIR` | Where each optimizer writes `portfolio_latest.json` at the end of a run. Default `/workspace/pipeline/portfolio`. If the directory cannot be created or written, the script prints a warning and finishes anyway. |
+| `BL_INPUT_FILE` | Optional JSON for `black_litterman.py`. If unset, missing, or invalid, the hardcoded `TICKERS` and views are used. |
 
 `bkm_hist_max_minutes` (default **60**, top of `quadratic_utility.py` and its seasonal copy) is a budget, not a switch that skips the whole historical z-score. The script counts only US tickers with a finite current MFIS, charges about `bkm_hist_contracts_estimate` (26) priced contracts per uncached date, and walks the candidate ranking until the call budget is used. Names that do not fit are logged as `historia_no_procesada_presupuesto` (they stay in the book, and the log says they were not scored). Each OTM contract's daily aggregates are requested once for the span of sample dates, then sliced with the same ±5 day rule. The on-disk key is `mfis_hist_v3`. Only dates strictly before today are stored, so the next run pays the uncached dates. `bkm_max_workers` defaults to 12; the rate limiter is still global.
 
@@ -188,7 +191,7 @@ Optimizer for **minimum prospective tail risk (BKM + Cornish-Fisher)**.
 - The historical tail panel uses overlapping horizon windows on about two years of daily data. The window count is not the number of independent observations; that is documented in the output and left overlapping on purpose.
 - Maximum drawdown of the optimized portfolio uses log returns (`exp(cumsum)`), and the portfolio log return is `log(1 + Σ w (e^r − 1))`, not the weighted sum of logs.
 
-Manager views are edited in **Block 6** of the file.
+Manager views are edited in **Block 6** of the file, or passed in `BL_INPUT_FILE` (see [Pipeline JSON](#pipeline-json)).
 
 Risk-free fallback `Rf` in this file stays at `0.046`. Minimum variance and quadratic utility use `0.047`.
 
@@ -208,13 +211,46 @@ The seasonal quadratic-utility script keeps a single QUBO pass. Its `rf_rate` is
 
 ---
 
+## Pipeline JSON
+
+At the end of a run, every optimizer writes UTF-8 JSON (`indent=2`) to `PORTFOLIO_OUT_DIR`: `portfolio_latest.json` and `portfolio_<optimizer>_<YYYYMMDDTHHMMSS>.json`. The write is atomic (`.tmp` then replace). Timestamps are ISO 8601 with the America/Bogota offset. Weights below `1e-6` are dropped and the rest are rounded to 6 decimal places and rescaled so they sum to 1. `tickers` is that same order, largest weight first. `metrics.expected_return` and `metrics.volatility` are annualized decimals when the script has them (quadratic utility uses monthly ×12 and ×√12; minimum variance uses its annual columns; Black-Litterman scales the horizon moments by `12 / MESES_HORIZONTE`).
+
+`horizon_days` / `horizon_end` come from the script's own horizon. A month count (`MESES_HORIZONTE`, `horizon_months`) is calendar days from the run date to that date plus N months. A seasonal month list (`execution_months`, `rebalance_months`) is the calendar length of that month window, ending on its last day (the window that contains today, otherwise the next one).
+
+`risk_profile` is the Black-Litterman profile name (`agresivo`, `moderado`, `conservador`) and null for the other optimizers. `params` records the knobs that script actually has: `gamma` plus `lambda3` / `lambda4` for Black-Litterman, `lambda` for quadratic utility, weight caps, the ETF floor and cap, max assets or the candidate cap, shrinkage, and the main thresholds.
+
+`BL_INPUT_FILE` replaces `TICKERS`. Two shapes are accepted.
+
+A universe file (only `tickers` is read; views stay the Block 6 defaults, and a default view is dropped when any of its tickers is absent):
+
+```json
+{"schema_version": 1, "tickers": ["AAPL", "MSFT"], "source": "Corp_FR_Optimization"}
+```
+
+A views file. Each view is one row of `P` and one entry of `Q`, in horizon-return units, same as Block 6. `name` is optional. A relative view has two coefficients; an absolute view has one.
+
+```json
+{
+  "schema_version": 1,
+  "tickers": ["DELL", "META", "GS", "REGN", "EBAY", "ARES"],
+  "source": "manager",
+  "views": [
+    {"name": "View_1", "p": {"DELL": 1.0, "META": -1.0}, "q": 0.15},
+    {"name": "View_2", "p": {"GS": 1.0, "REGN": -1.0}, "q": 0.10},
+    {"name": "View_3", "p": {"EBAY": 1.0, "ARES": -1.0}, "q": 0.08}
+  ]
+}
+```
+
+`views: []` means no views (the Gaussian posterior stays at equilibrium). Omitting `views` keeps the defaults. An invalid file is ignored with a warning.
+
 ## Tests
 
 ```bash
 python -m pytest
 ```
 
-Tests cover the shared modules and the extracted optimizer logic (FX and calendar alignment, quadprog constraints, time scaling, Cornish-Fisher, Polygon client behavior with recorded responses, quadratic-utility metrics, Black-Litterman units, delta modes, and log-return drawdown). `tests/test_script_smoke.py` parses every optimizer for a module-level name that shadows an import (`rk = ...` used to hide `risk_estimators`) and runs `black_litterman.py` under `AMPM_SMOKE=1` with mocked prices. They do not call Polygon and they do not run a full universe.
+Tests cover the shared modules and the extracted optimizer logic (FX and calendar alignment, quadprog constraints, time scaling, Cornish-Fisher, Polygon client behavior with recorded responses, quadratic-utility metrics, Black-Litterman units, delta modes, and log-return drawdown). `tests/test_pipeline_io.py` checks the portfolio JSON writer and `BL_INPUT_FILE` parsing with no network. `tests/test_script_smoke.py` parses every optimizer for a module-level name that shadows an import (`rk = ...` used to hide `risk_estimators`) and runs `black_litterman.py` under `AMPM_SMOKE=1` with mocked prices. They do not call Polygon and they do not run a full universe.
 
 ---
 

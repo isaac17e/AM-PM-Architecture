@@ -7,6 +7,7 @@ corre black_litterman.py con datos falsos.
 """
 
 import ast
+import json
 import runpy
 import zlib
 from pathlib import Path
@@ -142,3 +143,55 @@ def test_black_litterman_smoke_reaches_cornish_fisher(monkeypatch):
     monkeypatch.setattr("yfinance.Ticker", _YahooFalso)
     monkeypatch.setattr(go.Figure, "show", lambda self, *a, **k: None)
     runpy.run_path(str(ROOT / "black_litterman.py"), run_name="__main__")
+
+
+def _correr_bl(monkeypatch, tmp_path, payload):
+    archivo = tmp_path / "bl_input.json"
+    archivo.write_text(json.dumps(payload), encoding="utf-8")
+    salida = tmp_path / "portfolio"
+    monkeypatch.setenv("BL_INPUT_FILE", str(archivo))
+    monkeypatch.setenv("AMPM_SMOKE", "1")
+    monkeypatch.setenv("POLYGON_API_KEY", "")
+    monkeypatch.setenv("PORTFOLIO_OUT_DIR", str(salida))
+    monkeypatch.setattr("yfinance.Ticker", _YahooFalso)
+    monkeypatch.setattr(go.Figure, "show", lambda self, *a, **k: None)
+    g = runpy.run_path(str(ROOT / "black_litterman.py"), run_name="__main__")
+    latest = json.loads((salida / "portfolio_latest.json").read_text(encoding="utf-8"))
+    return g, latest
+
+
+def test_bl_input_file_overrides_tickers_and_views(monkeypatch, tmp_path):
+    g, latest = _correr_bl(monkeypatch, tmp_path, {
+        "schema_version": 1,
+        "tickers": ["aapl", "MSFT", "SPY"],
+        "source": "manager",
+        "views": [{"name": "View_1", "p": {"AAPL": 1.0, "MSFT": -1.0}, "q": 0.05}],
+    })
+    assert g["TICKERS"] == ["AAPL", "MSFT", "SPY"]
+    assert g["N_VIEWS"] == 1
+    assert g["P"].loc["View_1", "AAPL"] == 1.0
+    assert g["P"].loc["View_1", "MSFT"] == -1.0
+    assert g["P"].loc["View_1", "SPY"] == 0.0
+    assert g["Q"]["View_1"] == 0.05
+    assert latest["optimizer"] == "black_litterman"
+    assert latest["source_repo"] == "AM-PM-Architecture"
+    assert latest["risk_profile"] == "agresivo"
+    assert latest["params"]["gamma"] == 1.5
+    assert "lambda3" in latest["params"] and "lambda4" in latest["params"]
+    assert latest["tickers"] == list(latest["weights"])
+    assert sum(int(round(v * 1_000_000)) for v in latest["weights"].values()) == 1_000_000
+    assert latest["metrics"]["expected_return"] is not None
+    assert latest["horizon_end"] is not None
+
+
+def test_bl_universe_file_drops_default_views(monkeypatch, tmp_path):
+    g, latest = _correr_bl(monkeypatch, tmp_path, {
+        "schema_version": 1,
+        "source": "Corp_FR_Optimization",
+        "tickers": ["AAPL", "MSFT", "SPY"],
+        "details": [{"ticker": "AAPL", "rank": 1}],
+    })
+    assert g["TICKERS"] == ["AAPL", "MSFT", "SPY"]
+    assert g["N_VIEWS"] == 0
+    assert latest["optimizer"] == "black_litterman"
+    assert latest["risk_profile"] == "agresivo"
