@@ -75,7 +75,25 @@ def test_parse_calls_per_min(valor, esperado):
 
 
 def test_default_rate_limit_is_documented_constant():
-    assert pc.DEFAULT_CALLS_PER_MIN == 1200.0
+    assert pc.DEFAULT_CALLS_PER_MIN == 100.0
+
+
+def test_calls_per_minute_lee_el_nombre_largo(monkeypatch):
+    monkeypatch.setenv("POLYGON_CALLS_PER_MINUTE", "80")
+    monkeypatch.setenv("POLYGON_CALLS_PER_MIN", "5")
+    assert pc.calls_per_minute_from_env() == 80.0
+
+
+def test_calls_per_minute_acepta_el_alias_viejo(monkeypatch):
+    monkeypatch.delenv("POLYGON_CALLS_PER_MINUTE", raising=False)
+    monkeypatch.setenv("POLYGON_CALLS_PER_MIN", "5")
+    assert pc.calls_per_minute_from_env() == 5.0
+
+
+def test_calls_per_minute_sin_env_usa_el_default(monkeypatch):
+    monkeypatch.delenv("POLYGON_CALLS_PER_MINUTE", raising=False)
+    monkeypatch.delenv("POLYGON_CALLS_PER_MIN", raising=False)
+    assert pc.calls_per_minute_from_env() == 100.0
 
 
 def test_default_cache_dir_lives_outside_the_repo():
@@ -206,6 +224,7 @@ def test_get_json_strips_key_from_cache_key_and_sends_it(monkeypatch):
 def test_get_json_retries_on_429_respecting_retry_after(monkeypatch):
     esperas = []
     monkeypatch.setattr(pc.time, "sleep", lambda s: esperas.append(s))
+    monkeypatch.setattr(pc.random, "random", lambda: 1.0)
     respuestas = iter([_RespuestaFalsa(429, headers={"retry-after": "3"}),
                        _RespuestaFalsa(503),
                        _RespuestaFalsa(200, {"results": []})])
@@ -249,6 +268,22 @@ def test_get_json_non_transient_error_is_not_retried_nor_cached(monkeypatch):
     assert len(llamadas) == 1
     assert pc.cache_get("https://api.polygon.io/v3/nada") is None
     assert pc.diag["sample_errors"][0]["status"] == 404
+
+
+def test_get_json_jitter_on_5xx_and_retry_after_wins(monkeypatch):
+    esperas = []
+    monkeypatch.setattr(pc.time, "sleep", lambda s: esperas.append(s))
+    monkeypatch.setattr(pc.random, "random", lambda: 0.0)
+    respuestas = iter([
+        _RespuestaFalsa(503),
+        _RespuestaFalsa(429, headers={"Retry-After": "4"}),
+        _RespuestaFalsa(200, {"results": [1]}),
+    ])
+    monkeypatch.setattr(requests, "get", lambda url, timeout: next(respuestas))
+    data, status = pc.get_json("https://api.polygon.io/v3/x", api_key="K", backoff=1.0)
+    assert status == 200 and data == {"results": [1]}
+    # 503: backoff 1 * 2^0 * 0.5. 429: Retry-After, sin jitter.
+    assert esperas == pytest.approx([0.5, 4.0])
 
 
 def test_get_json_exhausts_retries_on_network_error(monkeypatch):
@@ -395,6 +430,27 @@ def test_expiry_rank_prefers_50_over_15_for_a_30_day_target():
 ])
 def test_is_us_ticker(ticker, es_us):
     assert pc.is_us_ticker(ticker) is es_us
+
+
+def test_fetch_otm_chain_formats_class_share_and_skips_non_us(monkeypatch):
+    urls = []
+
+    def _get_all(url, api_key=None, max_pages=40):
+        urls.append(url)
+        return [], True, 200
+
+    monkeypatch.setattr(pc, "get_all", _get_all)
+    pc.fetch_otm_chain("BRK-B", 100.0, "2026-01-01", "2026-12-31", 70.0, 140.0, 30)
+    assert urls and all("BRK.B" in url and "BRK-B" not in url for url in urls)
+
+    def _no_llamar(*a, **k):
+        raise AssertionError("SHOP.TO no debe ir a Polygon")
+
+    monkeypatch.setattr(pc, "get_all", _no_llamar)
+    calls, puts, info = pc.fetch_otm_chain(
+        "SHOP.TO", 100.0, "2026-01-01", "2026-12-31", 70.0, 140.0, 30)
+    assert calls.empty and puts.empty and info["completo"] and info["status"] == "no_us"
+    assert not pc.es_transitorio(info["status"])
 
 
 def test_fetch_otm_chain_incomplete_download_returns_empty(monkeypatch):

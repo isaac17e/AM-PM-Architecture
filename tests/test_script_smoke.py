@@ -9,6 +9,7 @@ corre black_litterman.py con datos falsos.
 import ast
 import json
 import runpy
+import sys
 import zlib
 from pathlib import Path
 
@@ -182,6 +183,30 @@ def test_bl_input_file_overrides_tickers_and_views(monkeypatch, tmp_path):
     assert sum(int(round(v * 1_000_000)) for v in latest["weights"].values()) == 1_000_000
     assert latest["metrics"]["expected_return"] is not None
     assert latest["horizon_end"] is not None
+
+
+def test_bl_risk_profile_env_and_cli(monkeypatch, tmp_path):
+    monkeypatch.setenv("RISK_PROFILE", "moderado")
+    g, latest = _correr_bl(monkeypatch, tmp_path, {
+        "schema_version": 1,
+        "tickers": ["AAPL", "MSFT", "SPY"],
+    })
+    assert g["PERFIL_RIESGO"] == "moderado"
+    assert g["gamma_ra"] == 3.0
+    assert g["tau"] == 0.05
+    assert latest["risk_profile"] == "moderado"
+    assert latest["params"]["gamma"] == 3.0
+    assert latest["params"]["omega_scale"] == 1.0
+
+    monkeypatch.setattr(sys, "argv", ["black_litterman.py", "--risk-profile", "conservador"])
+    g, latest = _correr_bl(monkeypatch, tmp_path, {
+        "schema_version": 1,
+        "tickers": ["AAPL", "MSFT", "SPY"],
+    })
+    assert g["PERFIL_RIESGO"] == "conservador"
+    assert g["gamma_ra"] == 6.0
+    assert latest["risk_profile"] == "conservador"
+    assert latest["params"]["tau"] == 0.025
 
 
 def test_bl_universe_file_drops_default_views(monkeypatch, tmp_path):

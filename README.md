@@ -47,7 +47,7 @@ Each optimizer is a standalone script. Shared estimation lives in imported modul
 ```
 
 ### `polygon_client.py`
-Shared Polygon.io access: a process-wide rate limiter, retries with `Retry-After`, pagination that never treats a truncated chain as complete, a disk cache (permanent for history, TTL for snapshots), and `polygon_format_ticker` (`BRK-B` → `BRK.B`) so every script asks for the same contract.
+Shared Polygon.io access: a process-wide rate limiter (`POLYGON_CALLS_PER_MINUTE`, default 100), retries with exponential backoff, jitter, and `Retry-After`, pagination that never treats a truncated chain as complete, a disk cache (permanent for history, TTL for snapshots), and `polygon_format_ticker` (`BRK-B` → `BRK.B`). Non-US suffixes are not sent to the options chain.
 
 ### `risk_estimators.py`
 Estimation the optimizers share: EWMA covariance with Ledoit-Wolf shrinkage, Q→P vol and correlation, co-moment portfolio skewness and kurtosis, Cornish-Fisher VaR/ES (Maillard, 2012), `scale_moments` / `implied_variance_to_horizon` for changing the horizon, and `trapezoid` (`np.trapezoid` on NumPy 2, `np.trapz` on 1.x). BKM integration goes through `trapezoid`; no script calls `np.trapezoid` directly.
@@ -104,21 +104,25 @@ Create a `.env` file in the repository root (it is covered by `.gitignore`):
 
 ```env
 POLYGON_API_KEY=your_api_key_here
-POLYGON_CALLS_PER_MIN=1200
+POLYGON_CALLS_PER_MINUTE=100
+RISK_PROFILE=agresivo
 ```
 
 | Variable | Role |
 |---|---|
 | `POLYGON_API_KEY` | Polygon key. Without it, every options call returns `sin_api_key` and is not retried. `black_litterman.py` with `USAR_IV_POLYGON = True` stops at startup. The other optimizers continue on the historical fallback and print why each ticker missed the chain. |
-| `POLYGON_CALLS_PER_MIN` | Rate cap. Default **1200** (20 calls/second). The paid options plan does not publish a hard cap; stay under 100 requests/second. Use `5` on the free tier. `0`, `none`, or `unlimited` turns the limiter off. |
+| `POLYGON_CALLS_PER_MINUTE` | Rate cap. Default **100** calls/minute. `POLYGON_CALLS_PER_MIN` is the old name and is used only when the new one is unset. Use `5` on the free tier. `0`, `none`, or `unlimited` turns the limiter off. HTTP 429 and transient 5xx are retried with exponential backoff and jitter; a numeric `Retry-After` is waited out as given. |
 | `POLYGON_SNAPSHOT_TTL_MIN` | Kept for compatibility. Live snapshots and anything dated today are not written to the cache. |
 | `POLYGON_CACHE_DIR` | Cache directory, shared across runs. Default `~/.cache/am-pm/polygon` (outside the repo and the run folder). |
 | `PORTFOLIO_OUT_DIR` | Where each optimizer writes `portfolio_latest.json` at the end of a run. Default `/workspace/pipeline/portfolio`. If the directory cannot be created or written, the script prints a warning and finishes anyway. |
 | `BL_INPUT_FILE` | Optional JSON for `black_litterman.py`. If unset, missing, or invalid, the hardcoded `TICKERS` and views are used. |
+| `RISK_PROFILE` | `conservador`, `moderado`, or `agresivo`. Applies that optimizer's preset. Unset keeps the profile already written in the file (`agresivo` in every optimizer). `--risk-profile` overrides this variable. |
 
 `bkm_hist_max_minutes` (default **60**, top of `quadratic_utility.py` and its seasonal copy) is a budget, not a switch that skips the whole historical z-score. The script counts only US tickers with a finite current MFIS, charges about `bkm_hist_contracts_estimate` (26) priced contracts per uncached date, and walks the candidate ranking until the call budget is used. Names that do not fit are logged as `historia_no_procesada_presupuesto` (they stay in the book, and the log says they were not scored). Each OTM contract's daily aggregates are requested once for the span of sample dates, then sliced with the same ±5 day rule. The on-disk key is `mfis_hist_v3`. Only dates strictly before today are stored, so the next run pays the uncached dates. `bkm_max_workers` defaults to 12; the rate limiter is still global.
 
-**Parameters are edited in the configuration block at the top of each file.** There is no CLI. Run a script with `python script_name.py`. Plotly charts open in the browser.
+**Parameters are edited in the configuration block at the top of each file.** The only CLI flag is `--risk-profile` (`conservador`, `moderado`, or `agresivo`), which overrides `RISK_PROFILE`. With neither set, the run keeps the profile hardcoded in that file. Run a script with `python script_name.py`. Plotly charts open in the browser.
+
+`minimum_variance.py`, `minimum_variance_(seasonal_version).py`, `quadratic_utility.py`, and `quadratic_utility_(seasonal_version).py` each keep a `RISK_PRESETS` dict (the columns in `docs/risk_profile_audit.html`). The numbers above that dict are the agresivo preset, so an unset profile does not change the book. `black_litterman.py` already selects with `PERFILES` (`omega_scale`, `tau`, `gamma_ra`); the same env var and flag override `PERFIL_RIESGO`.
 
 ### ETFs in the resulting portfolio
 
@@ -217,7 +221,7 @@ At the end of a run, every optimizer writes UTF-8 JSON (`indent=2`) to `PORTFOLI
 
 `horizon_days` / `horizon_end` come from the script's own horizon. A month count (`MESES_HORIZONTE`, `horizon_months`) is calendar days from the run date to that date plus N months. A seasonal month list (`execution_months`, `rebalance_months`) is the calendar length of that month window, ending on its last day (the window that contains today, otherwise the next one).
 
-`risk_profile` is the Black-Litterman profile name (`agresivo`, `moderado`, `conservador`) and null for the other optimizers. `params` records the knobs that script actually has: `gamma` plus `lambda3` / `lambda4` for Black-Litterman, `lambda` for quadratic utility, weight caps, the ETF floor and cap, max assets or the candidate cap, shrinkage, and the main thresholds.
+`risk_profile` is the profile that ran (`agresivo`, `moderado`, or `conservador`) for every optimizer. With nothing selected it is `agresivo`, which is the preset already written in each file, so the weights are unchanged and the field is no longer null. `params` records the knobs that script actually has: `gamma` plus `lambda3` / `lambda4` for Black-Litterman, `lambda` for quadratic utility, weight caps, the ETF floor and cap, max assets or the candidate cap, shrinkage, and the main thresholds.
 
 `BL_INPUT_FILE` replaces `TICKERS`. Two shapes are accepted.
 
@@ -269,9 +273,10 @@ Tests cover the shared modules and the extracted optimizer logic (FX and calenda
 
 ## Notes on the Polygon API
 
-- The free *Stocks Basic* tier allows **5 calls per minute**. Set `POLYGON_CALLS_PER_MIN=5`. The default 1200 assumes the paid options plan (unlimited calls, keep the pace under 100 requests/second).
+- The free *Stocks Basic* tier allows **5 calls per minute**. Set `POLYGON_CALLS_PER_MINUTE=5`. The default is 100. Raise it on the paid options plan if you want more throughput; `0` or `unlimited` turns the limiter off. A 429 waits for `Retry-After` when Polygon sends one; otherwise the client backs off exponentially with jitter, and the same backoff covers 500/502/503/504 and dropped connections.
 - A full optimizer run walks hundreds of tickers. Lower `n_top_sp500`, `n_top_nasdaq`, and `target_total_tickers` for a short test.
-- `bkm_max_workers` (default 12) is the BKM thread pool. The rate limiter is still global, so the threads share `POLYGON_CALLS_PER_MIN`.
+- `bkm_max_workers` (default 12) is the BKM thread pool. The rate limiter is still global, so the threads share `POLYGON_CALLS_PER_MINUTE`.
+- Yahoo class shares are sent to Polygon with a dot (`BRK-B` → `BRK.B`). Exchange suffixes (`.TO`, `.L`, `.AS`, and the rest of `is_us_ticker`'s list) are not sent to the options endpoints.
 - When an options query fails, the ticker falls back to a historical estimate and the summary lists the reason. Read that table before trusting an "implied" book.
 - Historical MFIS in quadratic utility spends `bkm_hist_max_minutes` on the highest-ranked US names that already have a finite current MFIS. The log prints how many received a z-score, how many were left unprocessed, and the elapsed seconds. The cache directory is `~/.cache/am-pm/polygon` unless `POLYGON_CACHE_DIR` is set. Today's option chain is not stored there.
 

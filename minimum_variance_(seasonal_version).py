@@ -220,6 +220,74 @@ panel_min_obs = 104
 use_sector_factor = True
 use_country_factor = True
 
+# ------------------------------------------------------------------------------
+# PERFIL DE RIESGO (conservador | moderado | agresivo)
+# Los numeros de arriba son el agresivo. --risk-profile o RISK_PROFILE eligen
+# otro preset; si no hay ninguno, el agresivo se queda igual.
+# ------------------------------------------------------------------------------
+RISK_PRESETS = {
+    "conservador": {
+        "volatility_percentile": 0.55,
+        "correlation_percentile": 0.60,
+        "max_assets_in_portfolio": 15,
+        "max_weight_per_asset": 0.12,
+        "etf_min_weight": 0.30,
+        "etf_max_weight": 0.55,
+        "shrinkage_min": 0.35,
+        "shrinkage_max": 0.85,
+        "ratio_band": 0.30,
+        "n_pre_seasonal": 70,
+        "seasonal_min_weeks": 20,
+        "n_top_international": 5,
+        "n_divers_candidates": 45,
+        "max_fx_exposure": 0.20,
+        "tail_risk_filter_confidence": 0.99,
+        "cornish_fisher_confidence": 0.99,
+        "delta_min": 0.24,
+    },
+    "moderado": {
+        "volatility_percentile": 0.85,
+        "correlation_percentile": 0.75,
+        "max_assets_in_portfolio": 10,
+        "max_weight_per_asset": 0.22,
+        "etf_min_weight": 0.00,
+        "etf_max_weight": 0.20,
+        "shrinkage_min": 0.02,
+        "shrinkage_max": 0.70,
+        "ratio_band": 0.25,
+        "n_pre_seasonal": 60,
+        "seasonal_min_weeks": 15,
+        "n_top_international": 10,
+        "n_divers_candidates": 40,
+        "max_fx_exposure": 0.35,
+        "tail_risk_filter_confidence": 0.975,
+        "cornish_fisher_confidence": 0.975,
+        "delta_min": 0.18,
+    },
+    "agresivo": {
+        "volatility_percentile": 0.97,
+        "correlation_percentile": 0.90,
+        "max_assets_in_portfolio": 6,
+        "max_weight_per_asset": 0.35,
+        "etf_min_weight": 0.00,
+        "etf_max_weight": 0.05,
+        "shrinkage_min": 0.02,
+        "shrinkage_max": 0.40,
+        "ratio_band": 0.20,
+        "n_pre_seasonal": 45,
+        "seasonal_min_weeks": 10,
+        "n_top_international": 15,
+        "n_divers_candidates": 30,
+        "max_fx_exposure": 0.50,
+        "tail_risk_filter_confidence": 0.95,
+        "cornish_fisher_confidence": 0.95,
+        "delta_min": 0.15,
+    },
+}
+RISK_PROFILE = pipeline_io.resolve_risk_profile("agresivo")
+globals().update(RISK_PRESETS[RISK_PROFILE])
+print(f"Perfil de riesgo: {RISK_PROFILE}")
+
 # ==============================================================================
 # SECCION 2: VALIDACION DEL HORIZONTE
 # ==============================================================================
@@ -793,6 +861,8 @@ _polygon_cache = {}
 
 
 def get_polygon_option_snapshot(ticker):
+    if is_non_us_exchange(ticker):
+        return None
     if ticker in _polygon_cache:
         return _polygon_cache[ticker]
 
@@ -2522,6 +2592,7 @@ _h_days, _h_end = pipeline_io.horizon_from_month_list(end_date, execution_months
 pipeline_io.export_portfolio(
     "minimum_variance_seasonal",
     w_final,
+    risk_profile=RISK_PROFILE,
     horizon_days=_h_days,
     horizon_end=_h_end,
     params={

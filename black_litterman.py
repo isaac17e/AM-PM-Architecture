@@ -67,7 +67,7 @@ SEMANAS_MES = 4.33
 # ------------------------------------------------------------------------------
 # 3. PERFIL DE RIESGO
 # ------------------------------------------------------------------------------
-PERFIL_RIESGO = "agresivo"
+PERFIL_RIESGO = pipeline_io.resolve_risk_profile("agresivo")
 
 # ------------------------------------------------------------------------------
 # 4. PARAMETROS DE OPTIMIZACION (POR PERFIL)

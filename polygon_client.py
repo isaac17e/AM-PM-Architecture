@@ -4,9 +4,10 @@
 # Modulo comun a minimum_variance.py, quadratic_utility.py, black_litterman.py
 # y sus versiones estacionales. Centraliza:
 #
-#   1. Limitador de tasa global y seguro entre hilos (POLYGON_CALLS_PER_MIN).
-#   2. Reintentos con backoff ante 429 / 5xx / errores de red, respetando
-#      Retry-After.
+#   1. Limitador de tasa global y seguro entre hilos
+#      (POLYGON_CALLS_PER_MINUTE; POLYGON_CALLS_PER_MIN es alias).
+#   2. Reintentos con backoff exponencial y jitter ante 429 / 5xx / errores
+#      de red. Un Retry-After numerico positivo se espera tal cual.
 #   3. Paginacion completa via next_url, con indicador de completitud: una
 #      cadena a la que le falta una pagina NUNCA se devuelve como completa.
 #   4. Cache en disco, fuera del repo: solo datos historicos inmutables
@@ -22,11 +23,10 @@
 #                             devuelve status "sin_api_key" de forma
 #                             DEFINITIVA (no se reintenta ni se trata como
 #                             fallo transitorio) y se emite un aviso una vez.
-#   POLYGON_CALLS_PER_MIN     tope de llamadas por minuto. Default
-#                             DEFAULT_CALLS_PER_MIN (1200 = 20/s). El plan de
-#                             opciones de pago no trae tope duro; se recomienda
-#                             quedar por debajo de 100 req/s. La variable sigue
-#                             mandando. Valores:
+#   POLYGON_CALLS_PER_MINUTE  tope de llamadas por minuto. Default
+#                             DEFAULT_CALLS_PER_MIN (100). POLYGON_CALLS_PER_MIN
+#                             es el nombre anterior y solo se lee si el nuevo
+#                             no esta definido. Valores:
 #                               5                 plan gratuito
 #                               0 / none / unlimited   sin limitador
 #   POLYGON_SNAPSHOT_TTL_MIN  se conserva por compatibilidad. Los snapshots
@@ -41,6 +41,7 @@
 import hashlib
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -58,6 +59,7 @@ __all__ = [
     "API_KEY",
     "CALLS_PER_MIN",
     "DEFAULT_CALLS_PER_MIN",
+    "calls_per_minute_from_env",
     "set_rate_limit",
     "polygon_format_ticker",
     "is_us_ticker",
@@ -80,10 +82,10 @@ __all__ = [
 
 API_KEY = os.environ.get("POLYGON_API_KEY")
 
-# Ritmo por defecto para el plan de opciones de pago (llamadas sin tope duro).
-# 1200/min son 20 req/s, por debajo de los 100 req/s que conviene no pasar.
-# POLYGON_CALLS_PER_MIN lo reemplaza; 0 o "unlimited" apaga el limitador.
-DEFAULT_CALLS_PER_MIN = 1200.0
+# 100/min (~1.7 req/s) es un tope conservador para no comerse el 429 en una
+# corrida larga. El plan de pago se sube con POLYGON_CALLS_PER_MINUTE.
+# 0 o "unlimited" apaga el limitador.
+DEFAULT_CALLS_PER_MIN = 100.0
 _SIN_TOPE = {"0", "none", "null", "unlimited", "inf", "sin_tope", "ilimitado"}
 
 
@@ -116,7 +118,15 @@ def _parse_calls_per_min(valor, default=DEFAULT_CALLS_PER_MIN):
     return None if num <= 0 or not np.isfinite(num) else num
 
 
-CALLS_PER_MIN = _parse_calls_per_min(os.environ.get("POLYGON_CALLS_PER_MIN"))
+def calls_per_minute_from_env():
+    """POLYGON_CALLS_PER_MINUTE manda. Si no esta, se usa POLYGON_CALLS_PER_MIN."""
+    for nombre in ("POLYGON_CALLS_PER_MINUTE", "POLYGON_CALLS_PER_MIN"):
+        if nombre in os.environ and os.environ.get(nombre, "").strip():
+            return _parse_calls_per_min(os.environ.get(nombre))
+    return _parse_calls_per_min(None)
+
+
+CALLS_PER_MIN = calls_per_minute_from_env()
 SNAPSHOT_TTL_SEC = _env_float("POLYGON_SNAPSHOT_TTL_MIN", 60.0) * 60.0
 
 
@@ -443,7 +453,7 @@ def get_json(url, api_key=None, permanente=False, max_retries=5, timeout=20, bac
             resp = requests.get(_con_api_key(clave, api_key), timeout=timeout)
         except requests.RequestException:
             status = "red"
-            time.sleep(backoff * 2 ** (intento - 1))
+            time.sleep(_espera_reintento(intento, backoff))
             continue
         status = resp.status_code
         if status == 200:
@@ -457,12 +467,7 @@ def get_json(url, api_key=None, permanente=False, max_retries=5, timeout=20, bac
                 cache_set(clave, data, permanente=permanente)
             return data, 200
         if status in STATUS_TRANSITORIOS:
-            espera = None
-            try:
-                espera = float(resp.headers.get("retry-after"))
-            except (TypeError, ValueError):
-                pass
-            time.sleep(espera if espera and espera > 0 else backoff * 2 ** (intento - 1))
+            time.sleep(_espera_reintento(intento, backoff, _retry_after(resp.headers)))
             continue
         if status == 403:
             _avisar_403(clave)
@@ -513,6 +518,36 @@ def fetch_option_aggs(contract_ticker, from_date, to_date, api_key=None, limit=5
     if data is None:
         return [], not es_transitorio(status)
     return list(data.get("results") or []), True
+
+
+def _retry_after(headers):
+    """Segundos de Retry-After, o None si no hay un numero positivo."""
+    if not headers:
+        return None
+    valor = None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        valor = getter("retry-after")
+        if valor is None:
+            valor = getter("Retry-After")
+    if valor is None:
+        for clave, item in getattr(headers, "items", lambda: ())():
+            if str(clave).lower() == "retry-after":
+                valor = item
+                break
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return None
+    return numero if numero > 0 else None
+
+
+def _espera_reintento(intento, backoff, retry_after=None):
+    """Retry-After tal cual. Si no, backoff * 2^(intento-1) con jitter en [0.5, 1]."""
+    if retry_after is not None and retry_after > 0:
+        return float(retry_after)
+    base = float(backoff) * (2 ** (intento - 1))
+    return base * (0.5 + 0.5 * random.random())
 
 
 def es_transitorio(status):
@@ -569,6 +604,10 @@ def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
     """
     vacio = pd.DataFrame(columns=_COLS_CADENA)
     info = {"completo": True, "status": 200, "expiracion": None, "dte": np.nan}
+    if not is_us_ticker(underlying):
+        info["status"] = "no_us"
+        return vacio, vacio.copy(), info
+    underlying = polygon_format_ticker(underlying)
     if S is None or not np.isfinite(S) or S <= 0:
         return vacio, vacio.copy(), info
 

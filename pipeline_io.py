@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import sys
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,8 +17,42 @@ from zoneinfo import ZoneInfo
 DEFAULT_PORTFOLIO_DIR = "/workspace/pipeline/portfolio"
 SOURCE_REPO = "AM-PM-Architecture"
 BOGOTA = ZoneInfo("America/Bogota")
+RISK_PROFILE_NAMES = ("conservador", "moderado", "agresivo")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _OPTIMIZER = re.compile(r"[A-Za-z0-9_]+")
+
+
+def resolve_risk_profile(default, allowed=RISK_PROFILE_NAMES, argv=None):
+    """Nombre de perfil: `--risk-profile` gana a `RISK_PROFILE`, y ambos al default.
+
+    Acepta mayusculas y espacios. Un nombre fuera de `allowed` lanza ValueError.
+    """
+    elegido = _cli_risk_profile(sys.argv[1:] if argv is None else argv)
+    if elegido is None:
+        elegido = os.environ.get("RISK_PROFILE")
+    if elegido is None or not str(elegido).strip():
+        elegido = default
+    nombre = str(elegido).strip().lower()
+    permitidos = tuple(allowed)
+    if nombre not in permitidos:
+        raise ValueError(
+            f"perfil de riesgo invalido: {elegido!r}. "
+            f"Use uno de: {', '.join(permitidos)} (--risk-profile o RISK_PROFILE)."
+        )
+    return nombre
+
+
+def _cli_risk_profile(argv):
+    for i, arg in enumerate(argv):
+        if arg == "--risk-profile":
+            if i + 1 >= len(argv) or str(argv[i + 1]).startswith("-"):
+                raise ValueError(
+                    "--risk-profile necesita un valor: conservador, moderado o agresivo"
+                )
+            return argv[i + 1]
+        if arg.startswith("--risk-profile="):
+            return arg.split("=", 1)[1]
+    return None
 
 
 def horizon_from_months(as_of, n_months):

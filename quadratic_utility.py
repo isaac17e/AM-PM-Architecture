@@ -232,6 +232,86 @@ etf_band_relax_if_infeasible = True
 # ------------------------------------------------------------------------------
 include_etfs_in_portfolio = True
 
+# ------------------------------------------------------------------------------
+# PERFIL DE RIESGO (conservador | moderado | agresivo)
+# Los numeros de arriba son el agresivo. --risk-profile o RISK_PROFILE eligen
+# otro preset; si no hay ninguno, el agresivo se queda igual.
+# ------------------------------------------------------------------------------
+RISK_PRESETS = {
+    "conservador": {
+        "lambda_": 6.0,
+        "max_weight": 0.12,
+        "weight_sharpe": 0.80,
+        "weight_decorr": 0.20,
+        "volatility_percentile": 0.45,
+        "correlation_percentile": 0.50,
+        "n_pre_filter": 80,
+        "n_filter_candidates": 50,
+        "recent_vol_window_min_weeks": 20,
+        "recent_vol_window_max_weeks": 26,
+        "recent_vol_ratio_max": 1.15,
+        "recent_vol_min_survivors": 22,
+        "iv_vs_realized_ratio_max": 1.15,
+        "iv_min_survivors": 16,
+        "delta_min": 0.24,
+        "pct_etf_deseado": 0.55,
+        "pct_etf_tolerancia": 0.10,
+        "max_region_weight": 0.35,
+        "iv_outlier_multiplier": 3.0,
+        "bkm_z_threshold": 1.50,
+        "bkm_min_survivors": 16,
+    },
+    "moderado": {
+        "lambda_": 3.0,
+        "max_weight": 0.18,
+        "weight_sharpe": 0.75,
+        "weight_decorr": 0.25,
+        "volatility_percentile": 0.65,
+        "correlation_percentile": 0.65,
+        "n_pre_filter": 65,
+        "n_filter_candidates": 42,
+        "recent_vol_window_min_weeks": 15,
+        "recent_vol_window_max_weeks": 24,
+        "recent_vol_ratio_max": 1.35,
+        "recent_vol_min_survivors": 18,
+        "iv_vs_realized_ratio_max": 1.35,
+        "iv_min_survivors": 14,
+        "delta_min": 0.18,
+        "pct_etf_deseado": 0.30,
+        "pct_etf_tolerancia": 0.08,
+        "max_region_weight": 0.55,
+        "iv_outlier_multiplier": 4.0,
+        "bkm_z_threshold": 1.75,
+        "bkm_min_survivors": 14,
+    },
+    "agresivo": {
+        "lambda_": 1.5,
+        "max_weight": 0.30,
+        "weight_sharpe": 0.70,
+        "weight_decorr": 0.30,
+        "volatility_percentile": 0.85,
+        "correlation_percentile": 0.85,
+        "n_pre_filter": 45,
+        "n_filter_candidates": 30,
+        "recent_vol_window_min_weeks": 13,
+        "recent_vol_window_max_weeks": 18,
+        "recent_vol_ratio_max": 1.80,
+        "recent_vol_min_survivors": 14,
+        "iv_vs_realized_ratio_max": 1.80,
+        "iv_min_survivors": 10,
+        "delta_min": 0.15,
+        "pct_etf_deseado": 0.10,
+        "pct_etf_tolerancia": 0.10,
+        "max_region_weight": 0.80,
+        "iv_outlier_multiplier": 6.0,
+        "bkm_z_threshold": 2.00,
+        "bkm_min_survivors": 12,
+    },
+}
+RISK_PROFILE = pipeline_io.resolve_risk_profile("agresivo")
+globals().update(RISK_PRESETS[RISK_PROFILE])
+print(f"Perfil de riesgo: {RISK_PROFILE}")
+
 # ==============================================================================
 # VALIDACION DE PARAMETROS
 # ==============================================================================
@@ -3112,6 +3192,7 @@ _h_days, _h_end = pipeline_io.horizon_from_months(as_of_date, horizon_months)
 pipeline_io.export_portfolio(
     "quadratic_utility",
     dict(zip(pesos["symbol"], pesos["weight"])),
+    risk_profile=RISK_PROFILE,
     horizon_days=_h_days,
     horizon_end=_h_end,
     params={
