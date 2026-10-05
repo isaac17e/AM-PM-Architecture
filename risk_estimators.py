@@ -23,9 +23,15 @@
 # Cornish-Fisher, un ajuste 2x2 con scipy.optimize.least_squares.
 # ==============================================================================
 
+import logging
+
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+
+# Los optimizadores silencian `warnings` (filterwarnings("ignore")); los avisos
+# del estimador van por logging para que sigan llegando a la consola.
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "trapezoid",
@@ -35,6 +41,7 @@ __all__ = [
     "average_correlation",
     "ledoit_wolf_constant_correlation",
     "cov_ewma_shrunk",
+    "LW_DELTA_MAX",
     "scale_cov",
     "nearest_psd",
     "q_to_p_vol",
@@ -149,48 +156,67 @@ def average_correlation(S):
     return float(vals.mean()) if vals.size else 0.0
 
 
-def ledoit_wolf_constant_correlation(returns, S=None, t_eff=None):
+def ledoit_wolf_constant_correlation(returns, S=None, t_eff=None, weights=None,
+                                     demean=True, delta_max=1.0, return_info=False):
     """Intensidad de shrinkage optima hacia el objetivo de correlacion constante.
 
     Ledoit & Wolf (2003), "Honey, I Shrunk the Sample Covariance Matrix".
     El objetivo F tiene las varianzas muestrales en la diagonal y, fuera de
     ella, la correlacion promedio reescalada: f_ij = rbar * sqrt(s_ii * s_jj).
 
-    delta* = max(0, min(1, (pi - rho) / gamma / T))
+    delta* = max(0, min(delta_max, (pi - rho) / gamma / T))
 
     Parametros
     ----------
     returns : (T, n) retornos. Se usan para los momentos de orden 4 que
-        entran en pi y rho; no se les aplican pesos EWMA porque la formula de
-        Ledoit-Wolf supone muestreo iid.
-    S : covarianza a encoger. Si es None se usa la muestral (MLE, divide por T).
-        Pasar aqui la matriz EWMA es la combinacion recomendada.
-    t_eff : tamano de muestra a usar en delta. Si se encogio una matriz EWMA,
-        pasar effective_sample_size(w); si es None se usa T.
+        entran en pi y rho.
+    S : covarianza a encoger. Si es None se usa la muestral con `weights`
+        (MLE, divide por T con pesos iguales). Pasar aqui la matriz EWMA es la
+        combinacion recomendada, junto con sus pesos.
+    t_eff : tamano de muestra a usar en delta. Si es None se usa el de Kish
+        de `weights` (T con pesos iguales).
+    weights : pesos de las filas (suman 1), los MISMOS con los que se calculo S.
+        None -> pesos iguales: Ledoit-Wolf clasico.
+    demean : centrar con la media ponderada (igual que ewma_cov).
+    delta_max : cota superior de delta. Si el delta bruto la supera (o supera
+        1) se registra un aviso con el valor bruto.
+    return_info : si True devuelve ademas un dict con delta_raw y delta.
 
-    Consistencia entre S y S_sample cuando S es la EWMA:
+    Consistencia cuando S es la EWMA:
       - El objetivo F (varianzas y correlacion promedio) y gamma = ||F - S||^2
-        se construyen con la MISMA matriz S que se encoge. gamma mide la
-        distancia entre el objetivo y el estimador que se va a mezclar; usar
-        S_sample aqui mezclaba dos estimadores distintos.
-      - pi y rho son los momentos de orden 4 de la MUESTRA (sin pesos): son
-        la varianza asintotica de la covarianza bajo iid, que la formula de
-        Ledoit-Wolf supone; el efecto de los pesos EWMA entra via t_eff.
-    Con S=None (caso clasico) ambas convenciones coinciden exactamente.
+        se construyen con la MISMA matriz S que se encoge.
+      - pi y rho (y la S_sample que entra en ellos) se calculan con los MISMOS
+        pesos EWMA, y el divisor es t_eff (Kish). Antes pi y rho eran los de la
+        muestra completa sin pesos divididos por t_eff: con un shock aislado
+        (COVID, marzo 2020) lejos en el pasado, pi quedaba ~3 veces inflado y
+        delta se saturaba en 1 (diagnostico mv_shrinkage_diag, variante D).
+    Con weights=None y S=None es exactamente el Ledoit-Wolf clasico.
 
-    Devuelve (S_shrunk, delta, F).
+    Devuelve (S_shrunk, delta, F), o (S_shrunk, delta, F, info) si return_info.
     """
     X = np.asarray(returns, dtype=float)
     T, n = X.shape
-    Xc = X - X.mean(axis=0)
+    if weights is None:
+        w = np.full(T, 1.0 / T)
+    else:
+        w = np.asarray(weights, dtype=float)
+        if w.shape != (T,):
+            raise ValueError("weights debe tener una entrada por fila de returns")
+        w = w / w.sum()
+    Xc = X - (w @ X) if demean else X
 
-    S_sample = (Xc.T @ Xc) / T
+    S_sample = (Xc * w[:, None]).T @ Xc
     if S is None:
         S = S_sample
     S = np.asarray(S, dtype=float)
 
+    info = {"delta_raw": 0.0, "delta": 0.0, "delta_max": float(delta_max)}
+
+    def _out(S_out, delta, F_out):
+        return (S_out, delta, F_out, info) if return_info else (S_out, delta, F_out)
+
     if n < 2 or T < 4:
-        return S, 0.0, S
+        return _out(S, 0.0, S)
 
     var = np.clip(np.diag(S), 1e-300, None)
     sd = np.sqrt(var)
@@ -200,14 +226,14 @@ def ledoit_wolf_constant_correlation(returns, S=None, t_eff=None):
     F = rbar * np.outer(sd, sd)
     np.fill_diagonal(F, var)
 
-    # pi_ij = (1/T) sum_t (x_ti x_tj - s_ij)^2
+    # pi_ij = sum_t w_t (x_ti x_tj - s_ij)^2   (w_t = 1/T en el caso clasico)
     Y = Xc ** 2
-    pi_mat = (Y.T @ Y) / T - S_sample ** 2
+    pi_mat = (Y * w[:, None]).T @ Y - S_sample ** 2
     pi_hat = float(pi_mat.sum())
 
-    # theta_ii,ij = (1/T) sum_t (x_ti^2 - s_ii)(x_ti x_tj - s_ij)
-    #             = (1/T) sum_t x_ti^3 x_tj - s_ii * s_ij
-    cube = (Xc ** 3).T @ Xc / T
+    # theta_ii,ij = sum_t w_t (x_ti^2 - s_ii)(x_ti x_tj - s_ij)
+    #             = sum_t w_t x_ti^3 x_tj - s_ii * s_ij
+    cube = (Xc ** 3 * w[:, None]).T @ Xc
     var_s = np.diag(S_sample)
     theta_ii = cube - var_s[:, None] * S_sample
     theta_jj = cube.T - var_s[None, :] * S_sample
@@ -221,19 +247,31 @@ def ledoit_wolf_constant_correlation(returns, S=None, t_eff=None):
     gamma_hat = float(np.sum((F - S) ** 2))
 
     if gamma_hat <= 0 or not np.isfinite(gamma_hat):
-        return S, 0.0, F
+        return _out(S, 0.0, F)
 
-    T_use = float(t_eff) if (t_eff is not None and t_eff > 1) else float(T)
-    delta = (pi_hat - rho_hat) / gamma_hat / T_use
-    delta = float(min(1.0, max(0.0, delta)))
+    T_use = float(t_eff) if (t_eff is not None and t_eff > 1) else effective_sample_size(w)
+    delta_raw = float((pi_hat - rho_hat) / gamma_hat / T_use)
+    cota = min(1.0, float(delta_max))
+    delta = float(min(cota, max(0.0, delta_raw)))
+    if delta_raw > cota:
+        logger.warning(
+            "Ledoit-Wolf: delta bruto %.3f supera la cota %.2f; se aplica %.3f "
+            "(t_eff=%.1f). Revisar la muestra (shocks aislados) o el halflife.",
+            delta_raw, cota, delta, T_use)
+    info.update(delta_raw=delta_raw, delta=delta)
 
     S_shrunk = delta * F + (1.0 - delta) * S
     S_shrunk = (S_shrunk + S_shrunk.T) / 2.0
-    return S_shrunk, delta, F
+    return _out(S_shrunk, delta, F)
+
+
+# Cota de delta en el pipeline EWMA + LW. Con el estimador consistente el delta
+# no deberia acercarse a 1; si lo hace se avisa y se recorta aqui.
+LW_DELTA_MAX = 0.9
 
 
 def cov_ewma_shrunk(returns, halflife=None, scale=1.0, demean=True,
-                    shrink=True, min_obs=60):
+                    shrink=True, min_obs=60, lw_delta_max=LW_DELTA_MAX):
     """Pipeline completo: EWMA -> shrinkage Ledoit-Wolf -> reescalado.
 
     Es el reemplazo directo de `returns.cov() * factor` en los optimizadores.
@@ -249,8 +287,10 @@ def cov_ewma_shrunk(returns, halflife=None, scale=1.0, demean=True,
     shrink : aplicar Ledoit-Wolf sobre la matriz EWMA.
     min_obs : por debajo de este numero de filas se devuelve la covarianza
         muestral simple reescalada, sin EWMA ni shrinkage.
+    lw_delta_max : cota del delta de Ledoit-Wolf (aviso si el bruto la supera).
 
-    Devuelve (cov, info) donde info trae delta, t_eff y n_obs.
+    Devuelve (cov, info) donde info trae delta (aplicado), delta_raw, t_eff y
+    n_obs.
     """
     if isinstance(returns, pd.DataFrame):
         cols = list(returns.columns)
@@ -261,8 +301,8 @@ def cov_ewma_shrunk(returns, halflife=None, scale=1.0, demean=True,
         X = X[np.isfinite(X).all(axis=1)]
 
     T = X.shape[0]
-    info = {"n_obs": T, "delta": 0.0, "t_eff": float(T), "halflife": halflife,
-            "method": "ewma+lw"}
+    info = {"n_obs": T, "delta": 0.0, "delta_raw": 0.0, "t_eff": float(T),
+            "halflife": halflife, "method": "ewma+lw"}
 
     if T < max(min_obs, 4):
         cov = np.cov(X, rowvar=False, ddof=1) if T > 1 else np.zeros((X.shape[1],) * 2)
@@ -274,8 +314,12 @@ def cov_ewma_shrunk(returns, halflife=None, scale=1.0, demean=True,
     info["t_eff"] = effective_sample_size(w)
 
     if shrink:
-        cov, delta, _ = ledoit_wolf_constant_correlation(X, S=cov, t_eff=info["t_eff"])
+        cov, delta, _, lw = ledoit_wolf_constant_correlation(
+            X, S=cov, t_eff=info["t_eff"], weights=w, demean=demean,
+            delta_max=lw_delta_max, return_info=True)
         info["delta"] = delta
+        info["delta_raw"] = lw["delta_raw"]
+        info["delta_max"] = lw["delta_max"]
     else:
         info["method"] = "ewma"
 

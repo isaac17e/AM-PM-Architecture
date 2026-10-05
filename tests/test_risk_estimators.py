@@ -104,13 +104,97 @@ def test_ledoit_wolf_standard_case_regression(retornos):
 def test_ledoit_wolf_ewma_target_is_built_from_shrunk_matrix(retornos):
     cov_e, w = rk.ewma_cov(retornos, halflife=60)
     S_shr, delta, F = rk.ledoit_wolf_constant_correlation(
-        retornos, S=cov_e, t_eff=rk.effective_sample_size(w))
+        retornos, S=cov_e, t_eff=rk.effective_sample_size(w), weights=w)
     assert 0.0 <= delta <= 1.0
     # F conserva las varianzas de la matriz que se encoge (EWMA), no las muestrales
     assert np.allclose(np.diag(F), np.diag(cov_e))
     assert F[0, 1] == pytest.approx(rk.average_correlation(cov_e) * np.sqrt(cov_e[0, 0] * cov_e[1, 1]))
     # S_shrunk es la combinacion convexa exacta con la misma F y delta
     assert np.allclose(S_shr, delta * F + (1 - delta) * cov_e)
+    # Con los pesos EWMA, S=None reconstruye la misma matriz y el mismo delta
+    S_def, delta_def, _ = rk.ledoit_wolf_constant_correlation(retornos, weights=w)
+    assert delta_def == pytest.approx(delta, rel=1e-10)
+    assert np.allclose(S_def, S_shr, rtol=1e-10, atol=1e-14)
+
+
+def _lw_ewma_referencia_delta(X, w):
+    """delta bruto consistente con bucles: pi, rho y S con los pesos w, divisor Kish."""
+    T, n = X.shape
+    w = w / w.sum()
+    Xc = X - w @ X
+    S = np.array([[np.sum(w * Xc[:, i] * Xc[:, j]) for j in range(n)] for i in range(n)])
+    sd = np.sqrt(np.diag(S))
+    rbar = np.mean([S[i, j] / (sd[i] * sd[j]) for i in range(n) for j in range(n) if i != j])
+    F = rbar * np.outer(sd, sd)
+    np.fill_diagonal(F, np.diag(S))
+    pi = np.array([[np.sum(w * (Xc[:, i] * Xc[:, j] - S[i, j]) ** 2) for j in range(n)]
+                   for i in range(n)])
+    rho = np.trace(pi)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            th_ii = np.sum(w * (Xc[:, i] ** 2 - S[i, i]) * (Xc[:, i] * Xc[:, j] - S[i, j]))
+            th_jj = np.sum(w * (Xc[:, j] ** 2 - S[j, j]) * (Xc[:, i] * Xc[:, j] - S[i, j]))
+            rho += (rbar / 2.0) * (sd[j] / sd[i] * th_ii + sd[i] / sd[j] * th_jj)
+    gamma = np.sum((F - S) ** 2)
+    return (pi.sum() - rho) / gamma / (1.0 / np.sum(w ** 2))
+
+
+@pytest.fixture(scope="module")
+def retornos_shock_covid():
+    """367 semanas con un crash de 2 semanas (y 4 de resaca) al inicio de la serie."""
+    rng = np.random.default_rng(5)
+    T, n = 367, 10
+    L = rng.normal(size=(n, n))
+    C = L @ L.T / n + np.eye(n) * 0.5
+    X = rng.standard_normal((T, n)) @ np.linalg.cholesky(C).T * 0.02
+    X += rng.standard_normal(T)[:, None] * 0.01
+    X[24:26] = -0.25 + rng.standard_normal((2, n)) * 0.08
+    X[26:30] *= 4.0
+    return X
+
+
+def test_ledoit_wolf_ewma_does_not_saturate_with_covid_shock(retornos_shock_covid, caplog):
+    X = retornos_shock_covid
+    cov_e, w = rk.ewma_cov(X, halflife=26)
+    t_eff = rk.effective_sample_size(w)
+
+    # Forma anterior (pi y rho sin pesos, divisor t_eff): el shock lejano infla
+    # pi y el delta bruto pasa de 1.
+    _, delta_viejo, _, info_viejo = rk.ledoit_wolf_constant_correlation(
+        X, S=cov_e, t_eff=t_eff, return_info=True)
+    assert info_viejo["delta_raw"] > 1.0
+    assert delta_viejo == 1.0
+
+    # Forma consistente: coincide con la referencia con bucles y no se satura
+    esperado = _lw_ewma_referencia_delta(X, w)
+    caplog.clear()   # descarta el aviso de la forma anterior; caplog acumula todo el test
+    with caplog.at_level("WARNING", logger="risk_estimators"):
+        cov, info = rk.cov_ewma_shrunk(X, halflife=26)
+    assert info["delta_raw"] == pytest.approx(esperado, rel=1e-9)
+    assert info["delta"] == pytest.approx(esperado, rel=1e-9)
+    assert 0.0 < info["delta"] < rk.LW_DELTA_MAX
+    assert info["t_eff"] == pytest.approx(t_eff)
+    assert not caplog.records
+
+
+def test_ledoit_wolf_delta_cap_logs_raw_delta(retornos_shock_covid, caplog):
+    X = retornos_shock_covid
+    cov_e, w = rk.ewma_cov(X, halflife=26)
+    with caplog.at_level("WARNING", logger="risk_estimators"):
+        S_shr, delta, F, info = rk.ledoit_wolf_constant_correlation(
+            X, S=cov_e, t_eff=rk.effective_sample_size(w), delta_max=0.9,
+            return_info=True)
+    assert info["delta_raw"] > 1.0
+    assert delta == info["delta"] == pytest.approx(0.9)
+    assert np.allclose(S_shr, 0.9 * F + 0.1 * cov_e)
+    assert any("delta bruto" in r.getMessage() for r in caplog.records)
+
+    # La cota del pipeline tambien recorta y guarda ambos valores
+    _, info_p = rk.cov_ewma_shrunk(X, halflife=26, lw_delta_max=0.05)
+    assert info_p["delta"] == pytest.approx(0.05)
+    assert info_p["delta_raw"] > 0.05
 
 
 def test_cov_ewma_shrunk_pipeline(retornos):

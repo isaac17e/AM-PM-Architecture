@@ -191,7 +191,11 @@ ratio_band = 0.20
 # ------------------------------------------------------------------------------
 hist_cov_frequency = "auto"
 cov_halflife_days = 120
-cov_halflife_weeks = 26
+# 52 semanas (antes 26): t_eff (Kish) pasa de ~75 a ~148 semanas. Con 26 el
+# delta de Ledoit-Wolf se saturaba en 1 en la ruta semanal (mv_shrinkage_diag).
+# El halflife diario (120 d, t_eff ~346) no se toca: con el estimador
+# consistente su delta es ~0.11, sin saturacion.
+cov_halflife_weeks = 52
 use_lw_shrinkage = True
 
 hist_shrink_alpha = 0.35
