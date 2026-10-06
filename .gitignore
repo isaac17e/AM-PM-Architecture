@@ -9,3 +9,10 @@ portfolio_risk_history.csv
 portfolio_vix_report.html
 .cache/
 pipeline/
+
+# graphify: versionar solo graph.json, GRAPH_REPORT.md y manifest.json
+graphify-out/graph.html
+graphify-out/cache/
+graphify-out/cost.json
+graphify-out/.graphify_*
+graphify-out/.needs_update
