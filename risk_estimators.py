@@ -1033,3 +1033,122 @@ def portfolio_log_returns(asset_log_returns, weights):
     X = np.asarray(asset_log_returns, dtype=float)
     w = np.asarray(weights, dtype=float)
     return np.log1p(np.expm1(X) @ w)
+
+
+# ==============================================================================
+# 8. CONSISTENCIA DE LA IV DEL PROVEEDOR CON LA TASA DEL SCRIPT
+# ==============================================================================
+# Polygon/Massive entrega `implied_volatility` ya invertida con su propio
+# modelo (tasa, dividendos, spot), que no publica. Los scripts reprecian esa
+# IV con Black-Scholes a la tasa libre del script (r = rf, q = 0) para la
+# integral BKM. Si el acarreo del proveedor no es rf, los precios
+# reconstruidos no son los del mercado: en MCD (oct-2026) la call ATM salia
+# con 25.5% y la put del mismo strike con 22.2%, y la cadena OTM (puts bajo
+# el spot, calls encima) tenia un salto en el ATM que inflaba MFIS.
+#
+# Los precios de mercado cumplen paridad call-put. Con un acarreo b se
+# reconstruyen C(b) = BS(iv_call; b) y P(b) = BS(iv_put; b); C(b) - P(b)
+# crece con b, asi que hay un unico b que deja C - P = S - K e^{-rT} en los
+# strikes con ambos lados. Con ese b los precios quedan sin salto en el ATM
+# y consistentes con la convencion del script (sin dividendos). Si no hay
+# pares, o b cae en la cota, se usa rf: el comportamiento anterior.
+# ==============================================================================
+
+def bs_price(S, K, T, r, sigma, is_call):
+    """Precio Black-Scholes europeo (q = 0). Vectorizado; NaN si T o sigma <= 0."""
+    S, K, T, r, sigma = (np.asarray(x, dtype=float) for x in (S, K, T, r, sigma))
+    is_call = np.asarray(is_call, dtype=bool)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sq = sigma * np.sqrt(T)
+        d1 = (np.log(S / K) + (r + sigma ** 2 / 2.0) * T) / sq
+        d2 = d1 - sq
+        df = np.exp(-r * T)
+        call = S * norm.cdf(d1) - K * df * norm.cdf(d2)
+        put = K * df * norm.cdf(-d2) - S * norm.cdf(-d1)
+    out = np.where(is_call, call, put)
+    out = np.where((T > 0) & (sigma > 0) & (S > 0) & (K > 0), out, np.nan)
+    return float(out) if out.ndim == 0 else out
+
+
+def bs_implied_vol(price, S, K, T, r, is_call, lo=1e-4, hi=5.0, n_iter=100):
+    """IV Black-Scholes (q = 0) por biseccion vectorizada.
+
+    NaN si el precio cae fuera de [precio con lo, precio con hi]: bajo el
+    valor intrinseco descontado o por encima del limite de arbitraje.
+    """
+    price, S, K, T, r = (np.asarray(x, dtype=float) for x in (price, S, K, T, r))
+    is_call = np.asarray(is_call, dtype=bool)
+    shape = np.broadcast(price, S, K, T, r, is_call).shape
+    price, S, K, T, r, is_call = (np.broadcast_to(x, shape) for x in (price, S, K, T, r, is_call))
+    a = np.full(shape, lo)
+    b = np.full(shape, hi)
+    p_lo = bs_price(S, K, T, r, a, is_call)
+    p_hi = bs_price(S, K, T, r, b, is_call)
+    ok = np.isfinite(price) & (price >= p_lo) & (price <= p_hi)
+    for _ in range(n_iter):
+        m = (a + b) / 2.0
+        alto = bs_price(S, K, T, r, m, is_call) > price
+        b = np.where(alto, m, b)
+        a = np.where(alto, a, m)
+    out = np.where(ok, (a + b) / 2.0, np.nan)
+    return float(out) if out.ndim == 0 else out
+
+
+def calibrate_iv_carry(S, T, rate, strikes, iv_call, iv_put, band=0.10,
+                       bounds=(-0.20, 0.20), min_pairs=1):
+    """Acarreo con el que la IV del proveedor reproduce precios con paridad.
+
+    strikes, iv_call, iv_put: strikes de UN vencimiento con call y put. Se
+    usan los pares con IV positiva y |ln(K/S)| <= band. Minimiza
+    sum (C(b) - P(b) - (S - K e^{-rate T}))^2 en b dentro de `bounds`.
+
+    Devuelve dict:
+      carry          tasa con la que reconstruir precios desde la IV (rate si no ok)
+      ok             False sin pares suficientes o con b en la cota
+      n_pairs        pares usados
+      iv_gap_before  media de |iv_call - iv_put| tal como vienen
+      iv_gap_after   la misma brecha re-invertida a `rate` con `carry`
+    """
+    from scipy.optimize import minimize_scalar
+
+    out = {"carry": float(rate), "ok": False, "n_pairs": 0,
+           "iv_gap_before": float("nan"), "iv_gap_after": float("nan")}
+    K = np.asarray(strikes, dtype=float)
+    ivc = np.asarray(iv_call, dtype=float)
+    ivp = np.asarray(iv_put, dtype=float)
+    if not (np.isfinite(S) and S > 0 and np.isfinite(T) and T > 0) or K.size == 0:
+        return out
+    m = (np.isfinite(K) & (K > 0) & np.isfinite(ivc) & (ivc > 0)
+         & np.isfinite(ivp) & (ivp > 0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m &= np.abs(np.log(K / S)) <= band
+    K, ivc, ivp = K[m], ivc[m], ivp[m]
+    out["n_pairs"] = int(K.size)
+    if K.size == 0:
+        return out
+    out["iv_gap_before"] = float(np.mean(np.abs(ivc - ivp)))
+    if K.size < min_pairs:
+        return out
+
+    paridad = S - K * np.exp(-rate * T)
+
+    def residuo(b):
+        c = bs_price(S, K, T, b, ivc, True)
+        p = bs_price(S, K, T, b, ivp, False)
+        return float(np.sum(((c - p - paridad) / S) ** 2))
+
+    lo, hi = bounds
+    res = minimize_scalar(residuo, bounds=(lo, hi), method="bounded",
+                          options={"xatol": 1e-7})
+    b = float(res.x)
+    if not np.isfinite(b) or min(b - lo, hi - b) < 1e-4:
+        return out
+    c = bs_implied_vol(bs_price(S, K, T, b, ivc, True), S, K, T, rate, True)
+    p = bs_implied_vol(bs_price(S, K, T, b, ivp, False), S, K, T, rate, False)
+    out.update(carry=b, ok=True, iv_gap_after=float(np.nanmean(np.abs(c - p))))
+    return out
+
+
+def iv_at_rate(iv, S, K, T, carry, rate, is_call):
+    """IV del proveedor (invertida con `carry`) expresada a la tasa `rate`."""
+    return bs_implied_vol(bs_price(S, K, T, carry, iv, is_call), S, K, T, rate, is_call)

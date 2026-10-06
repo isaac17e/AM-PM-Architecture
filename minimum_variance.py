@@ -825,7 +825,6 @@ def get_polygon_option_snapshot(ticker):
 
         url = (
             f"https://api.polygon.io/v3/snapshot/options/{pc.polygon_format_ticker(ticker)}?"
-            f"contract_type=call&"
             f"strike_price.gte={strike_min:.2f}&strike_price.lte={strike_max:.2f}&"
             f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
             f"limit=250"
@@ -845,21 +844,41 @@ def get_polygon_option_snapshot(ticker):
         df["dte"] = (df["expiracion"] - hoy_ts).dt.days
 
         df = df[(df["dte"] >= target_dte_iv - dte_tol_iv) & (df["dte"] <= target_dte_iv + dte_tol_iv)].copy()
-        if len(df) == 0:
-            raise ValueError("sin contratos en la ventana ~30 DTE")
+        calls = df[df["details.contract_type"] == "call"].copy()
+        if len(calls) == 0:
+            raise ValueError("sin calls en la ventana ~30 DTE")
 
-        rango = pc.expiry_rank_columns(df["dte"], target_dte_iv, np.ones(len(df)), dte_min_iv)
-        df = df.assign(**rango)
-        df["_moneyness"] = (df["strike"] / S - 1).abs()
-        df = df.sort_values(pc.EXPIRY_SORT_COLS + ["_moneyness"])
-        elegido = df.iloc[0]
+        rango = pc.expiry_rank_columns(calls["dte"], target_dte_iv, np.ones(len(calls)), dte_min_iv)
+        calls = calls.assign(**rango)
+        calls["_moneyness"] = (calls["strike"] / S - 1).abs()
+        calls = calls.sort_values(pc.EXPIRY_SORT_COLS + ["_moneyness"])
+        elegido = calls.iloc[0]
 
         spot_final = elegido.get("underlying_asset.price", np.nan)
         spot_final = float(spot_final) if not pd.isna(spot_final) else S
 
+        # La IV de Polygon viene invertida con su propio acarreo: se calibra con
+        # los pares call/put del mismo vencimiento y se lleva a risk_free_rate.
+        iv_api = elegido.get("implied_volatility", np.nan)
+        iv_api = float(iv_api) if not pd.isna(iv_api) else np.nan
+        misma = df[df["expiracion"] == elegido["expiracion"]]
+        pares = pc.pares_call_put(pd.DataFrame({
+            "strike": misma["strike"],
+            "iv": misma["implied_volatility"] if "implied_volatility" in misma else np.nan,
+            "type": misma["details.contract_type"]}))
+        T_iv = rk.to_years(dte=float(elegido["dte"]))
+        ajuste = rk.calibrate_iv_carry(spot_final, T_iv, risk_free_rate,
+                                       pares["strike"], pares["iv_call"], pares["iv_put"])
+        iv_tasa = (rk.iv_at_rate(iv_api, spot_final, float(elegido["strike"]), T_iv,
+                                 ajuste["carry"], risk_free_rate, True)
+                   if np.isfinite(iv_api) and iv_api > 0 else np.nan)
+
         resultado = dict(
             spot=spot_final,
-            iv=float(elegido.get("implied_volatility", np.nan)) if not pd.isna(elegido.get("implied_volatility", np.nan)) else np.nan,
+            iv=iv_tasa if np.isfinite(iv_tasa) else iv_api,
+            iv_api=iv_api,
+            carry=ajuste["carry"],
+            carry_ok=ajuste["ok"],
             delta=float(elegido.get("greeks.delta", np.nan)) if not pd.isna(elegido.get("greeks.delta", np.nan)) else np.nan,
             gamma=float(elegido.get("greeks.gamma", np.nan)) if not pd.isna(elegido.get("greeks.gamma", np.nan)) else np.nan,
             vega=float(elegido.get("greeks.vega", np.nan)) if not pd.isna(elegido.get("greeks.vega", np.nan)) else np.nan,
@@ -907,12 +926,18 @@ def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_
         target_dte, api_key=POLYGON_API_KEY, strike_fmt="{:.2f}", min_dte=dte_min_iv)
 
 
-def bkm_iv_chain_to_prices(S, r, T, chain_df):
+def bkm_iv_chain_to_prices(S, r, T, chain_df, carry=None):
+    """Precio de cada opcion desde su IV de Polygon.
+
+    `carry` es la tasa con la que Polygon invirtio esa IV (rk.calibrate_iv_carry).
+    Reprecia con ella para recuperar el precio de mercado; None usa `r`.
+    """
     if chain_df is None or chain_df.empty:
         return chain_df
+    tasa = r if carry is None else carry
     chain_df = chain_df.copy()
     chain_df["price"] = [
-        bs_price(S, k, T, r, iv, tipo)
+        bs_price(S, k, T, tasa, iv, tipo)
         for k, iv, tipo in zip(chain_df["strike"], chain_df["iv"], chain_df["type"])
     ]
     chain_df = chain_df[chain_df["price"].notna() & (chain_df["price"] > 0)]
@@ -993,10 +1018,16 @@ def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
 
     dte = info_cadena["dte"] if np.isfinite(info_cadena["dte"]) and info_cadena["dte"] > 0 else target_dte
     T = rk.to_years(dte=dte)
-    calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df)
-    puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df)
+    pares = info_cadena.get("pares")
+    if pares is None or len(pares) == 0:
+        pares = pd.DataFrame(columns=["strike", "iv_call", "iv_put"])
+    ajuste = rk.calibrate_iv_carry(S, T, rf, pares["strike"], pares["iv_call"], pares["iv_put"])
+    calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df, carry=ajuste["carry"])
+    puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df, carry=ajuste["carry"])
     mom = bkm_compute_moments(S, rf, T, calls_df, puts_df)
-    mom.update(spot=S, dte=int(dte), expiracion=info_cadena["expiracion"], transitorio=False)
+    mom.update(spot=S, dte=int(dte), expiracion=info_cadena["expiracion"], transitorio=False,
+               carry=ajuste["carry"], carry_ok=ajuste["ok"], n_pares=ajuste["n_pairs"],
+               iv_gap_antes=ajuste["iv_gap_before"], iv_gap_despues=ajuste["iv_gap_after"])
     return mom
 
 
@@ -1206,6 +1237,7 @@ print(f"  OK Candidatos previos al filtro: {len(selected_pre_seasonal)}")
 print(f"  OK Con VaR_CF calculable (>={hv_min_obs_weeks} sem hist.): {n_con_tail} "
       f"(BKM: {n_con_tail - n_hist_tail} | historico: {n_hist_tail})")
 print(f"  ADVERTENCIA Descartados (sin cobertura BKM o con MFIS/MFIK inadmisibles): {n_sin_tail}")
+print("  " + qm.texto_ajuste_iv(qm.resumen_ajuste_iv(bkm_moments_cache.values()), risk_free_rate))
 
 tail_risk_final = tail_risk_stats.head(n_divers_candidates)
 print(f"  OK Seleccionados (<={n_divers_candidates}, menor VaR_CF/Tail Risk Score): {len(tail_risk_final)}")

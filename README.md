@@ -47,10 +47,12 @@ Each optimizer is a standalone script. Shared estimation lives in imported modul
 ```
 
 ### `polygon_client.py`
-Shared Polygon.io access: a process-wide rate limiter (`POLYGON_CALLS_PER_MINUTE`, default 100), retries with exponential backoff, jitter, and `Retry-After`, pagination that never treats a truncated chain as complete, a disk cache (permanent for history, TTL for snapshots), and `polygon_format_ticker` (`BRK-B` → `BRK.B`). Non-US suffixes are not sent to the options chain.
+Shared Polygon.io access: a process-wide rate limiter (`POLYGON_CALLS_PER_MINUTE`, default 100), retries with exponential backoff, jitter, and `Retry-After`, pagination that never treats a truncated chain as complete, a disk cache (permanent for history, TTL for snapshots), and `polygon_format_ticker` (`BRK-B` → `BRK.B`). Non-US suffixes are not sent to the options chain. `fetch_otm_chain` also returns, in `info["pares"]`, the strikes of the chosen expiry that have both a call and a put; they feed `risk_estimators.calibrate_iv_carry`.
 
 ### `risk_estimators.py`
 Estimation the optimizers share: EWMA covariance with Ledoit-Wolf shrinkage, Q→P vol and correlation, co-moment portfolio skewness and kurtosis, Cornish-Fisher VaR/ES (Maillard, 2012), `scale_moments` / `implied_variance_to_horizon` for changing the horizon, and `trapezoid` (`np.trapezoid` on NumPy 2, `np.trapz` on 1.x). BKM integration goes through `trapezoid`; no script calls `np.trapezoid` directly.
+
+`calibrate_iv_carry` fixes the rate behind Polygon's `implied_volatility`. Polygon inverts each IV with its own carry, which it does not publish; repricing that IV at the script's `rf` gave prices off the market (MCD, Oct 2026: ATM call 25.5% vs put 22.2% on the same strike) and a jump at the money in the OTM chain that biased MFIS upward. The carry is the one that makes the call and put of each strike (within ±10% of spot) satisfy put-call parity at `rf`. `minimum_variance.py` and `quadratic_utility.py` reprice the BKM chain with it and convert the ATM IV with `iv_at_rate`; with no pairs, or a carry at the bound, they keep `rf`. The seasonal versions do not apply it yet.
 
 ### `market_data.py`
 Currency comes from the provider (`yfinance` `history_metadata`). A manual override is used only when the provider is silent, and a contradiction is reported rather than applied (HSBC and BP are USD ADRs). Prices in minor units (GBp, ZAc) are scaled before FX. Daily panels align to one calendar with a bounded forward-fill. A weekly `resample("W")` drops the in-progress week.

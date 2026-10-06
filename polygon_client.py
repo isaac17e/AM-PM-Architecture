@@ -75,6 +75,7 @@ __all__ = [
     "estimate_minutes",
     "fetch_option_aggs",
     "fetch_otm_chain",
+    "pares_call_put",
     "diag",
     "print_diagnostics",
     "n_fallos_transitorios",
@@ -569,6 +570,7 @@ def es_transitorio(status):
 # ==============================================================================
 
 _COLS_CADENA = ["strike", "iv", "type"]
+_COLS_PARES = ["strike", "iv_call", "iv_put"]
 EXPIRY_SORT_COLS = ["_bajo_min", "_bajo_obj", "_dist", "_n"]
 
 
@@ -600,10 +602,13 @@ def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
 
     Devuelve (calls_df, puts_df, info). info trae completo (False si la
     descarga quedo incompleta por un fallo transitorio), status, expiracion
-    elegida y dte.
+    elegida, dte y pares: strikes del vencimiento elegido con call y put
+    (columnas strike, iv_call, iv_put), antes del recorte OTM. Los pares
+    calibran el acarreo de la IV del proveedor (rk.calibrate_iv_carry).
     """
     vacio = pd.DataFrame(columns=_COLS_CADENA)
-    info = {"completo": True, "status": 200, "expiracion": None, "dte": np.nan}
+    info = {"completo": True, "status": 200, "expiracion": None, "dte": np.nan,
+            "pares": pd.DataFrame(columns=_COLS_PARES)}
     if not is_us_ticker(underlying):
         info["status"] = "no_us"
         return vacio, vacio.copy(), info
@@ -636,9 +641,9 @@ def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
     if not filas:
         return vacio, vacio.copy(), info
 
-    df = pd.DataFrame(filas).dropna(subset=["strike", "expiracion"])
-    df = df[((df["type"] == "call") & (df["strike"] >= S))
-            | ((df["type"] == "put") & (df["strike"] < S))]
+    todos = pd.DataFrame(filas).dropna(subset=["strike", "expiracion"])
+    df = todos[((todos["type"] == "call") & (todos["strike"] >= S))
+               | ((todos["type"] == "put") & (todos["strike"] < S))]
     if df.empty:
         return vacio, vacio.copy(), info
 
@@ -658,5 +663,22 @@ def fetch_otm_chain(underlying, S, fecha_min, fecha_max, strike_min, strike_max,
     df = df[df["expiracion"] == elegido["expiracion"]]
     calls = df[df["type"] == "call"][_COLS_CADENA].drop_duplicates("strike").reset_index(drop=True)
     puts = df[df["type"] == "put"][_COLS_CADENA].drop_duplicates("strike").reset_index(drop=True)
-    info.update(expiracion=elegido["expiracion"], dte=int(elegido["dte"]))
+    info.update(expiracion=elegido["expiracion"], dte=int(elegido["dte"]),
+                pares=pares_call_put(todos[todos["expiracion"] == elegido["expiracion"]]))
     return calls, puts, info
+
+
+def pares_call_put(cadena):
+    """Strikes con call y put en `cadena` (columnas strike, iv, type).
+
+    Devuelve strike, iv_call, iv_put ordenado por strike. Si un strike trae
+    duplicados se queda el primero, como la cadena OTM.
+    """
+    if cadena is None or len(cadena) == 0:
+        return pd.DataFrame(columns=_COLS_PARES)
+    lados = {}
+    for tipo, col in (("call", "iv_call"), ("put", "iv_put")):
+        lado = cadena[cadena["type"] == tipo].drop_duplicates("strike")
+        lados[col] = lado.set_index("strike")["iv"].rename(col)
+    pares = pd.concat(lados.values(), axis=1, join="inner").dropna()
+    return pares.rename_axis("strike").reset_index()[_COLS_PARES].sort_values("strike").reset_index(drop=True)

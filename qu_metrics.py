@@ -1135,3 +1135,33 @@ def relajar_banda_etf(n_etf, n_acciones, max_weight, etf_lo, etf_hi):
     hi = min(1.0, max(float(etf_hi), 1.0 - cap_acc))
     lo = min(lo, hi)
     return lo, hi
+
+
+def resumen_ajuste_iv(momentos):
+    """Resumen del ajuste IV/tasa sobre momentos BKM (dicts con carry, carry_ok...).
+
+    Cuenta solo las cadenas consultadas (las que traen `carry`). Medianas sobre
+    las calibradas (carry_ok). Brechas en puntos de vol (0.05 = 5 puntos).
+    """
+    filas = [m for m in momentos if isinstance(m, dict) and "carry" in m]
+    ok = [m for m in filas if m.get("carry_ok")]
+
+    def _mediana(clave):
+        vals = [float(m[clave]) for m in ok if m.get(clave) is not None and np.isfinite(m[clave])]
+        return float(np.median(vals)) if vals else float("nan")
+
+    return {"n": len(filas), "n_ok": len(ok), "carry_mediana": _mediana("carry"),
+            "brecha_antes": _mediana("iv_gap_antes"), "brecha_despues": _mediana("iv_gap_despues")}
+
+
+def texto_ajuste_iv(resumen, rate):
+    """Linea de consola para `resumen_ajuste_iv`."""
+    if not resumen["n"]:
+        return "Ajuste IV/tasa: sin cadenas consultadas"
+    if not resumen["n_ok"]:
+        return (f"Ajuste IV/tasa: 0 de {resumen['n']} cadenas con pares call/put; "
+                f"se reprecia a la tasa del script ({rate:.2%})")
+    return (f"Ajuste IV/tasa: {resumen['n_ok']} de {resumen['n']} cadenas calibradas | "
+            f"acarreo implicito mediano de Polygon {resumen['carry_mediana']:+.2%} (script {rate:.2%}) | "
+            f"brecha IV call-put mediana {resumen['brecha_antes'] * 100:.1f} -> "
+            f"{resumen['brecha_despues'] * 100:.1f} puntos")
