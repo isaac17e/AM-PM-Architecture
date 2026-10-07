@@ -420,9 +420,11 @@ def polygon_get_atm_option(ticker, target_dte, dte_tol=21, api_key=None, contrac
         filtro_strike = (f"strike_price.gte={S * (1 - atm_strike_band):.4f}&"
                          f"strike_price.lte={S * (1 + atm_strike_band):.4f}&")
 
+    # Calls y puts juntos: los pares del mismo strike calibran el acarreo con
+    # el que Polygon invirtio la IV (rk.calibrate_iv_carry).
     url_chain = (
         f"https://api.polygon.io/v3/snapshot/options/{polygon_format_ticker(ticker)}?"
-        f"contract_type={contract_type}&{filtro_strike}"
+        f"{filtro_strike}"
         f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
         f"limit=250"
     )
@@ -436,19 +438,34 @@ def polygon_get_atm_option(ticker, target_dte, dte_tol=21, api_key=None, contrac
             return vacio
 
         df["dte"] = (pd.to_datetime(df["details.expiration_date"]) - pd.Timestamp(hoy)).dt.days
-        df = df[df.get("implied_volatility").notna() & (df.get("implied_volatility") > 0) &
-                 df.get("greeks.delta").notna()].copy()
-        if df.empty:
+        df = df[df.get("implied_volatility").notna() & (df.get("implied_volatility") > 0)].copy()
+        lado = df[(df["details.contract_type"] == contract_type) & df.get("greeks.delta").notna()].copy()
+        if lado.empty:
             return vacio
 
-        rango = pc.expiry_rank_columns(df["dte"], target_dte, np.ones(len(df)), polygon_dte_min)
-        df = df.assign(**rango)
-        df["_delta"] = (df["greeks.delta"] - 0.50).abs()
-        df = df.sort_values(pc.EXPIRY_SORT_COLS + ["_delta"])
-        c1 = df.iloc[0]
+        rango = pc.expiry_rank_columns(lado["dte"], target_dte, np.ones(len(lado)), polygon_dte_min)
+        lado = lado.assign(**rango)
+        lado["_delta"] = (lado["greeks.delta"] - 0.50).abs()
+        lado = lado.sort_values(pc.EXPIRY_SORT_COLS + ["_delta"])
+        c1 = lado.iloc[0]
+
+        misma = df[df["details.expiration_date"] == c1["details.expiration_date"]]
+        pares = pc.pares_call_put(pd.DataFrame({
+            "strike": misma["details.strike_price"], "iv": misma["implied_volatility"],
+            "type": misma["details.contract_type"]}))
+        S_cal = c1.get("underlying_asset.price", np.nan)
+        S_cal = float(S_cal) if not pd.isna(S_cal) else S
+        T_iv = rk.to_years(dte=float(c1["dte"]))
+        ajuste = rk.calibrate_iv_carry(S_cal, T_iv, rf_rate, pares["strike"], pares["iv_call"], pares["iv_put"])
+        iv_api = float(c1["implied_volatility"])
+        iv_tasa = rk.iv_at_rate(iv_api, S_cal, float(c1["details.strike_price"]), T_iv,
+                                ajuste["carry"], rf_rate, contract_type == "call")
 
         return dict(
-            iv=c1.get("implied_volatility", np.nan),
+            iv=iv_tasa if np.isfinite(iv_tasa) else iv_api,
+            iv_api=iv_api,
+            carry=ajuste["carry"],
+            carry_ok=ajuste["ok"],
             delta=c1.get("greeks.delta", np.nan),
             gamma=c1.get("greeks.gamma", np.nan),
             vega=c1.get("greeks.vega", np.nan),
@@ -527,12 +544,18 @@ def get_spot_safe_bkm(ticker):
 # ==============================================================================
 # FUNCIONES BKM (Bakshi, Kapadia y Madan, 2003)
 # ==============================================================================
-def bkm_iv_chain_to_prices(S, r, T, chain_df):
+def bkm_iv_chain_to_prices(S, r, T, chain_df, carry=None):
+    """Precio de cada opcion desde su IV de Polygon.
+
+    `carry` es la tasa con la que Polygon invirtio esa IV (rk.calibrate_iv_carry).
+    Reprecia con ella para recuperar el precio de mercado; None usa `r`.
+    """
     if chain_df is None or chain_df.empty:
         return chain_df
+    tasa = r if carry is None else carry
     chain_df = chain_df.copy()
     chain_df["price"] = [
-        bs_price(S, k, T, r, iv, tipo)
+        bs_price(S, k, T, tasa, iv, tipo)
         for k, iv, tipo in zip(chain_df["strike"], chain_df["iv"], chain_df["type"])
     ]
     chain_df = chain_df[chain_df["price"].notna() & (chain_df["price"] > 0)]
@@ -622,13 +645,19 @@ def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
             return vacio
         dte = target_dte
     T = rk.to_years(dte=float(dte))
-    calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df)
-    puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df)
+    pares = info_cadena.get("pares")
+    if pares is None or len(pares) == 0:
+        pares = pd.DataFrame(columns=["strike", "iv_call", "iv_put"])
+    ajuste = rk.calibrate_iv_carry(S, T, rf, pares["strike"], pares["iv_call"], pares["iv_put"])
+    calls_df = bkm_iv_chain_to_prices(S, rf, T, calls_df, carry=ajuste["carry"])
+    puts_df = bkm_iv_chain_to_prices(S, rf, T, puts_df, carry=ajuste["carry"])
     mom = bkm_compute_moments(S, rf, T, calls_df, puts_df)
     mom["spot"] = S
     mom["dte"] = int(dte)
     mom["expiracion"] = info_cadena["expiracion"]
     mom["transitorio"] = False
+    mom.update(carry=ajuste["carry"], carry_ok=ajuste["ok"], n_pares=ajuste["n_pairs"],
+               iv_gap_antes=ajuste["iv_gap_before"], iv_gap_despues=ajuste["iv_gap_after"])
     return mom
 
 
@@ -1993,6 +2022,7 @@ print(f"\nConjunto FINAL tras filtro BKM (MFIS): {len(ticker_candidates)} ticker
 for tk in ticker_candidates:
     if tk not in bkm_current_moments or not bkm_current_moments[tk]["ok"]:
         bkm_current_moments[tk] = bkm_get_current_moments(tk, target_dte_polygon, polygon_dte_tol, rf_rate)
+print(qm.texto_ajuste_iv(qm.resumen_ajuste_iv(bkm_current_moments.values()), rf_rate))
 
 # ==============================================================================
 # CONSTRUCCION DE MATRIZ DE RETORNOS
