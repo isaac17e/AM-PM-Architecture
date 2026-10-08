@@ -192,9 +192,9 @@
     "semantic_hash": "e53d268a313f788c4446941bdb5b922d"
   },
   "CLAUDE.md": {
-    "mtime": 1791306752.095264,
-    "seen": 1791332220.327738,
-    "ast_hash": "82efb97a359f5c7290bf2513d14686be",
+    "mtime": 1791469766.0396256,
+    "seen": 1791469795.6664221,
+    "ast_hash": "b24453fba34bdfdc3ea2344167e115e4",
     "semantic_hash": ""
   },
   "tests/test_ajuste_iv_tasa.py": {
@@ -207,6 +207,12 @@
     "mtime": 1791324222.587879,
     "seen": 1791332220.327741,
     "ast_hash": "538966086d240ede4e7ca8189d3fba3b",
+    "semantic_hash": ""
+  },
+  "AGENTS.md": {
+    "mtime": 1791469785.383072,
+    "seen": 1791469795.666421,
+    "ast_hash": "b24453fba34bdfdc3ea2344167e115e4",
     "semantic_hash": ""
   }
 }
