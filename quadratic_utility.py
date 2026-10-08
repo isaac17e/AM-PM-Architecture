@@ -75,7 +75,7 @@ horizon_months = 2
 history_start_year = 2014
 target_years, history_start, history_end = qm.history_window(as_of_date, history_start_year)
 mdd_start_year = history_start_year
-rf_rate = 0.047
+rf_rate = pipeline_io.resolve_risk_free_rate(0.047)  # env RISK_FREE_RATE (decimal anual)
 seed = 123
 max_weight = 0.30
 n_sim = 5000
@@ -154,7 +154,7 @@ bkm_lookback_months = 12
 bkm_hist_sample_freq = "2W"
 bkm_hist_anchor = "2020-01-05"
 bkm_hist_min_valid = 8
-bkm_hist_max_minutes = 60
+bkm_hist_max_minutes = qm.mfis_max_minutes_from_env(60)  # env MFIS_MAX_MINUTES (0 = sin presupuesto)
 bkm_max_workers = 12
 bkm_z_threshold = 2.00
 bkm_tail_mode = "upper"
@@ -1967,7 +1967,8 @@ def _plan_ronda_bkm(tickers):
 print(f"   Cola MFIS: {bkm_tail_mode} | umbral |z|={bkm_z_threshold:.2f} "
       f"(upper=demanda de calls, lower=demanda de puts)")
 print(f"   Cache historica clave v3 en {pc.CACHE_DIR}")
-print(f"   Presupuesto: {bkm_hist_max_minutes:g} min"
+print(f"   Presupuesto: "
+      + (f"{bkm_hist_max_minutes:g} min" if bkm_hist_max_minutes is not None else "sin limite de minutos")
       + (f" a {pc.CALLS_PER_MIN:g} llamadas/min" if pc.CALLS_PER_MIN else " (sin tope de llamadas)")
       + f" | ~{bkm_hist_contracts_estimate} contratos/fecha | {bkm_max_workers} hilos")
 
@@ -1975,12 +1976,15 @@ full_set = list(ticker_candidates)
 resultados_log = []
 i_reponer = 0
 usados_reponer_bkm = set()
-por_evaluar = list(ticker_candidates)
+# Cola por relevancia (market cap del S&P 500, luego el ranking del pre-filtro):
+# si el presupuesto no alcanza, quedan sin procesar los menos relevantes.
+por_evaluar = qm.orden_prioridad_mfis(ticker_candidates, sp500_caps, prefilter_ranking)
+print("   Orden de la cola MFIS: " + ", ".join(por_evaluar))
 ronda_bkm = 1
 t0_bkm = time.perf_counter()
 
 while por_evaluar:
-    print(f"   [Ronda {ronda_bkm}] {len(por_evaluar)} activo(s) en el orden de candidatos...")
+    print(f"   [Ronda {ronda_bkm}] {len(por_evaluar)} activo(s) en orden de prioridad (market cap)...")
     _asegurar_momentos_actuales(por_evaluar)
     plan = _plan_ronda_bkm(por_evaluar)
     n_pend = sum(_rank_bkm(t)["n_pending"] for t in plan["procesar"])
@@ -2048,7 +2052,7 @@ while por_evaluar:
     if not reemplazos_nuevos:
         break
     full_set = list(dict.fromkeys(full_set + reemplazos_nuevos))
-    por_evaluar = list(dict.fromkeys(reemplazos_nuevos))
+    por_evaluar = qm.orden_prioridad_mfis(reemplazos_nuevos, sp500_caps, prefilter_ranking)
     ronda_bkm += 1
 
 _elapsed_bkm = time.perf_counter() - t0_bkm
@@ -2279,7 +2283,7 @@ if use_daily_cov:
             en_diaria = [a for a in assets if a in daily_names]
             vol_monthly_based = df_xts[en_diaria].std().values * math.sqrt(12)
             print(f"      obs diarias: {cov_info['n_obs']} | t_eff (Kish): {cov_info['t_eff']:.1f} "
-                  f"| delta shrinkage: {cov_info['delta']:.3f}")
+                  f"| {rk.texto_delta_shrinkage(cov_info)}")
             print(f"      vol anual media (nombres con diaria): mensual={vol_monthly_based.mean() * 100:.1f}% -> "
                   f"diaria+EWMA={vol_daily_based.mean() * 100:.1f}%")
         else:
@@ -3226,6 +3230,7 @@ pipeline_io.export_portfolio(
     horizon_days=_h_days,
     horizon_end=_h_end,
     params={
+        "risk_free_rate": rf_rate,
         "lambda": lambda_,
         "lambda_annual": lambda_annual,
         "max_weight": max_weight,

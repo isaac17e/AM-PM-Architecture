@@ -42,6 +42,30 @@ def resolve_risk_profile(default, allowed=RISK_PROFILE_NAMES, argv=None):
     return nombre
 
 
+def resolve_risk_free_rate(default, env=None):
+    """Tasa libre de riesgo anual (decimal): `RISK_FREE_RATE` si esta, si no `default`.
+
+    Se lee una vez al inicio del script; todo lo derivado (rf semanal/mensual,
+    rf al horizonte, griegas BS, calibracion del acarreo de la IV) parte de
+    este valor. Un valor no numerico o fuera de [0, 0.5) lanza ValueError.
+    """
+    crudo = (os.environ if env is None else env).get("RISK_FREE_RATE")
+    if crudo is None or not str(crudo).strip():
+        return float(default)
+    try:
+        tasa = float(str(crudo).strip())
+    except ValueError:
+        raise ValueError(
+            f"RISK_FREE_RATE invalido: {crudo!r}. Use un decimal anual, p. ej. 0.052."
+        ) from None
+    if not math.isfinite(tasa) or not 0.0 <= tasa < 0.5:
+        raise ValueError(
+            f"RISK_FREE_RATE fuera de rango: {crudo!r}. Debe cumplir 0 <= rf < 0.5 "
+            "(decimal anual: 0.052 es 5.2%)."
+        )
+    return tasa
+
+
 def _cli_risk_profile(argv):
     for i, arg in enumerate(argv):
         if arg == "--risk-profile":

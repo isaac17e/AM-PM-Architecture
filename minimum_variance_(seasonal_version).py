@@ -77,7 +77,8 @@ execution_n_months = 1
 # ------------------------------------------------------------------------------
 # TASA LIBRE DE RIESGO
 # ------------------------------------------------------------------------------
-risk_free_rate = 0.047
+# RISK_FREE_RATE (decimal anual, p. ej. 0.052) la sobreescribe; sin env, 0.047.
+risk_free_rate = pipeline_io.resolve_risk_free_rate(0.047)
 risk_free_rate_weekly = risk_free_rate / 52
 
 # ------------------------------------------------------------------------------
@@ -1798,7 +1799,7 @@ if daily_sel is not None and len(daily_sel) >= 60:
     cov_hist_simple = np.asarray(cov_hist_simple)
     print("\n  COVARIANZA HISTORICA (EWMA + Ledoit-Wolf, base diaria):")
     print(f"     observaciones diarias: {cov_info['n_obs']} | t_eff (Kish): {cov_info['t_eff']:.1f}")
-    print(f"     halflife: {cov_halflife_days} dias | delta shrinkage: {cov_info['delta']:.3f} "
+    print(f"     halflife: {cov_halflife_days} dias | {rk.texto_delta_shrinkage(cov_info)} "
           f"({cov_info['delta'] * 100:.0f}% hacia correlacion constante)")
 elif len(log_returns_selected.dropna()) >= 60:
     cov_hist_simple, cov_info = rk.cov_ewma_shrunk(
@@ -1807,7 +1808,7 @@ elif len(log_returns_selected.dropna()) >= 60:
     cov_hist_simple = np.asarray(cov_hist_simple)
     print("\n  COVARIANZA HISTORICA (EWMA + Ledoit-Wolf, base semanal):")
     print(f"     observaciones semanales: {cov_info['n_obs']} | t_eff (Kish): {cov_info['t_eff']:.1f}")
-    print(f"     halflife: {cov_halflife_weeks} semanas | delta shrinkage: {cov_info['delta']:.3f} "
+    print(f"     halflife: {cov_halflife_weeks} semanas | {rk.texto_delta_shrinkage(cov_info)} "
           f"({cov_info['delta'] * 100:.0f}% hacia correlacion constante)")
 else:
     cov_hist_simple = log_returns_selected.cov().values
@@ -2632,6 +2633,7 @@ pipeline_io.export_portfolio(
     horizon_days=_h_days,
     horizon_end=_h_end,
     params={
+        "risk_free_rate": risk_free_rate,
         "max_weight_per_asset": max_weight_per_asset,
         "min_weight_per_asset": min_weight_per_asset,
         "max_assets_in_portfolio": max_assets_in_portfolio,

@@ -88,7 +88,8 @@ PESO_MAX_ACTIVO = 0.35
 # ------------------------------------------------------------------------------
 # 6. TASA LIBRE DE RIESGO - FALLBACK
 # ------------------------------------------------------------------------------
-Rf = 0.046
+# RISK_FREE_RATE (decimal anual, p. ej. 0.052) la sobreescribe; sin env, 0.046.
+Rf = pipeline_io.resolve_risk_free_rate(0.046)
 
 # ------------------------------------------------------------------------------
 # 7. DELTA DE MERCADO
@@ -454,7 +455,7 @@ if USAR_COV_DIARIA:
         sem_muestral = retornos_sem.cov().values
         print("\n=== Covarianza semanal (EWMA + Ledoit-Wolf, base diaria) ===")
         print(f"  obs diarias: {cov_info_bl['n_obs']} | t_eff (Kish): {cov_info_bl['t_eff']:.1f} "
-              f"| delta shrinkage: {cov_info_bl['delta']:.3f}")
+              f"| {rk.texto_delta_shrinkage(cov_info_bl)}")
         print(f"  vol semanal media: muestral={np.sqrt(np.diag(sem_muestral)).mean() * 100:.3f}% -> "
               f"EWMA+LW={np.sqrt(np.diag(Sigma_sem)).mean() * 100:.3f}%")
         print(f"  correlacion promedio: muestral={rk.average_correlation(sem_muestral):.4f} -> "
@@ -2854,6 +2855,7 @@ pipeline_io.export_portfolio(
     horizon_days=_h_days,
     horizon_end=_h_end,
     params={
+        "risk_free_rate": Rf,
         "gamma": gamma_ra,
         "lambda3": lambda3,
         "lambda4": lambda4,

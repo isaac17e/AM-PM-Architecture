@@ -41,6 +41,7 @@ __all__ = [
     "average_correlation",
     "ledoit_wolf_constant_correlation",
     "cov_ewma_shrunk",
+    "texto_delta_shrinkage",
     "LW_DELTA_MAX",
     "scale_cov",
     "nearest_psd",
@@ -327,6 +328,23 @@ def cov_ewma_shrunk(returns, halflife=None, scale=1.0, demean=True,
     if cols:
         cov = pd.DataFrame(cov, index=cols, columns=cols)
     return cov, info
+
+
+def texto_delta_shrinkage(info):
+    """'delta shrinkage: 0.212 (delta_raw: 0.245, cota delta_max: 0.90)' para el log.
+
+    Muestra el delta aplicado, el bruto de Ledoit-Wolf y la cota si `info`
+    (de cov_ewma_shrunk) los trae; marca cuando el bruto fue recortado.
+    """
+    texto = f"delta shrinkage: {float(info.get('delta', 0.0)):.3f}"
+    extras = []
+    if info.get("delta_raw") is not None:
+        extras.append(f"delta_raw: {float(info['delta_raw']):.3f}")
+    if info.get("delta_max") is not None:
+        extras.append(f"cota delta_max: {float(info['delta_max']):.2f}")
+        if info.get("delta_raw") is not None and float(info["delta_raw"]) > float(info["delta_max"]):
+            extras.append("recortado a la cota")
+    return texto + (f" ({', '.join(extras)})" if extras else "")
 
 
 def scale_cov(cov, factor):

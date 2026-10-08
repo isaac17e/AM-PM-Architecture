@@ -17,6 +17,7 @@
 # ==============================================================================
 
 import math
+import os
 from datetime import date, timedelta
 
 import numpy as np
@@ -63,6 +64,8 @@ __all__ = [
     "close_near_from_bars",
     "contract_agg_ranges",
     "plan_bkm_history_budget",
+    "mfis_max_minutes_from_env",
+    "orden_prioridad_mfis",
     "frontier_lambda_grid",
     "portfolio_mu_final_metrics",
     "frontier_curve",
@@ -848,6 +851,61 @@ def plan_bkm_history_budget(ranked, contracts_per_date=26, calls_per_min=1200.0,
         "minutos": minutos,
         "n_us_mfis": len(elegibles),
     }
+
+
+_SIN_PRESUPUESTO = {"0", "none", "null", "unlimited", "inf", "sin_tope", "ilimitado"}
+
+
+def mfis_max_minutes_from_env(default=60.0, env=None):
+    """Presupuesto del bloque MFIS en minutos: `MFIS_MAX_MINUTES` o `default`.
+
+    0 / none / unlimited -> None (sin presupuesto: entra todo el que tenga
+    MFIS actual). Un valor no numerico o negativo avisa y usa `default`.
+    El ritmo de llamadas sale de POLYGON_CALLS_PER_MINUTE (polygon_client).
+    """
+    crudo = (os.environ if env is None else env).get("MFIS_MAX_MINUTES")
+    if crudo is None or not str(crudo).strip():
+        return default
+    texto = str(crudo).strip().lower()
+    if texto in _SIN_PRESUPUESTO:
+        return None
+    try:
+        minutos = float(texto)
+    except ValueError:
+        minutos = float("nan")
+    if not math.isfinite(minutos) or minutos < 0:
+        print(f"ADVERTENCIA: MFIS_MAX_MINUTES={crudo!r} invalido; se usan {default:g} min.")
+        return default
+    return None if minutos == 0 else minutos
+
+
+def _clave_cap(ticker, market_caps):
+    texto = str(ticker).strip().upper()
+    for clave in (texto, texto.replace("-", "."), texto.replace(".", "-")):
+        cap = market_caps.get(clave)
+        if cap is not None and np.isfinite(cap) and cap > 0:
+            return float(cap)
+    return None
+
+
+def orden_prioridad_mfis(tickers, market_caps=None, ranking=None):
+    """Cola del MFIS por relevancia, para que un corte de presupuesto deje
+    fuera a los menos relevantes y no a los grandes (LLY).
+
+    Primero los que tienen market cap, de mayor a menor; despues el orden de
+    `ranking` (p. ej. el h_score del pre-filtro); el empate queda en el orden
+    recibido. No cambia que tickers se evaluan, solo el turno.
+    """
+    market_caps = market_caps or {}
+    posicion = {str(t): i for i, t in enumerate(ranking or [])}
+    unicos = list(dict.fromkeys(tickers))
+
+    def clave(par):
+        i, ticker = par
+        cap = _clave_cap(ticker, market_caps)
+        return (cap is None, -(cap or 0.0), posicion.get(str(ticker), len(posicion)), i)
+
+    return [t for _, t in sorted(enumerate(unicos), key=clave)]
 
 
 def frontier_lambda_grid(lambda_ref=None, n=60, lo=0.1, hi=200.0):
