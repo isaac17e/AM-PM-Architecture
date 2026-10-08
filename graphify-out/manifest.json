@@ -48,21 +48,21 @@
     "semantic_hash": "6be462c188d913da13a2b8906de26ee9"
   },
   "qu_metrics.py": {
-    "mtime": 1791480413.4961462,
-    "seen": 1791480629.179234,
-    "ast_hash": "b953845bd2d123321b0ab17edd1cd65b",
+    "mtime": 1791502624.8685403,
+    "seen": 1791502762.86192,
+    "ast_hash": "6d6ce51f76e2fe904a490a6f904edde5",
     "semantic_hash": ""
   },
   "quadratic_utility.py": {
-    "mtime": 1791480432.9916027,
-    "seen": 1791480629.179234,
-    "ast_hash": "c6f202614f62885b8f3f7acbacc43e84",
+    "mtime": 1791502664.365558,
+    "seen": 1791502762.861921,
+    "ast_hash": "4f7f6cf04bd2e1f6358da1fec17df004",
     "semantic_hash": ""
   },
   "quadratic_utility_(seasonal_version).py": {
-    "mtime": 1791480439.7797801,
-    "seen": 1791480629.179235,
-    "ast_hash": "6a6c1f1ace1f1bdc59ff39fb3c6468d1",
+    "mtime": 1791502689.775967,
+    "seen": 1791502762.861921,
+    "ast_hash": "bb7ca56d8254c9b67136b0fca1e80fc0",
     "semantic_hash": ""
   },
   "risk_estimators.py": {
@@ -174,9 +174,9 @@
     "semantic_hash": "e55d6b0b688fdced183b0d628d66e24b"
   },
   "README.md": {
-    "mtime": 1791480542.7746093,
-    "seen": 1791480629.179254,
-    "ast_hash": "8d1b9a04977bc266c5b35503aa0e729d",
+    "mtime": 1791502700.2715628,
+    "seen": 1791502762.86194,
+    "ast_hash": "ee734ede3f4cfafdba5c45474755755e",
     "semantic_hash": ""
   },
   "docs/risk_profile_audit.html": {
@@ -219,6 +219,12 @@
     "mtime": 1791480476.9443629,
     "seen": 1791480629.17924,
     "ast_hash": "64f8c97197db22f09f1c2465a3cbb273",
+    "semantic_hash": ""
+  },
+  "tests/test_qu_horizonte.py": {
+    "mtime": 1791502741.968276,
+    "seen": 1791502762.861933,
+    "ast_hash": "b07627910730d5c8757fbd5966633e9c",
     "semantic_hash": ""
   }
 }
