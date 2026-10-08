@@ -2513,7 +2513,6 @@ print(f"   Grupos geograficos - CA: {len(canada_assets)} | EU: {len(europe_asset
       f"JP: {len(japan_assets)} | US/ETF: {n_assets - len(geo_union)}")
 
 n = n_assets
-Dmat = cov_mat + np.eye(n) * 1e-8
 
 # ==============================================================================
 # RETORNO ESPERADO EN EL VECTOR dvec
@@ -2556,7 +2555,17 @@ if use_svix_expected_return:
     else:
         print("   Sin SVIX de mercado suficiente - se mantiene mu historico")
 
-dvec = mu_final / lambda_
+# El QP trabaja al horizonte del portafolio: mu x h y Sigma x h (h = horizon_months
+# periodos mensuales, iid). quadprog minimiza 1/2 w'Dw - d'w; con D = h(Sigma + eps I)
+# y d = h mu/lambda el objetivo es h veces el mensual, asi que los pesos no cambian
+# y lambda / max_weight conservan su significado. cov_mat y mu_final siguen mensuales
+# para los reportes, la frontera y la comparacion de lambdas.
+mu_qp, cov_qp = qm.qp_inputs_at_horizon(mu_final, cov_mat, horizon_months)
+qp_nugget = 1e-8 * horizon_months
+Dmat = cov_qp + np.eye(n) * qp_nugget
+dvec = mu_qp / lambda_
+print(f"   QP al horizonte: mu x {horizon_months}, Sigma x {horizon_months} "
+      f"({horizon_months} mes(es); los pesos no dependen de este factor)")
 
 print("   Delta: solo filtro de elegibilidad, no multiplica a mu")
 print("   Penalizacion de cola sobre mu: ELIMINADA (MFIS/MFIK son momentos Q sin calibrar)")
@@ -2651,7 +2660,7 @@ try:
     sol = quadprog.solve_qp(Dmat, dvec, Amat, bvec, meq)
 except Exception as e:
     print(f"  quadprog fallo ({e}) - reintentando con nugget mayor...")
-    sol = quadprog.solve_qp(cov_mat + np.eye(n) * 1e-6, dvec, Amat, bvec, meq)
+    sol = quadprog.solve_qp(cov_qp + np.eye(n) * 1e-6 * horizon_months, dvec, Amat, bvec, meq)
 
 weights_opt = sol[0]
 weights_opt = np.maximum(weights_opt, 0)
@@ -2698,9 +2707,10 @@ ret_opt = float(np.sum(w_vec * mu))
 sd_opt = float(np.sqrt(w_vec @ cov_mat @ w_vec))
 sharpe_opt = (ret_opt - rf_rate_period) / sd_opt
 utility_opt = ret_opt - (lambda_ / 2) * (sd_opt ** 2)
-_terms = qm.utility_terms(float(np.sum(w_vec * mu_final)), float(w_vec @ cov_mat @ w_vec), lambda_)
+_terms = qm.utility_terms(float(np.sum(w_vec * mu_qp)), float(w_vec @ cov_qp @ w_vec), lambda_)
 _ratio_pen = _terms["risk_term"] / _terms["mu_term"] if _terms["mu_term"] else np.nan
-print("  Terminos en el optimo (mu que ve el optimizador, no el mu crudo del reporte):")
+print(f"  Terminos en el optimo (mu que ve el optimizador, horizonte {horizon_months}m, "
+      "no el mu crudo del reporte):")
 print(f"    mu'w = {_terms['mu_term']:.6f} | lambda/2 w'Sigma w = {_terms['risk_term']:.6f} "
       f"| penalizacion/retorno = {_ratio_pen:.3f}")
 if lambda_annual is None and np.isfinite(_ratio_pen) and _ratio_pen < 0.05:
@@ -2740,8 +2750,9 @@ if len(panel_source_qu) >= panel_min_obs:
     port_kurt_exc = mom_qu["exkurt"]
     port_sd_cf = sd_opt
 
-    cf_qu = rk.var_cvar_cornish_fisher(
-        ret_opt, port_sd_cf, port_skew, port_kurt_exc,
+    # Momentos mensuales -> horizonte (rk.scale_moments): VaR/CVaR CF a horizon_months.
+    cf_qu = qm.cornish_fisher_at_horizon(
+        ret_opt, port_sd_cf, port_skew, port_kurt_exc, horizon_months,
         confidence=cornish_fisher_confidence)
     var_cf = cf_qu["var"]
     cvar_cf = cf_qu["cvar"]
@@ -2754,11 +2765,13 @@ if len(panel_source_qu) >= panel_min_obs:
         print("\n   MOMENTOS DEL PORTAFOLIO (co-momentos, medida P):")
         print(f"      asimetria:          {port_skew:+.4f}   (atajo Q anterior: {skew_naive_qu:+.4f})")
         print(f"      exceso de curtosis: {port_kurt_exc:+.4f}   (atajo Q anterior: {kurt_naive_qu:+.4f})")
+        print(f"      al horizonte ({horizon_months}m, iid): asimetria {cf_qu['skew_h']:+.4f} | "
+              f"exceso de curtosis {cf_qu['exkurt_h']:+.4f}")
 
     if not cf_qu["exact"]:
         print("   AVISO: la familia Cornish-Fisher no alcanza estos momentos; se usaron")
         print("   los alcanzables mas cercanos (Maillard, 2012).")
-        print(f"   Referencia gaussiana -> VaR {cf_qu['var_gaussian'] * 100:.4f}% | "
+        print(f"   Referencia gaussiana ({horizon_months}m) -> VaR {cf_qu['var_gaussian'] * 100:.4f}% | "
               f"CVaR {cf_qu['cvar_gaussian'] * 100:.4f}%")
 else:
     port_skew, port_kurt_exc = np.nan, np.nan
@@ -2823,8 +2836,8 @@ print(f"  Sortino Ratio (mensual):  {sortino_opt:.4f}")
 print(f"  Utilidad Cuadratica:      {utility_opt:.6f}")
 print(f"  VaR (95%, Normal):        {var_parametric * 100:.4f}%")
 print(f"  CVaR (95%, Historico):    {cvar_95 * 100:.4f}%")
-print(f"  VaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%): {var_cf * 100:.4f}%")
-print(f"  CVaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%): {cvar_cf * 100:.4f}%")
+print(f"  VaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%, horizonte {horizon_months}m): {var_cf * 100:.4f}%")
+print(f"  CVaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%, horizonte {horizon_months}m): {cvar_cf * 100:.4f}%")
 print(f"  Tracking Error:           {tracking_error * 100:.4f}%")
 print(f"  Relative VaR (95%):      {relative_var * 100:.4f}%")
 
@@ -2878,8 +2891,8 @@ print("\nGenerando frontera eficiente restringida (barrido de lambda)...")
 
 
 def solve_qp_portfolio(lambda_val):
-    dv = mu_final / lambda_val
-    Dm = cov_mat + np.eye(n) * 1e-8
+    dv = mu_qp / lambda_val
+    Dm = cov_qp + np.eye(n) * qp_nugget
     try:
         s = quadprog.solve_qp(Dm, dv, Amat, bvec, meq)
         w = np.maximum(s[0], 0)
@@ -3184,8 +3197,8 @@ print(f"   Volatilidad mensual:      {sd_opt * 100:.2f}%")
 print(f"   Volatilidad anualizada:   {_ann_opt['sd'] * 100:.2f}%")
 print(f"   Sharpe Ratio:             {sharpe_opt:.4f}")
 print(f"   Sortino Ratio:            {sortino_opt:.4f}")
-print(f"   VaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%): {var_cf * 100:.4f}%")
-print(f"   CVaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%): {cvar_cf * 100:.4f}%")
+print(f"   VaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%, horizonte {horizon_months}m): {var_cf * 100:.4f}%")
+print(f"   CVaR Cornish-Fisher ({cornish_fisher_confidence * 100:.0f}%, horizonte {horizon_months}m): {cvar_cf * 100:.4f}%")
 if np.isfinite(median_mdd):
     print(f"   MDD tipico historico:     {median_mdd * 100:.2f}%")
 

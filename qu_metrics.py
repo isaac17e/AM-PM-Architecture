@@ -186,6 +186,37 @@ def utility_terms(expected_return, variance, lambda_):
     return {"mu_term": mu_term, "risk_term": risk_term, "utility": mu_term - risk_term}
 
 
+def qp_inputs_at_horizon(mu_monthly, cov_monthly, horizon_months):
+    """mu y Sigma mensuales llevados al horizonte del portafolio (iid).
+
+    mu x h y Sigma x h con h = horizon_months, via rk.scale_moments. En
+    U = mu'w - lambda/2 w'Sigma w los dos terminos escalan por h, asi que el
+    argmax en w (y por tanto lambda y max_weight) no cambia con el horizonte.
+    """
+    esc = rk.scale_moments(rk.to_years(months=1), rk.to_years(months=horizon_months),
+                           mu=np.asarray(mu_monthly, dtype=float),
+                           var=np.asarray(cov_monthly, dtype=float))
+    return np.asarray(esc["mu"], dtype=float), np.asarray(esc["var"], dtype=float)
+
+
+def cornish_fisher_at_horizon(mu_monthly, sd_monthly, skew_monthly, exkurt_monthly,
+                              horizon_months, confidence=0.95):
+    """VaR/CVaR Cornish-Fisher del portafolio al horizonte (iid).
+
+    Recibe momentos mensuales; media x h, sd x sqrt(h), asimetria / sqrt(h) y
+    exceso de curtosis / h (rk.scale_moments). Con horizon_months = 1 es el
+    VaR mensual de antes. Devuelve el dict de rk.var_cvar_cornish_fisher mas
+    los momentos al horizonte (mu_h, sd_h, skew_h, exkurt_h).
+    """
+    esc = rk.scale_moments(rk.to_years(months=1), rk.to_years(months=horizon_months),
+                           mu=mu_monthly, sd=sd_monthly, skew=skew_monthly, exkurt=exkurt_monthly)
+    out = rk.var_cvar_cornish_fisher(esc["mu"], esc["sd"], esc["skew"], esc["exkurt"],
+                                     confidence=confidence)
+    out.update({"horizon_months": horizon_months, "mu_h": esc["mu"], "sd_h": esc["sd"],
+                "skew_h": esc["skew"], "exkurt_h": esc["exkurt"]})
+    return out
+
+
 def mfis_tail_decision(z, threshold, mode="upper"):
     """Decision del filtro de MFIS (M-9).
 
