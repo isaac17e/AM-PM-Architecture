@@ -131,7 +131,7 @@
   <div class="decisions">
     <div class="dec">
       <h3>QU y MV normales: el perfil es una banda de beta (2026-10-11)</h3>
-      <p>El conservador busca moverse menos que el mercado, no refugiarse en activos de vol baja. En <b>quadratic_utility.py</b> y <b>minimum_variance.py</b> el perfil se fija con la beta contra SPY: <b>beta_port_lo / beta_port_hi</b> = 0.60–0.80 / 0.80–0.95 / ≥ 0.95 (el agresivo no tiene techo: <code>beta_port_hi = None</code>) es una restricción del QP (Σ wᵢβᵢ dentro del rango) y <b>beta_asset_min / beta_asset_max</b> = 0.20–1.30 / 0.40–1.50 / 0.50–2.00 solo descarta extremos por activo. Beta OLS semanal en USD de 104 semanas, encogida hacia 1 (Blume, 2/3·β + 1/3).</p>
+      <p>El conservador busca moverse menos que el mercado, no refugiarse en activos de vol baja. En <b>quadratic_utility.py</b> y <b>minimum_variance.py</b> el perfil se fija con la beta contra SPY: <b>beta_port_lo / beta_port_hi</b> = 0.60–0.80 / 0.80–0.95 / ≥ 0.95 (el agresivo no tiene techo: <code>beta_port_hi = None</code>) es una restricción del QP (Σ wᵢβᵢ dentro del rango) y <b>beta_asset_min / beta_asset_max</b> = 0.20–1.30 / 0.40–1.50 / ≥ 0.50 (sin máximo en el agresivo) solo descarta extremos por activo. Beta OLS semanal en USD de 104 semanas, encogida hacia 1 (Blume, 2/3·β + 1/3).</p>
       <p>Se retiraron las palancas que la banda vuelve redundantes: percentiles de vol total y de correlación, cuota de ETF (los ETF entran por mérito) y <b>delta_min</b> por perfil (queda global en 0.15). La vol residual (percentil 0.85, global) solo saca a los erráticos. MV selecciona por Sharpe y usa el VaR_CF solo para recortar el peor 20%. Si el pool no cubre la banda, se repone con los mejores candidatos del lado que falta; si aun así no se alcanza, la banda se acerca al rango alcanzable con aviso. MV suele quedar en el piso de la banda y QU cerca del techo. Las versiones estacionales no cambian.</p>
     </div>
     <div class="dec">
@@ -319,7 +319,7 @@ const betaRows = (minvar) => [
   {p:"beta_port_lo", v:["0.60","0.80","0.95"], live:"0.95", st:"new", lab:"= Agr", note:BETA_PORT_NOTE + (minvar ? " Mínima varianza suele quedar en el piso." : " QU suele quedar cerca del techo: μ crece con la beta.")},
   {p:"beta_port_hi", v:["0.80","0.95","None"], live:"None", st:"new", lab:"= Agr", note:"None = sin techo: al agresivo le basta una beta mayor al piso. Sin techo, la reposición busca que el pool pueda llegar al piso + 0.25."},
   {p:"beta_asset_min", v:["0.20","0.40","0.50"], live:"0.50", st:"new", lab:"= Agr", note:BETA_ASSET_NOTE},
-  {p:"beta_asset_max", v:["1.30","1.50","2.00"], live:"2.00", st:"new", lab:"= Agr"},
+  {p:"beta_asset_max", v:["1.30","1.50","None"], live:"None", st:"new", lab:"= Agr", note:"None = sin máximo por activo: el agresivo busca movimiento y los demás filtros (vol residual, delta, cola) descartan los nombres rotos."},
 ];
 
 const mvNormal = [

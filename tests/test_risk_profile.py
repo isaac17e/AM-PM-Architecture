@@ -126,6 +126,8 @@ def test_el_perfil_de_qu_y_mv_es_una_banda_de_beta(nombre):
         # La banda por activo es mas ancha que la del portafolio y la contiene.
         assert p["beta_asset_min"] < lo
         assert hi is None or lo <= hi < p["beta_asset_max"]
+        # El agresivo no tiene techos: ni de portafolio ni por activo.
+        assert (hi is None) == (p["beta_asset_max"] is None)
         assert not set(REDUNDANTES) & set(p)
     escalera = [presets[k]["beta_port_lo"] for k in ("conservador", "moderado", "agresivo")]
     assert escalera == sorted(escalera)

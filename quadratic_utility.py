@@ -129,7 +129,9 @@ qubo_sa_iterations = 20000
 beta_window_weeks = 104
 beta_min_obs_weeks = 52
 beta_asset_min = 0.50
-beta_asset_max = 2.00
+# None = sin maximo por activo: el agresivo busca movimiento; los demas filtros
+# (vol residual, delta, vol reciente, IV, MFIS) descartan los nombres rotos.
+beta_asset_max = None
 beta_port_lo = 0.95
 # None = sin techo: el agresivo solo pide una beta mayor al piso.
 beta_port_hi = None
@@ -294,7 +296,7 @@ RISK_PRESETS = {
         "weight_sharpe": 0.70,
         "weight_decorr": 0.30,
         "beta_asset_min": 0.50,
-        "beta_asset_max": 2.00,
+        "beta_asset_max": None,
         "beta_port_lo": 0.95,
         "beta_port_hi": None,
         "n_pre_filter": 45,
@@ -322,7 +324,8 @@ if not (1 <= horizon_months <= 24):
     raise ValueError("Error: horizon_months debe estar entre 1 y 24")
 if not (math.isfinite(mu_shrink_k) and mu_shrink_k >= 0):
     raise ValueError("Error: mu_shrink_k debe ser finito y >= 0")
-if not (beta_asset_min <= beta_asset_max and (beta_port_hi is None or beta_port_lo <= beta_port_hi)):
+if not ((beta_asset_max is None or beta_asset_min <= beta_asset_max)
+        and (beta_port_hi is None or beta_port_lo <= beta_port_hi)):
     raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max); "
                      "beta_port_hi = None deja la banda sin techo")
 if not (0 < resid_vol_percentile <= 1):
@@ -1205,7 +1208,7 @@ beta_stats = beta_stats.rename_axis("symbol").reset_index()
 _beta_ok = beta_stats["beta"].notna()
 print(f"Betas contra SPY ({len(_ret_weekly)} semanas, Blume): {int(_beta_ok.sum())} de {len(beta_stats)} tickers | "
       f"mediana {beta_stats.loc[_beta_ok, 'beta'].median():.2f} | "
-      f"rango elegible del perfil {beta_asset_min:.2f}-{beta_asset_max:.2f} | "
+      f"rango elegible del perfil {pq.beta_band_text(beta_asset_min, beta_asset_max)} | "
       f"rango del portafolio {pq.beta_band_text(beta_port_lo, beta_port_hi)}")
 
 # ==============================================================================
@@ -1438,10 +1441,11 @@ def select_optimal_candidates(df, n_candidates):
                       & df["sharpe_ratio_adjusted"].notna() & np.isfinite(df["sharpe_ratio_adjusted"])].copy()
 
     con_beta = df_filtered["beta"].notna() & df_filtered["resid_vol"].notna()
-    en_banda = con_beta & df_filtered["beta"].between(beta_asset_min, beta_asset_max)
+    en_banda = con_beta & df_filtered["beta"].between(
+        beta_asset_min, np.inf if beta_asset_max is None else beta_asset_max)
     resid_threshold = df_filtered.loc[con_beta, "resid_vol"].quantile(resid_vol_percentile)
     df_candidates = df_filtered[en_banda & (df_filtered["resid_vol"] <= resid_threshold)]
-    print(f"Filtro de beta ({beta_asset_min:.2f}-{beta_asset_max:.2f}): {int(en_banda.sum())} de "
+    print(f"Filtro de beta ({pq.beta_band_text(beta_asset_min, beta_asset_max)}): {int(en_banda.sum())} de "
           f"{int(con_beta.sum())} con beta | sin beta (historia semanal corta): {int((~con_beta).sum())}")
     print(f"Filtro de vol residual (percentil {resid_vol_percentile:.2f} = {resid_threshold * 100:.1f}% anual): "
           f"{len(df_candidates)} candidatos")
@@ -1451,7 +1455,7 @@ def select_optimal_candidates(df, n_candidates):
         df_candidates = df_filtered[en_banda]
     if len(df_candidates) == 0:
         raise RuntimeError(
-            f"Error: ningun activo con beta entre {beta_asset_min:.2f} y {beta_asset_max:.2f}. "
+            f"Error: ningun activo con beta {pq.beta_band_text(beta_asset_min, beta_asset_max)}. "
             "Revisa la descarga diaria (betas) o amplia beta_asset_min/max.")
 
     df_candidates = df_candidates.copy()

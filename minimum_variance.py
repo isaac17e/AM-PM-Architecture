@@ -124,7 +124,9 @@ n_divers_candidates = 30
 beta_window_weeks = 104
 beta_min_obs_weeks = 52
 beta_asset_min = 0.50
-beta_asset_max = 2.00
+# None = sin maximo por activo: el agresivo busca movimiento; los demas filtros
+# (vol residual, delta, cola) descartan los nombres rotos.
+beta_asset_max = None
 beta_port_lo = 0.95
 # None = sin techo: el agresivo solo pide una beta mayor al piso.
 beta_port_hi = None
@@ -275,7 +277,7 @@ RISK_PRESETS = {
     },
     "agresivo": {
         "beta_asset_min": 0.50,
-        "beta_asset_max": 2.00,
+        "beta_asset_max": None,
         "beta_port_lo": 0.95,
         "beta_port_hi": None,
         "max_assets_in_portfolio": 6,
@@ -305,7 +307,8 @@ if not (1 <= options_horizon_cap_months <= 12):
     raise ValueError("Error: options_horizon_cap_months debe ser un entero entre 1 y 12.")
 if not (math.isfinite(delta_min) and delta_min >= 0):
     raise ValueError("Error: delta_min debe ser finito y >= 0")
-if not (beta_asset_min <= beta_asset_max and (beta_port_hi is None or beta_port_lo <= beta_port_hi)):
+if not ((beta_asset_max is None or beta_asset_min <= beta_asset_max)
+        and (beta_port_hi is None or beta_port_lo <= beta_port_hi)):
     raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max); "
                      "beta_port_hi = None deja la banda sin techo")
 if not (0 < resid_vol_percentile <= 1):
@@ -792,14 +795,15 @@ print(f"[INFO] Activos con metricas validas: {len(asset_stats)}\n")
 
 resid_threshold = asset_stats["Resid_Vol"].quantile(resid_vol_percentile)
 
-asset_stats["Passes_Beta"] = asset_stats["Beta"].between(beta_asset_min, beta_asset_max)
+asset_stats["Passes_Beta"] = asset_stats["Beta"].between(
+    beta_asset_min, np.inf if beta_asset_max is None else beta_asset_max)
 asset_stats["Passes_Resid"] = asset_stats["Resid_Vol"] <= resid_threshold
 asset_stats["Passes_Return"] = asset_stats["Mean_Return"] > 0
 asset_stats["Passes_All"] = asset_stats["Passes_Beta"] & asset_stats["Passes_Resid"] & asset_stats["Passes_Return"]
 asset_stats = asset_stats.sort_values("Sharpe", ascending=False).reset_index(drop=True)
 
 print(f"[INFO] Beta contra SPY ({min(beta_window_weeks, len(log_returns))} semanas, Blume): "
-      f"mediana {asset_stats['Beta'].median():.2f} | elegibles {beta_asset_min:.2f}-{beta_asset_max:.2f}: "
+      f"mediana {asset_stats['Beta'].median():.2f} | elegibles {pq.beta_band_text(beta_asset_min, beta_asset_max)}: "
       f"{int(asset_stats['Passes_Beta'].sum())} | banda del portafolio {pq.beta_band_text(beta_port_lo, beta_port_hi)}")
 print(f"[INFO] Vol residual <= percentil {resid_vol_percentile:.2f} ({resid_threshold * 100:.1f}% anual): "
       f"{int(asset_stats['Passes_Resid'].sum())} | retorno > 0: {int(asset_stats['Passes_Return'].sum())}")
