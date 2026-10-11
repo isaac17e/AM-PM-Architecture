@@ -126,7 +126,8 @@ beta_min_obs_weeks = 52
 beta_asset_min = 0.50
 beta_asset_max = 2.00
 beta_port_lo = 0.95
-beta_port_hi = 1.30
+# None = sin techo: el agresivo solo pide una beta mayor al piso.
+beta_port_hi = None
 # Vol residual (la que no explica SPY): solo descarta el extremo erratico.
 # Global: el riesgo de mercado ya lo fija la beta.
 resid_vol_percentile = 0.85
@@ -276,7 +277,7 @@ RISK_PRESETS = {
         "beta_asset_min": 0.50,
         "beta_asset_max": 2.00,
         "beta_port_lo": 0.95,
-        "beta_port_hi": 1.30,
+        "beta_port_hi": None,
         "max_assets_in_portfolio": 6,
         "max_weight_per_asset": 0.35,
         "shrinkage_min": 0.02,
@@ -304,8 +305,9 @@ if not (1 <= options_horizon_cap_months <= 12):
     raise ValueError("Error: options_horizon_cap_months debe ser un entero entre 1 y 12.")
 if not (math.isfinite(delta_min) and delta_min >= 0):
     raise ValueError("Error: delta_min debe ser finito y >= 0")
-if not (beta_asset_min <= beta_asset_max and beta_port_lo <= beta_port_hi):
-    raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max)")
+if not (beta_asset_min <= beta_asset_max and (beta_port_hi is None or beta_port_lo <= beta_port_hi)):
+    raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max); "
+                     "beta_port_hi = None deja la banda sin techo")
 if not (0 < resid_vol_percentile <= 1):
     raise ValueError("Error: resid_vol_percentile debe estar en (0, 1]")
 if not (isinstance(beta_window_weeks, int) and beta_window_weeks >= beta_min_obs_weeks >= 26):
@@ -798,7 +800,7 @@ asset_stats = asset_stats.sort_values("Sharpe", ascending=False).reset_index(dro
 
 print(f"[INFO] Beta contra SPY ({min(beta_window_weeks, len(log_returns))} semanas, Blume): "
       f"mediana {asset_stats['Beta'].median():.2f} | elegibles {beta_asset_min:.2f}-{beta_asset_max:.2f}: "
-      f"{int(asset_stats['Passes_Beta'].sum())} | banda del portafolio {beta_port_lo:.2f}-{beta_port_hi:.2f}")
+      f"{int(asset_stats['Passes_Beta'].sum())} | banda del portafolio {pq.beta_band_text(beta_port_lo, beta_port_hi)}")
 print(f"[INFO] Vol residual <= percentil {resid_vol_percentile:.2f} ({resid_threshold * 100:.1f}% anual): "
       f"{int(asset_stats['Passes_Resid'].sum())} | retorno > 0: {int(asset_stats['Passes_Return'].sum())}")
 
@@ -1292,7 +1294,7 @@ _extra_beta = pq.beta_coverage_additions(
     beta_port_lo, beta_port_hi, max_weight=max_weight_per_asset,
     max_add=max(3, math.ceil(1 / max_weight_per_asset)))
 if _extra_beta:
-    print(f"  OK Agregados para cubrir la banda de beta {beta_port_lo:.2f}-{beta_port_hi:.2f}: "
+    print(f"  OK Agregados para cubrir la banda de beta {pq.beta_band_text(beta_port_lo, beta_port_hi)}: "
           f"{', '.join(_extra_beta)}")
     tail_risk_final = pd.concat(
         [tail_risk_final, _pasan_cola[_pasan_cola["Symbol"].isin(_extra_beta)].drop(columns="Beta")],
@@ -1838,7 +1840,7 @@ _b_min, _b_max = pq.beta_range_reachable(_betas_pool, max_weight_per_asset, min_
 beta_lo, beta_hi, _nota_beta = pq.relax_beta_band(
     _betas_pool, beta_lo, beta_hi, max_weight=max_weight_per_asset,
     min_weight=min_weight_per_asset, total=min_total_weight)
-print(f"[INFO] Banda de beta del portafolio: {beta_lo:.2f}-{beta_hi:.2f} "
+print(f"[INFO] Banda de beta del portafolio: {pq.beta_band_text(beta_lo, beta_hi)} "
       f"(alcanzable con el pool: {_b_min:.2f}-{_b_max:.2f})")
 if _nota_beta:
     print(f"  ADVERTENCIA Banda de beta: {_nota_beta}")
@@ -1866,7 +1868,11 @@ def constraints_feasible(tickers_list):
         return False
     b_min, b_max = pq.beta_range_reachable([beta_map[t] for t in tickers_list], max_weight_per_asset,
                                            min_weight_per_asset, min_total_weight)
-    if not (np.isfinite(b_min) and b_min <= beta_hi + 1e-9 and b_max >= beta_lo - 1e-9):
+    if not np.isfinite(b_min):
+        return False
+    if beta_hi is not None and b_min > beta_hi + 1e-9:
+        return False
+    if beta_lo is not None and b_max < beta_lo - 1e-9:
         return False
     if use_fx_factor:
         n_fx = sum(1 for t in tickers_list if get_currency_for_ticker(t) != "USD")
@@ -2054,7 +2060,7 @@ print(f"\nOK Portafolio final: {len(selected_tickers)} activos (limite: {max_ass
 print(f"  Activos: {', '.join(selected_tickers)}")
 beta_portafolio = float(sum(w_final_implied[t] * beta_map[t] for t in selected_tickers)
                         / max(float(w_final_implied.sum()), 1e-12))
-print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {beta_lo:.2f}-{beta_hi:.2f}"
+print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {pq.beta_band_text(beta_lo, beta_hi)}"
       f"{', relajada desde la pedida' if _nota_beta else ''})\n")
 
 log_returns_selected = log_returns[selected_tickers]

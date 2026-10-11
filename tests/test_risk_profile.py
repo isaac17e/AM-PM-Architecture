@@ -110,7 +110,7 @@ def test_black_litterman_acepta_el_override_y_exporta_el_perfil():
 BANDAS_DE_BETA = {
     "conservador": (0.60, 0.80),
     "moderado": (0.80, 0.95),
-    "agresivo": (0.95, 1.30),
+    "agresivo": (0.95, None),           # sin techo: solo una beta mayor al piso
 }
 # Palancas que la banda de beta vuelve redundantes en QU y MV normales.
 REDUNDANTES = ("volatility_percentile", "correlation_percentile", "delta_min",
@@ -124,7 +124,8 @@ def test_el_perfil_de_qu_y_mv_es_una_banda_de_beta(nombre):
         p = presets[perfil]
         assert (p["beta_port_lo"], p["beta_port_hi"]) == (lo, hi)
         # La banda por activo es mas ancha que la del portafolio y la contiene.
-        assert p["beta_asset_min"] < lo <= hi < p["beta_asset_max"]
+        assert p["beta_asset_min"] < lo
+        assert hi is None or lo <= hi < p["beta_asset_max"]
         assert not set(REDUNDANTES) & set(p)
     escalera = [presets[k]["beta_port_lo"] for k in ("conservador", "moderado", "agresivo")]
     assert escalera == sorted(escalera)

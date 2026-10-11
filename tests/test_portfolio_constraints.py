@@ -245,3 +245,21 @@ def test_cobertura_de_beta_agrega_solo_lo_que_falta():
     alto = {"X": 1.2, "Y": 1.3, "Z": 1.4, "W": 1.5, "L": 0.4}
     assert pq.beta_coverage_additions(["X", "Y", "Z", "W"], ["L"], alto, 0.60, 0.80,
                                       max_weight=0.30, max_add=3) == ["L"]
+
+
+def test_banda_sin_techo():
+    cols, b = pq.beta_band_columns(BETAS, 0.95, None)
+    assert len(cols) == 1 and b == [0.0]
+    assert pq.beta_band_text(0.95, None) == ">= 0.95"
+    assert pq.beta_band_text(0.60, 0.80) == "0.60-0.80"
+    assert pq.beta_band_text(None, None) == "sin banda"
+    lo, hi, nota = pq.relax_beta_band(np.array([0.3, 0.5, 0.7, 0.9]), 0.95, None, max_weight=0.35)
+    assert hi is None and lo == pytest.approx(0.35 * 0.9 + 0.35 * 0.7 + 0.30 * 0.5)
+    assert "piso de beta" in nota
+    # Sin techo, el pool debe superar el piso con holgura (BETA_COVERAGE_MARGIN).
+    betas = {"A": 0.9, "B": 0.95, "C": 1.0, "D": 0.8, "E": 1.6, "F": 0.2, "G": 1.5, "H": 1.7}
+    extra = pq.beta_coverage_additions(["A", "B", "C", "D"], ["F", "E", "G", "H"], betas, 0.95, None,
+                                       max_weight=0.30, max_add=5)
+    assert extra == ["E", "G"]                       # solo beta >= piso + margen; F (0.2) nunca entra
+    nuevo = [betas[t] for t in ["A", "B", "C", "D"] + extra]
+    assert pq.beta_range_reachable(nuevo, 0.30)[1] >= 0.95 + pq.BETA_COVERAGE_MARGIN

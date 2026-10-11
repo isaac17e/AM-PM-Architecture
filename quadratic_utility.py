@@ -131,7 +131,8 @@ beta_min_obs_weeks = 52
 beta_asset_min = 0.50
 beta_asset_max = 2.00
 beta_port_lo = 0.95
-beta_port_hi = 1.30
+# None = sin techo: el agresivo solo pide una beta mayor al piso.
+beta_port_hi = None
 beta_band_relax_if_infeasible = True
 # Vol residual (la que no explica SPY): solo descarta el extremo erratico.
 # Global: el riesgo de mercado ya lo fija la beta.
@@ -295,7 +296,7 @@ RISK_PRESETS = {
         "beta_asset_min": 0.50,
         "beta_asset_max": 2.00,
         "beta_port_lo": 0.95,
-        "beta_port_hi": 1.30,
+        "beta_port_hi": None,
         "n_pre_filter": 45,
         "n_filter_candidates": 30,
         "recent_vol_window_min_weeks": 13,
@@ -321,8 +322,9 @@ if not (1 <= horizon_months <= 24):
     raise ValueError("Error: horizon_months debe estar entre 1 y 24")
 if not (math.isfinite(mu_shrink_k) and mu_shrink_k >= 0):
     raise ValueError("Error: mu_shrink_k debe ser finito y >= 0")
-if not (beta_asset_min <= beta_asset_max and beta_port_lo <= beta_port_hi):
-    raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max)")
+if not (beta_asset_min <= beta_asset_max and (beta_port_hi is None or beta_port_lo <= beta_port_hi)):
+    raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max); "
+                     "beta_port_hi = None deja la banda sin techo")
 if not (0 < resid_vol_percentile <= 1):
     raise ValueError("Error: resid_vol_percentile debe estar en (0, 1]")
 if not (isinstance(beta_window_weeks, int) and beta_window_weeks >= beta_min_obs_weeks >= 26):
@@ -1204,7 +1206,7 @@ _beta_ok = beta_stats["beta"].notna()
 print(f"Betas contra SPY ({len(_ret_weekly)} semanas, Blume): {int(_beta_ok.sum())} de {len(beta_stats)} tickers | "
       f"mediana {beta_stats.loc[_beta_ok, 'beta'].median():.2f} | "
       f"rango elegible del perfil {beta_asset_min:.2f}-{beta_asset_max:.2f} | "
-      f"rango del portafolio {beta_port_lo:.2f}-{beta_port_hi:.2f}")
+      f"rango del portafolio {pq.beta_band_text(beta_port_lo, beta_port_hi)}")
 
 # ==============================================================================
 # ESTADISTICAS DESCRIPTIVAS
@@ -1480,7 +1482,7 @@ def select_optimal_candidates(df, n_candidates):
         max_weight=max_weight, max_add=max(3, math.ceil(1 / max_weight)))
     _b_rng = pq.beta_range_reachable([_betas_cand[t] for t in selected], max_weight)
     print(f"   Beta alcanzable con el pool del QUBO: {_b_rng[0]:.2f}-{_b_rng[1]:.2f} "
-          f"(banda {beta_port_lo:.2f}-{beta_port_hi:.2f})")
+          f"(banda {pq.beta_band_text(beta_port_lo, beta_port_hi)})")
     if _extra_beta:
         print(f"   Agregados para cubrir la banda de beta: {', '.join(_extra_beta)}")
         selected = list(selected) + _extra_beta
@@ -2555,7 +2557,7 @@ beta_band_relaxed = False
 _caps_qp = np.array([0.0 if i in excluded_etf_set else max_weight for i in range(n)])
 _b_min, _b_max = pq.beta_range_reachable(beta_vec, _caps_qp)
 print(f"   Beta alcanzable con el pool y max_weight {max_weight:.2f}: {_b_min:.2f}-{_b_max:.2f} | "
-      f"banda del perfil {beta_lo:.2f}-{beta_hi:.2f}")
+      f"banda del perfil {pq.beta_band_text(beta_lo, beta_hi)}")
 geo_groups = {"Canada": canada_assets, "Europa": europe_assets, "Japon": japan_assets}
 
 
@@ -2577,7 +2579,7 @@ def armar_restricciones(beta_lo_, beta_hi_, verbose=True):
     A_cols += cols_beta
     b_vals += b_beta
     if verbose:
-        print(f"   Restriccion de beta: {beta_lo_:.2f} <= sum(w * beta) <= {beta_hi_:.2f}")
+        print(f"   Restriccion de beta: sum(w * beta) {pq.beta_band_text(beta_lo_, beta_hi_)}")
     for region_name, idx_region in geo_groups.items():
         if len(idx_region) > 0:
             v_geo = np.zeros(n)
@@ -2597,7 +2599,7 @@ Amat, bvec = armar_restricciones(beta_lo, beta_hi)
 # ------------------------------------------------------------------------------
 if not qm.restricciones_factibles(Amat, bvec, meq):
     print("\n   ADVERTENCIA: las restricciones del optimizador no se pueden cumplir con la banda "
-          f"de beta {beta_lo:.2f}-{beta_hi:.2f} (alcanzable sin topes regionales: {_b_min:.2f}-{_b_max:.2f})")
+          f"de beta {pq.beta_band_text(beta_lo, beta_hi)} (alcanzable sin topes regionales: {_b_min:.2f}-{_b_max:.2f})")
     if beta_band_relax_if_infeasible:
         _lo_rel, _hi_rel, _nota = pq.relax_beta_band(beta_vec, beta_lo, beta_hi, max_weight=_caps_qp)
         Amat_rel, bvec_rel = armar_restricciones(_lo_rel, _hi_rel, verbose=False)
@@ -2618,7 +2620,7 @@ if not qm.restricciones_factibles(Amat, bvec, meq):
     if not beta_band_relaxed:
         raise RuntimeError(
             f"Error: restricciones del optimizador infactibles (max_weight {max_weight:.2f}, "
-            f"banda de beta {beta_port_lo:.2f}-{beta_port_hi:.2f}, tope regional {max_region_weight:.2f}). "
+            f"banda de beta {pq.beta_band_text(beta_port_lo, beta_port_hi)}, tope regional {max_region_weight:.2f}). "
             "Amplia el pool (n_pre_filter, n_filter_candidates), sube max_weight o ajusta beta_port_lo/hi"
             + ("" if beta_band_relax_if_infeasible else ", o activa beta_band_relax_if_infeasible")
             + ".")
@@ -2639,8 +2641,7 @@ print("  Optimizacion completada")
 print(f"  Activos con peso > 1%: {(weights_opt > 0.01).sum()}")
 print(f"  Peso maximo: {weights_opt.max() * 100:.2f}% ({weights_opt.idxmax()})")
 beta_portafolio = float(weights_opt.values @ beta_vec)
-_banda_txt = (f"{beta_lo:.2f}-{beta_hi:.2f}" if beta_lo is not None else "sin banda")
-print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {_banda_txt}"
+print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {pq.beta_band_text(beta_lo, beta_hi)}"
       f"{', relajada desde la pedida' if beta_band_relaxed else ''})")
 _peso_etf = float(weights_opt.iloc[etf_commodity_assets].sum()) if etf_commodity_assets else 0.0
 print(f"  Peso en ETF/commodities: {_peso_etf * 100:.2f}% (sin cuota: entran por merito)")

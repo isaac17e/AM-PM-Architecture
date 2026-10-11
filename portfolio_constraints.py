@@ -32,6 +32,8 @@ __all__ = [
     "beta_range_reachable",
     "relax_beta_band",
     "beta_coverage_additions",
+    "beta_band_text",
+    "BETA_COVERAGE_MARGIN",
     "prune_order",
 ]
 
@@ -252,6 +254,20 @@ def relax_beta_band(betas, beta_lo, beta_hi, *, max_weight, min_weight=0.0, tota
     return lo, hi, "; ".join(notas)
 
 
+BETA_COVERAGE_MARGIN = 0.25
+
+
+def beta_band_text(beta_lo, beta_hi):
+    """Texto de la banda: "0.60-0.80", ">= 0.95" (sin techo), "<= 0.80" o "sin banda"."""
+    if beta_lo is None and beta_hi is None:
+        return "sin banda"
+    if beta_hi is None:
+        return f">= {beta_lo:.2f}"
+    if beta_lo is None:
+        return f"<= {beta_hi:.2f}"
+    return f"{beta_lo:.2f}-{beta_hi:.2f}"
+
+
 def beta_coverage_additions(pool, ranking, betas, beta_lo, beta_hi, *, max_weight, max_add):
     """Candidatos que hay que sumar al pool para que su rango de beta cubra la banda.
 
@@ -261,7 +277,13 @@ def beta_coverage_additions(pool, ranking, betas, beta_lo, beta_hi, *, max_weigh
     `beta_hi`, se agregan, en el orden de `ranking`, nombres con beta >= beta_hi;
     si la minima queda sobre `beta_lo`, nombres con beta <= beta_lo. Hasta
     `max_add` en total. `betas` es un dict ticker -> beta.
+
+    Sin techo (beta_hi None) el objetivo de arriba es beta_lo +
+    BETA_COVERAGE_MARGIN: el pool debe poder superar el piso con holgura, no
+    solo tocarlo. Sin piso (beta_lo None) no se agrega nada por abajo.
     """
+    if beta_hi is None and beta_lo is not None:
+        beta_hi = float(beta_lo) + BETA_COVERAGE_MARGIN
     actual = list(dict.fromkeys(pool))
     agregados = []
     en_pool = set(actual)
@@ -271,7 +293,8 @@ def beta_coverage_additions(pool, ranking, betas, beta_lo, beta_hi, *, max_weigh
 
     if not np.isfinite(_rango()[0]):
         return agregados                     # pool sin portafolio factible: no se juzga la beta
-    for lado in ("hi", "lo"):
+    lados = ([] if beta_hi is None else ["hi"]) + ([] if beta_lo is None else ["lo"])
+    for lado in lados:
         for t in ranking:
             if len(agregados) >= max_add:
                 return agregados
