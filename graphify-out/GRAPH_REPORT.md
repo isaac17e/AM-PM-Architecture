@@ -1,7 +1,7 @@
 # Graph Report - AM-PM-Architecture  (2026-10-11)
 
 ## Corpus Check
-- 35 files · ~123,538 words
+- 35 files · ~123,666 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 3 file(s) not represented in the graph (top: (none) 2, .ini 1)
 
@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `7a60ba82`
+- Built from commit: `c4345e79`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -442,24 +442,24 @@ Cohesion: 0.32
 Nodes (6): get_all(), _sumar(), _paginas(), test_get_all_follows_next_url(), test_get_all_marks_incomplete_when_a_page_fails(), test_get_all_truncated_by_max_pages()
 
 ## Knowledge Gaps
-- **15 isolated node(s):** `pandas>=2.0`, `plotly>=5.18`, `scipy>=1.10`, `statsmodels>=0.14`, `Open anomalies (share-class dedup in QU, XLK/QQQ overlap, MV delta filter, LW shrinkage 1.0)` (+10 more)
+- **15 isolated node(s):** `pandas>=2.0`, `plotly>=5.18`, `scipy>=1.10`, `statsmodels>=0.14`, `Pull request merge order (stacked PRs #2 to #4 then this PR)` (+10 more)
   These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 436 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
 - **30 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `test_yfinance_batch_is_one_unadjusted_download()` connect `frames_from_yf_download` to `test_market_data.py`?**
-  _High betweenness centrality (0.016) - this node is a cross-community bridge._
+- **Why does `Risk Profile Audit (configuration per investor profile)` connect `Risk Profile Audit (configuration per investor profile)` to `Workflow architecture (shared modules feed standalone optimizers)`?**
+  _High betweenness centrality (0.030) - this node is a cross-community bridge._
 - **What connects `pandas>=2.0`, `plotly>=5.18`, `scipy>=1.10` to the rest of the system?**
   _15 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `pytest` be split into smaller, more focused modules?**
   _Cohesion score 0.10384068278805121 - nodes in this community are weakly interconnected._
-- **Why does `Quadratic utility maximization U = mu'w - lambda/2 w'Sigma w` connect `Risk Profile Audit (configuration per investor profile)` to `quadratic_utility.py`, `qu_metrics.py`?**
+- **Why does `test_yfinance_batch_is_one_unadjusted_download()` connect `frames_from_yf_download` to `test_market_data.py`?**
   _High betweenness centrality (0.016) - this node is a cross-community bridge._
 - **Should `quadratic_utility_(seasonal_version).py` be split into smaller, more focused modules?**
   _Cohesion score 0.05701754385964912 - nodes in this community are weakly interconnected._
-- **Why does `Risk Profile Audit (configuration per investor profile)` connect `Risk Profile Audit (configuration per investor profile)` to `Workflow architecture (shared modules feed standalone optimizers)`?**
-  _High betweenness centrality (0.016) - this node is a cross-community bridge._
+- **Why does `mfis_tail_decision()` connect `mfis_tail_decision` to `numpy`, `quadratic_utility_(seasonal_version).py`, `evaluar_historia_bkm`, `qu_metrics.py`?**
+  _High betweenness centrality (0.015) - this node is a cross-community bridge._
 - **Should `bl_metrics.py` be split into smaller, more focused modules?**
   _Cohesion score 0.06282051282051282 - nodes in this community are weakly interconnected._
