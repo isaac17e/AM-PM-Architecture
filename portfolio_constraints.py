@@ -8,7 +8,10 @@
 #      en el formato de columnas de quadprog. El optimizador y la frontera
 #      eficiente usan el mismo bloque (B-5); antes la frontera solo imponia
 #      cotas y suma de pesos.
-#   2. bs_call_delta: delta Black-Scholes de una call. Con strike ATM (K = S)
+#   2. Banda de beta del portafolio (palanca de perfil): columnas homogeneas
+#      sum(b_i w_i) entre beta_lo y beta_hi por unidad de capital invertido,
+#      rango de beta alcanzable con las cotas y relajacion con aviso.
+#   3. bs_call_delta: delta Black-Scholes de una call. Con strike ATM (K = S)
 #      y r >= 0 la delta es N(d1) > 0.5, asi que el antiguo filtro
 #      "delta >= delta_min" (delta_min = 0.30) no descartaba ningun activo
 #      (M-3). Se elimino; esta funcion documenta por que.
@@ -25,6 +28,10 @@ __all__ = [
     "with_return_target",
     "bs_call_delta",
     "relax_group_band",
+    "beta_band_columns",
+    "beta_range_reachable",
+    "relax_beta_band",
+    "beta_coverage_additions",
     "prune_order",
 ]
 
@@ -44,6 +51,9 @@ def build_weight_constraints(
     is_non_usd=None,
     use_fx_cap=False,
     max_fx_exposure=1.0,
+    betas=None,
+    beta_lo=None,
+    beta_hi=None,
 ):
     """Restricciones (Amat, bvec, meq) de quadprog para n activos.
 
@@ -51,7 +61,8 @@ def build_weight_constraints(
     Cada columna de Amat es una restriccion.
 
     Devuelve dict con base (cotas + inversion total), full (base + banda ETF
-    + tope FX, como fraccion del capital invertido) y has_extra.
+    + tope FX + banda de beta, como fraccion del capital invertido) y
+    has_extra. La banda de beta solo entra si se pasan `betas` y alguna cota.
     """
     n = int(n)
     if n < 1:
@@ -87,6 +98,12 @@ def build_weight_constraints(
         # sum(w_fx) <= max_fx * sum(w)
         extra_cols += [max_fx_exposure - is_fx_vec]
         extra_b += [0.0]
+    if betas is not None:
+        cols_beta, b_beta = beta_band_columns(betas, beta_lo, beta_hi)
+        if len(cols_beta) and cols_beta[0].shape != (n,):
+            raise ValueError("betas debe tener longitud n")
+        extra_cols += cols_beta
+        extra_b += b_beta
 
     Amat_full, bvec_full = Amat_base, bvec_base
     if extra_cols:
@@ -154,6 +171,122 @@ def relax_group_band(n_group, n_other, max_weight, min_share, max_share, total=1
         )
         min_share = max_share
     return float(min_share), float(max_share), "; ".join(notas)
+
+
+def beta_band_columns(betas, beta_lo=None, beta_hi=None):
+    """Columnas de quadprog para beta_lo * sum(w) <= b'w <= beta_hi * sum(w).
+
+    Forma homogenea (b - lo)'w >= 0 y (hi - b)'w >= 0: vale igual con
+    inversion total fija o con un rango de inversion. Una cota en None no
+    agrega columna. Devuelve (lista de columnas, lista de b).
+    """
+    b = np.asarray(betas, dtype=float)
+    if b.ndim != 1 or not np.isfinite(b).all():
+        raise ValueError("betas debe ser un vector finito")
+    if beta_lo is not None and beta_hi is not None and float(beta_lo) > float(beta_hi) + 1e-12:
+        raise ValueError("beta_lo no puede superar a beta_hi")
+    cols, bs = [], []
+    if beta_lo is not None:
+        cols.append(b - float(beta_lo))
+        bs.append(0.0)
+    if beta_hi is not None:
+        cols.append(float(beta_hi) - b)
+        bs.append(0.0)
+    return cols, bs
+
+
+def beta_range_reachable(betas, max_weight, min_weight=0.0, total=1.0):
+    """Beta minima y maxima del portafolio con min_weight <= w_i <= max_weight y sum(w) = total.
+
+    `max_weight` puede ser un escalar o un vector (0 fija el peso del
+    activo en el piso). Se reparte el piso a todos y lo que queda va, en
+    orden de beta, al tope de cada activo. Devuelve (b_min, b_max) por
+    unidad de capital, o (nan, nan) si las cotas no permiten sumar `total`.
+    """
+    b = np.asarray(betas, dtype=float)
+    n = len(b)
+    if n == 0 or not np.isfinite(b).all():
+        return float("nan"), float("nan")
+    caps = np.broadcast_to(np.asarray(max_weight, dtype=float), (n,)).copy()
+    floors = np.minimum(np.full(n, float(min_weight)), caps)
+    total = float(total)
+    if floors.sum() > total + 1e-12 or caps.sum() < total - 1e-12:
+        return float("nan"), float("nan")
+
+    def _extremo(orden):
+        w = floors.copy()
+        resto = total - w.sum()
+        for i in orden:
+            if resto <= 1e-15:
+                break
+            add = min(caps[i] - w[i], resto)
+            w[i] += add
+            resto -= add
+        return float(w @ b / total)
+
+    asc = np.argsort(b, kind="stable")
+    return _extremo(asc), _extremo(asc[::-1])
+
+
+def relax_beta_band(betas, beta_lo, beta_hi, *, max_weight, min_weight=0.0, total=1.0):
+    """Banda de beta mas cercana a la pedida que el pool puede cumplir.
+
+    Si el piso supera la beta maxima alcanzable, baja hasta ella; si el
+    techo queda bajo la minima alcanzable, sube hasta ella. Devuelve
+    (lo, hi, nota); nota es "" si la banda pedida ya era alcanzable.
+    """
+    b_min, b_max = beta_range_reachable(betas, max_weight, min_weight, total)
+    lo = None if beta_lo is None else float(beta_lo)
+    hi = None if beta_hi is None else float(beta_hi)
+    if not (np.isfinite(b_min) and np.isfinite(b_max)):
+        return lo, hi, "las cotas de peso no permiten armar un portafolio: banda sin revisar"
+    notas = []
+    if lo is not None and lo > b_max + 1e-12:
+        notas.append(f"piso de beta {lo:.2f} inalcanzable (maximo {b_max:.2f} con el pool); "
+                     f"se baja a {b_max:.2f}")
+        lo = b_max
+    if hi is not None and hi < b_min - 1e-12:
+        notas.append(f"techo de beta {hi:.2f} inalcanzable (minimo {b_min:.2f} con el pool); "
+                     f"se sube a {b_min:.2f}")
+        hi = b_min
+    return lo, hi, "; ".join(notas)
+
+
+def beta_coverage_additions(pool, ranking, betas, beta_lo, beta_hi, *, max_weight, max_add):
+    """Candidatos que hay que sumar al pool para que su rango de beta cubra la banda.
+
+    La seleccion (QUBO, Sharpe) no mira la beta: el termino de decorrelacion
+    tiende a dejar fuera a los nombres de beta alta, que se correlacionan
+    entre si. Si la beta maxima alcanzable con `max_weight` queda bajo
+    `beta_hi`, se agregan, en el orden de `ranking`, nombres con beta >= beta_hi;
+    si la minima queda sobre `beta_lo`, nombres con beta <= beta_lo. Hasta
+    `max_add` en total. `betas` es un dict ticker -> beta.
+    """
+    actual = list(dict.fromkeys(pool))
+    agregados = []
+    en_pool = set(actual)
+
+    def _rango():
+        return beta_range_reachable([betas[t] for t in actual], max_weight)
+
+    if not np.isfinite(_rango()[0]):
+        return agregados                     # pool sin portafolio factible: no se juzga la beta
+    for lado in ("hi", "lo"):
+        for t in ranking:
+            if len(agregados) >= max_add:
+                return agregados
+            b_min, b_max = _rango()
+            falta = (b_max < beta_hi - 1e-12) if lado == "hi" else (b_min > beta_lo + 1e-12)
+            if not falta:
+                break
+            b = betas.get(t, float("nan"))
+            if t in en_pool or not np.isfinite(b):
+                continue
+            if (lado == "hi" and b >= beta_hi) or (lado == "lo" and b <= beta_lo):
+                actual.append(t)
+                en_pool.add(t)
+                agregados.append(t)
+    return agregados
 
 
 def bs_call_delta(spot, strike, years, rate, vol):

@@ -85,10 +85,8 @@ def test_presets_de_mv_y_qu_coinciden_con_la_auditoria():
     qu = _presets(ROOT / "quadratic_utility.py")
     qu_s = _presets(ROOT / "quadratic_utility_(seasonal_version).py")
 
-    assert mv["moderado"]["delta_min"] == 0.18
     assert mv["conservador"]["max_weight_per_asset"] == 0.12
     assert mv["moderado"]["max_assets_in_portfolio"] == 10
-    assert mv["agresivo"]["etf_max_weight"] == 0.05
     assert "seasonal_min_weeks" not in mv["agresivo"]
     assert mv_s["conservador"]["seasonal_min_weeks"] == 20
     assert mv_s["moderado"]["seasonal_min_weeks"] == 15
@@ -97,8 +95,6 @@ def test_presets_de_mv_y_qu_coinciden_con_la_auditoria():
     assert qu["conservador"]["lambda_"] == 6.0
     assert qu["moderado"]["lambda_"] == 3.0
     assert qu["agresivo"]["lambda_"] == 1.5
-    assert qu["moderado"]["volatility_percentile"] == 0.65
-    assert qu["moderado"]["pct_etf_deseado"] == 0.30
     assert qu_s["moderado"]["volatility_percentile"] == 0.60
     assert qu_s["moderado"]["pct_etf_deseado"] == 0.40
     assert qu_s["moderado"]["pct_etf_tolerancia"] == 0.05
@@ -109,3 +105,33 @@ def test_black_litterman_acepta_el_override_y_exporta_el_perfil():
     fuente = (ROOT / "black_litterman.py").read_text(encoding="utf-8")
     assert 'pipeline_io.resolve_risk_profile("agresivo")' in fuente
     assert "risk_profile=PERFIL_RIESGO" in fuente
+
+
+BANDAS_DE_BETA = {
+    "conservador": (0.60, 0.80),
+    "moderado": (0.80, 0.95),
+    "agresivo": (0.95, 1.30),
+}
+# Palancas que la banda de beta vuelve redundantes en QU y MV normales.
+REDUNDANTES = ("volatility_percentile", "correlation_percentile", "delta_min",
+               "pct_etf_deseado", "pct_etf_tolerancia", "etf_min_weight", "etf_max_weight")
+
+
+@pytest.mark.parametrize("nombre", ["minimum_variance.py", "quadratic_utility.py"])
+def test_el_perfil_de_qu_y_mv_es_una_banda_de_beta(nombre):
+    presets = _presets(ROOT / nombre)
+    for perfil, (lo, hi) in BANDAS_DE_BETA.items():
+        p = presets[perfil]
+        assert (p["beta_port_lo"], p["beta_port_hi"]) == (lo, hi)
+        # La banda por activo es mas ancha que la del portafolio y la contiene.
+        assert p["beta_asset_min"] < lo <= hi < p["beta_asset_max"]
+        assert not set(REDUNDANTES) & set(p)
+    escalera = [presets[k]["beta_port_lo"] for k in ("conservador", "moderado", "agresivo")]
+    assert escalera == sorted(escalera)
+    literales = _literales(ROOT / nombre)
+    for clave in REDUNDANTES:
+        if clave != "delta_min":
+            assert clave not in literales
+    assert literales["delta_min"] == 0.15
+    assert literales["resid_vol_percentile"] == 0.85
+    assert literales["beta_window_weeks"] == 104

@@ -160,7 +160,11 @@ def test_defaults_del_filtro_delta_en_mv(nombre):
     fuente = _fuente(nombre)
     assert re.search(r"^use_delta_filter = True\b", fuente, re.M)
     assert re.search(r"^delta_min = 0\.15\b", fuente, re.M)
-    assert "Conservador 0.24, moderado 0.18, agresivo 0.15" in fuente
+    if nombre == MV:
+        # Normal: delta_min es global; el perfil vive en la banda de beta.
+        assert "Global (antes 0.24 / 0.18 / 0.15 por perfil)" in fuente
+    else:
+        assert "Conservador 0.24, moderado 0.18, agresivo 0.15" in fuente
     assert re.search(r"^delta_otm_log_m = 0\.08\b", fuente, re.M)
     assert re.search(r"^delta_otm_ref_months = 2\b", fuente, re.M)
     # La tabla de griegas sigue con la delta real de la call ATM.

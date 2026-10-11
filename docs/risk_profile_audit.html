@@ -112,7 +112,7 @@
 <div class="wrap">
   <header class="top">
     <div>
-      <p class="eyebrow">8 optimizadores &middot; 4 repositorios &middot; revisado 2026-10-04</p>
+      <p class="eyebrow">8 optimizadores &middot; 4 repositorios &middot; revisado 2026-10-11</p>
       <h1>Configuración por perfil de inversor</h1>
     </div>
     <p class="top-note">Valores Conservador / Moderado / Agresivo para cada bloque editable, contrastados con lo que está hoy en el código. Elige un perfil para resaltar su columna y copiar el bloque listo para pegar.</p>
@@ -129,6 +129,11 @@
   </div>
 
   <div class="decisions">
+    <div class="dec">
+      <h3>QU y MV normales: el perfil es una banda de beta (2026-10-11)</h3>
+      <p>El conservador busca moverse menos que el mercado, no refugiarse en activos de vol baja. En <b>quadratic_utility.py</b> y <b>minimum_variance.py</b> el perfil se fija con la beta contra SPY: <b>beta_port_lo / beta_port_hi</b> = 0.60–0.80 / 0.80–0.95 / 0.95–1.30 es una restricción del QP (Σ wᵢβᵢ dentro del rango) y <b>beta_asset_min / beta_asset_max</b> = 0.20–1.30 / 0.40–1.50 / 0.50–2.00 solo descarta extremos por activo. Beta OLS semanal en USD de 104 semanas, encogida hacia 1 (Blume, 2/3·β + 1/3).</p>
+      <p>Se retiraron las palancas que la banda vuelve redundantes: percentiles de vol total y de correlación, cuota de ETF (los ETF entran por mérito) y <b>delta_min</b> por perfil (queda global en 0.15). La vol residual (percentil 0.85, global) solo saca a los erráticos. MV selecciona por Sharpe y usa el VaR_CF solo para recortar el peor 20%. Si el pool no cubre la banda, se repone con los mejores candidatos del lado que falta; si aun así no se alcanza, la banda se acerca al rango alcanzable con aviso. MV suele quedar en el piso de la banda y QU cerca del techo. Las versiones estacionales no cambian.</p>
+    </div>
     <div class="dec">
       <h3>Una sola aversión al riesgo γ por perfil: 6 / 3 / 1.5</h3>
       <p>QU, BL y US maximizan la misma forma <code>μ'w − (γ/2)·w'Σw</code> con μ y Σ en unidades consistentes (QU mensual/mensual; BL y US anual/anual), así que γ es adimensional y comparable. Hoy el mismo inversor agresivo tenía γ = 0.5, 0.8, 1.5 o 2 según el script.</p>
@@ -152,13 +157,13 @@
     </div>
     <div class="dec">
       <h3>Filtro delta de QU: cada umbral es un tope de IV anual</h3>
-      <p>Los dos QU usan el mismo filtro de colchón: <b>delta_strike_mode = "otm"</b>, delta_otm_log_m = 0.08 y delta_otm_ref_months = 2. <b>options_dte_cap_days = 90</b> solo existe en QU normal; el seasonal no tiene ese parámetro. <b>delta_min</b> es 0.24 / 0.18 / 0.15; el default del código es el Agresivo. En los dos QU el colchón solo filtra: ya no multiplica a μ.</p>
+      <p>Los dos QU usan el mismo filtro de colchón: <b>delta_strike_mode = "otm"</b>, delta_otm_log_m = 0.08 y delta_otm_ref_months = 2. <b>options_dte_cap_days = 90</b> solo existe en QU normal; el seasonal no tiene ese parámetro. En el seasonal <b>delta_min</b> es 0.24 / 0.18 / 0.15; en QU y MV normales es global en 0.15 desde 2026-10-11 (la beta fija el riesgo de mercado del perfil). En los dos QU el colchón solo filtra: ya no multiplica a μ.</p>
       <p>El colchón OTM depende solo de la volatilidad, así que cada umbral funciona como un tope de IV anual: 0.24 ≈ 31,5%, 0.18 ≈ 43%, 0.15 ≈ 52%. En el seasonal el horizonte es el número de meses de <code>rebalance_months</code> (1 con [10], 2 con [10, 11]) y el corte casi no cambia con el horizonte.</p>
     </div>
     <div class="dec">
       <h3>QU: la aversión al riesgo vive solo en λ</h3>
       <p>La vol baja se premiaba cuatro veces: en el puntaje QUBO (<b>weight_low_vol</b>), en el filtro delta, en un multiplicador de μ por el colchón delta y en λ·w'Σw. En los dos QU se eliminaron los dos premios (el término del puntaje y el multiplicador); <b>weight_sharpe</b> absorbe el peso del término eliminado (0.80 / 0.75 / 0.70).</p>
-      <p>Los filtros de elegibilidad (<b>volatility_percentile</b>, <b>delta_min</b>) se mantienen: deciden quién entra, no cuánto pesa, y funcionan como límites de mandato por perfil. μ es uno solo para selección y QP: media histórica encogida hacia Fama-French (<b>mu_shrink_k</b> = 140).</p>
+      <p>En el seasonal los filtros de elegibilidad (<b>volatility_percentile</b>, <b>delta_min</b>) se mantienen como límites de mandato por perfil. En QU normal los reemplaza la banda de beta (ver arriba). μ es uno solo para selección y QP: media histórica encogida hacia Fama-French (<b>mu_shrink_k</b> = 140).</p>
     </div>
     <div class="dec">
       <h3>Tickers internacionales: filtro de formato solo en domésticos</h3>
@@ -207,6 +212,7 @@
     <p class="file">quadratic_utility.py · results_comparison.csv de las tres corridas de hoy · rf 0,05275</p>
     <p class="summary">Retorno y volatilidad en % mensual. La fila resaltada es el λ configurado de ese perfil (6 / 3 / 1.5). pen_ret = (λ/2 · w'Σw) / w'μ.</p>
     <p class="obs">Con la escalera actual 6 / 3 / 1.5, el pen_ret de cada perfil en su propio λ es 0,133 / 0,111 / 0,139. La escalera no separa los perfiles (el moderado penaliza menos que el agresivo). Las diferencias las marcan los topes, el piso de ETF y los filtros.</p>
+    <p class="obs"><b>Anterior a la banda de beta (2026-10-11).</b> Sin piso de ETF ni percentiles de vol, el pool y el pen_ret de cada perfil cambian: recalibrar λ con la primera corrida real.</p>
     <p class="obs">En el agresivo hay un codo hacia λ ≈ 2,5–3: el tope del 30% deja de ligar y pen_ret se aplana cerca de 0,20 para λ entre 2,5 y 5. El moderado no tiene un codo claro, y su tope del 18% liga en todos los λ. En el conservador pen_ret crece casi lineal (~0,021·λ) y λ apenas mueve la cartera bajo las restricciones de 12% / 45% / 35%.</p>
     <p class="obs"><b>PENDIENTE DE DECISIÓN de Isaac, no aplicado.</b> Escalera de ejemplo para un pen_ret objetivo de 0,14 / 0,20 / 0,30: agresivo 1,5, moderado ~7,5, conservador ~14. El 14 queda fuera de la rejilla (el último punto del conservador es λ = 10, pen_ret 0,215) y hay que volver a correrlo.</p>
 
@@ -268,8 +274,9 @@
     <div class="block-head"><h2>Anomalías abiertas</h2></div>
     <ul>
       <li>QU no deduplica clases de acción (MV sí, con <code>share_class_groups</code>). En el moderado, GOOG y GOOGL juntos llegaron al 22,55% frente al tope del 18%.</li>
-      <li>XLK y QQQ se solapan al 24% en el conservador.</li>
-      <li>En MV agresivo el filtro delta no puede ligar después del percentil de volatilidad: la IV máxima fue 33,9% y el corte de delta_min = 0,15 es ~52%.</li>
+      <li>XLK y QQQ se solapan al 24% en el conservador (corrida previa a la banda de beta, con el piso de ETF del 45%).</li>
+      <li>En MV estacional agresivo el filtro delta no puede ligar después del percentil de volatilidad: la IV máxima fue 33,9% y el corte de delta_min = 0,15 es ~52%. En MV normal ya no hay percentil de vol y el colchón es el único tope de IV.</li>
+      <li><b>Pendiente de revalidar con datos reales:</b> la banda de beta de QU y MV normales (2026-10-11) solo se corrió con precios sintéticos sin red (seis corridas, todas dentro de su banda). La tabla de validación y la calibración de λ de arriba son anteriores al cambio. Sin cuota de ETF, conviene revisar cuánto peso se lleva cada perfil en ETF.</li>
       <li>En MV el shrinkage de Ledoit-Wolf sale 1,0.</li>
     </ul>
   </section>
@@ -282,6 +289,9 @@
       <li><code>skew_z_threshold</code> (QU): nunca se usó; su función la cumple <code>bkm_z_threshold</code>, que hereda la misma intención con valores 1.50 / 1.75 / 2.00.</li>
       <li><code>weight_low_vol</code> (los dos QU, 2026-10-04): premio a la vol baja en el puntaje QUBO, redundante con <code>lambda_</code>. Su peso pasó a <code>weight_sharpe</code>.</li>
       <li><code>delta_scale_mode</code>, <code>delta_rel_lo</code> / <code>hi</code>, <code>delta_scale_lo</code> / <code>hi</code> (los dos QU, 2026-10-04): el colchón delta multiplicaba a μ y premiaba la vol baja dentro del QP, fuera de <code>lambda_</code>. El colchón queda solo como filtro.</li>
+      <li><code>volatility_percentile</code> y <code>correlation_percentile</code> (QU y MV normales, 2026-10-11): reemplazados por la banda de beta y un percentil global de vol residual. En QU también <code>correlation_order</code> y la correlación media <code>avg_cor</code>; la decorrelación queda en el QUBO.</li>
+      <li><code>pct_etf_deseado</code>, <code>pct_etf_tolerancia</code>, <code>etf_floor_reserve_factor</code> y <code>etf_band_relax_if_infeasible</code> (QU normal), <code>use_etf_constraint</code>, <code>etf_min_weight</code> y <code>etf_max_weight</code> (MV normal), 2026-10-11: sin cuota de ETF, entran por mérito.</li>
+      <li><code>delta_min</code> por perfil (QU y MV normales, 2026-10-11): queda global en 0.15.</li>
     </ul>
   </footer>
 </div>
@@ -300,6 +310,35 @@ const REGION_NOTE = "Región por sufijo: .TO = Canadá; .DE / .L / .PA / .MC = E
 const OBS_MV = [
   '<b>Filtro delta.</b> use_delta_filter = True. delta_strike_mode = "atm" solo arma la tabla de griegas; el filtro es el colchón OTM (delta_otm_log_m = 0.08, delta_otm_ref_months = 2), con delta_min 0.24 / 0.18 / 0.15.',
   "<b>Internacionales.</b> Con n_top_international = 15 entran los 15 de mayor market cap del universo completo (Canadá, Europa, Japón y HSBC), no solo canadienses. tail_risk_hist_fallback = True y tail_risk_min_survivors = 5. Sin tope por región ni peso mínimo forzado."
+];
+
+const BETA_PORT_NOTE = "Restricción del QP: Σ wᵢβᵢ entre lo y hi por unidad de capital invertido. Beta OLS semanal en USD (104 semanas) encogida hacia 1 (Blume). Si el pool no la alcanza se repone y, si aun así no, se acerca al rango alcanzable con aviso.";
+const BETA_ASSET_NOTE = "Elegibilidad por activo: solo descarta extremos; la banda del portafolio es la que fija el perfil.";
+const DELTA_GLOBAL_NOTE = "Antes 0.24 / 0.18 / 0.15 por perfil. Global desde 2026-10-11: con strike OTM es un tope de IV anual (~52%) y la beta ya fija el riesgo de mercado del perfil. Sale del bloque de perfil.";
+const betaRows = (minvar) => [
+  {p:"beta_port_lo", v:["0.60","0.80","0.95"], live:"0.95", st:"new", lab:"= Agr", note:BETA_PORT_NOTE + (minvar ? " Mínima varianza suele quedar en el piso." : " QU suele quedar cerca del techo: μ crece con la beta.")},
+  {p:"beta_port_hi", v:["0.80","0.95","1.30"], live:"1.30", st:"new", lab:"= Agr"},
+  {p:"beta_asset_min", v:["0.20","0.40","0.50"], live:"0.50", st:"new", lab:"= Agr", note:BETA_ASSET_NOTE},
+  {p:"beta_asset_max", v:["1.30","1.50","2.00"], live:"2.00", st:"new", lab:"= Agr"},
+];
+
+const mvNormal = [
+  ...betaRows(true),
+  {p:"max_assets_in_portfolio", v:["15","10","6"], live:"6", st:"match", lab:"= Agr"},
+  {p:"max_weight_per_asset", v:["0.12","0.22","0.35"], live:"0.35", st:"match", lab:"= Agr"},
+  {p:"shrinkage_min", v:["0.35","0.02","0.02"], live:"0.02", st:"match", lab:"= Mod/Agr", note:MV_EST},
+  {p:"shrinkage_max", v:["0.85","0.70","0.40"], live:"0.40", st:"match", lab:"= Agr", note:MV_EST},
+  {p:"ratio_band", v:["0.30","0.25","0.20"], live:"0.20", st:"match", lab:"= Agr", note:MV_EST},
+  {p:"n_pre_seasonal", v:["70","60","45"], live:"45", st:"match", lab:"= Agr", note:"Pool del pre-filtro, ahora ordenado por Sharpe (antes por vol ascendente)."},
+  {p:"n_top_international", v:["5","10","15"], live:"15", st:"match", lab:"= Agr", note:"Top 15 por market cap del universo completo (Canadá, Europa, Japón y HSBC), no solo canadienses."},
+  {p:"n_divers_candidates", v:["45","40","30"], live:"30", st:"change", lab:"= Agr", note:"Mayor Sharpe entre los que pasan el recorte de cola (antes: menor VaR_CF)."},
+  {p:"max_fx_exposure", v:["0.20","0.35","0.50"], live:"0.50", st:"match", lab:"= Agr", note:"Techo de exposición a tickers no denominados en USD. Es un techo, no genera infactibilidad."},
+  {p:"tail_risk_filter_confidence", v:["0.99","0.975","0.95"], live:"0.95", st:"change", lab:"= Agr", note:"Confianza del VaR_CF del recorte: sale el peor tail_risk_cut_pct = 20% (global) y el resto se ordena por Sharpe."},
+  {p:"cornish_fisher_confidence", v:["0.99","0.975","0.95"], live:"0.95", st:"match", lab:"= Agr", note:CF_MV},
+  {p:"use_delta_filter", v:["True","True","True"], live:"True", st:"match", lab:"todos"},
+  {p:"delta_min", v:["0.15","0.15","0.15"], live:"0.15", st:"change", lab:"global", note:DELTA_GLOBAL_NOTE, skip:true},
+  {p:"delta_otm_log_m", v:["0.08","0.08","0.08"], live:"0.08", st:"match", lab:"todos"},
+  {p:"delta_otm_ref_months", v:["2","2","2"], live:"2", st:"match", lab:"todos"},
 ];
 
 const mvCommon = (seasonal) => [
@@ -347,10 +386,15 @@ const SECTIONS = [
    globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["execution_months","[10]"],["risk_free_rate","0.047"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["use_etf_constraint / use_fx_factor","True / True"],["delta_strike_mode",'"atm"'],["target_dte_iv / dte_tol_iv","30 / 21"],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["use_lw_shrinkage","True"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"],["tail_risk_hist_fallback","True"],["tail_risk_min_survivors","5"]],
    obs:OBS_MV},
   {id:"mv", title:"Minimum Variance", file:"~/AM-PM/minimum_variance.py · Sección 1", live:"hoy: Agresivo",
-   summary:"Agresivo en los campos registrados, incluido el filtro delta (delta_min 0.15). target_total_tickers ya no existe.",
-   rows: mvCommon(false),
-   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["horizon_months","1"],["options_horizon_cap_months","3"],["risk_free_rate","0.047"],["tail_risk_min_hist_weeks","26"],["tail_risk_hist_fallback","True"],["tail_risk_min_survivors","5"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["delta_strike_mode",'"atm"'],["target_dte_iv / dte_tol_iv","30 / 21"],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["use_lw_shrinkage","True"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
-   obs:OBS_MV},
+   summary:"Agresivo en los campos registrados. Desde 2026-10-11 el perfil es una banda de beta del portafolio: sin percentiles de vol ni de |correlación con SPY|, sin banda de ETF y con delta_min global. El pool se ordena por Sharpe y el VaR_CF solo recorta el peor 20%.",
+   rows: mvNormal,
+   globals:[["benchmark",'"SPY"'],["n_top_sp500 / nasdaq","80 / 80"],["horizon_months","1"],["options_horizon_cap_months","3"],["risk_free_rate","0.047"],["beta_window_weeks / beta_min_obs_weeks","104 / 52"],["resid_vol_percentile","0.85"],["tail_risk_cut_pct","0.20"],["delta_min","0.15 (global)"],["tail_risk_min_hist_weeks","26"],["tail_risk_hist_fallback","True"],["tail_risk_min_survivors","5"],["min_weight_per_asset","0.001"],["require_full_investment","False"],["delta_strike_mode",'"atm"'],["target_dte_iv / dte_tol_iv","30 / 21"],["bkm_moneyness_lo / hi","0.70 / 1.30"],["bkm_mfik_max","20.0"],["cov_halflife_days","120"],["use_lw_shrinkage","True"],["vrp_ratio_bounds","(0.70, 1.00)"],["panel_min_obs","104"]],
+   obs:[
+    '<b>Banda de beta.</b> Restricción del QP en la optimización, en la poda (constraints_feasible v3 exige que el subconjunto pueda alcanzar la banda) y en la frontera eficiente. Si el pool no cubre la banda, se reponen nombres por Sharpe del lado que falta; si aun así no, se acerca al rango alcanzable con aviso. El reporte imprime la beta del portafolio y el JSON exporta beta_portfolio y beta_band_used.',
+    '<b>Selección.</b> Beta en [beta_asset_min, beta_asset_max], vol residual ≤ percentil 0.85 y retorno > 0, ordenado por Sharpe (antes: vol ascendente con percentiles de vol y |corr SPY|). Tras el filtro delta, el VaR_CF Cornish-Fisher descarta el peor 20% y los n_divers_candidates de mayor Sharpe pasan al optimizador.',
+    '<b>ETF.</b> Sin cuota: use_etf_constraint, etf_min_weight y etf_max_weight ya no existen. Un ETF entra si pasa la beta y los demás filtros.',
+    OBS_MV[1]
+   ]},
   {id:"qu-seasonal", title:"Quadratic Utility (estacional)", file:"~/AM-PM/quadratic_utility_(seasonal_version).py · Parámetros configurables", live:"hoy: Agresivo",
    summary:"Agresivo en todos los campos registrados. Igual que QU normal: la aversión al riesgo del optimizador vive solo en lambda_ y μ es la media histórica encogida hacia Fama-French. Los filtros de vol (volatility_percentile, delta_min, seasonal_vol_ratio_max) se mantienen como límites de elegibilidad por perfil.",
    rows:[
@@ -379,35 +423,33 @@ const SECTIONS = [
     '<b>Banda de ETF del Conservador: portada, falta revalidar.</b> El script ya tiene el piso de ETF de QU normal (ceil(piso / max_weight), reserva, reposición tras los filtros y chequeo de factibilidad antes de optimizar). La falla de la tabla de validación (3 ETF, máximo 36% frente al piso de 45%) se midió antes de ese cambio.'
    ]},
   {id:"qu", title:"Quadratic Utility", file:"~/AM-PM/quadratic_utility.py · Parámetros configurables", live:"hoy: Agresivo",
-   summary:"Agresivo en todos los campos registrados. La aversión al riesgo del optimizador vive solo en lambda_: se eliminaron el premio a la vol baja del puntaje QUBO y el multiplicador de μ por delta. Los filtros de vol (volatility_percentile, delta_min) se mantienen como límites de elegibilidad por perfil.",
+   summary:"Agresivo en todos los campos registrados. La aversión al riesgo del optimizador vive solo en lambda_. Desde 2026-10-11 el perfil de riesgo de mercado es una banda de beta del portafolio: sin percentiles de vol ni de correlación, sin cuota de ETF y con delta_min global.",
    rows:[
     {p:"lambda_", v:["6.0","3.0","1.5"], live:"1.5", st:"match", lab:"= Agr", note:GAMMA_NOTE("6.0 / 2.5 / 0.5") + LAMBDA_NOTE},
     ...quCommon,
-    {p:"volatility_percentile", v:["0.45","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr", note:"Filtro de elegibilidad (quién entra), no premio: se mantiene como límite de mandato."},
-    {p:"correlation_percentile", v:["0.50","0.65","0.85"], live:"0.85", st:"match", lab:"= Agr"},
+    ...betaRows(false),
     {p:"n_pre_filter", v:["80","65","45"], live:"45", st:"match", lab:"= Agr"},
     {p:"n_filter_candidates", v:["50","42","30"], live:"30", st:"match", lab:"= Agr"},
     {p:"recent_vol_window_min_weeks", v:["20","15","13"], live:"13", st:"match", lab:"= Agr"},
     {p:"recent_vol_window_max_weeks", v:["26","24","18"], live:"18", st:"match", lab:"= Agr"},
-    {p:"recent_vol_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr"},
+    {p:"recent_vol_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr", note:"Estabilidad (vol reciente frente a su historia), no nivel de vol: no se cruza con la beta."},
     {p:"recent_vol_min_survivors", v:["22","18","14"], live:"14", st:"match", lab:"= Agr"},
     {p:"options_dte_cap_days", v:["90","90","90"], live:"90", st:"match", lab:"todos"},
     {p:"iv_vs_realized_ratio_max", v:["1.15","1.35","1.80"], live:"1.80", st:"match", lab:"= Agr", note:"Los rellenos de candidatos ya no reintroducen nombres que este filtro descartó."},
     {p:"iv_min_survivors", v:["16","14","10"], live:"10", st:"match", lab:"= Agr"},
-    {p:"delta_min", v:["0.24","0.18","0.15"], live:"0.15", st:"change", lab:"= Agr", note:DELTA_NOTE("0.55 / 0.42 / 0.30") + " Solo filtra: el colchón ya no multiplica a μ."},
-    {p:"pct_etf_deseado", v:["0.55","0.30","0.10"], live:"0.10", st:"match", lab:"= Agr", note:"La banda del Conservador (0.55 ± 0.10 con max_weight 0.12) se mantiene. El código garantiza que lleguen suficientes ETF para el piso: ceil(piso / max_weight) = 4 en el Conservador."},
-    {p:"pct_etf_tolerancia", v:["0.10","0.08","0.10"], live:"0.1", st:"match", lab:"= Agr"},
+    {p:"delta_min", v:["0.15","0.15","0.15"], live:"0.15", st:"change", lab:"global", note:DELTA_GLOBAL_NOTE + " Solo filtra: el colchón no multiplica a μ.", skip:true},
     {p:"max_region_weight", v:["0.35","0.55","0.80"], live:"0.80", st:"match", lab:"= Agr", note:REGION_NOTE},
     {p:"iv_outlier_multiplier", v:["3.0","4.0","6.0"], live:"6.0", st:"match", lab:"= Agr", note:MV_EST},
     {p:"bkm_z_threshold", v:["1.50","1.75","2.00"], live:"2.00", st:"new", lab:"= Agr", note:Z_NOTE},
     {p:"bkm_min_survivors", v:["16","14","12"], live:"12", st:"new", lab:"= Agr", note:"Piso tras el filtro MFIS."},
    ],
-   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["horizon_months","2"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["lambda_annual","None (si se fija, pisa a lambda_)"],["panel_min_obs","24"],["etf_floor_reserve_factor","3"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["options_dte_cap_days","90"],["etf_band_relax_if_infeasible","True"]],
+   globals:[["n_top_sp500 / nasdaq / int","90 / 90 / 50"],["horizon_months","2"],["rf_rate","0.047"],["seed / n_sim","123 / 5000"],["qubo_exact_threshold","2e6"],["qubo_sa_iterations","20000"],["beta_window_weeks / beta_min_obs_weeks","104 / 52"],["resid_vol_percentile","0.85"],["beta_band_relax_if_infeasible","True"],["delta_min","0.15 (global)"],["bkm_moneyness_lo / hi","0.70 / 1.40"],["bkm_mfik_max","20.0"],["bkm_lookback_months","12"],["cornish_fisher_confidence","0.95 (solo reporte)"],["cov_halflife_days","120"],["vrp / crp bounds","(0.70,1.00) / (0.60,1.00)"],["use_svix_expected_return","False"],["mu_shrink_k","140"],["min / ideal_observations","24 / 60"],["lambda_annual","None (si se fija, pisa a lambda_)"],["panel_min_obs","24"],["delta_strike_mode",'"otm"'],["delta_otm_log_m","0.08"],["delta_otm_ref_months","2"],["options_dte_cap_days","90"]],
    obs:[
     LAMBDA_OBS,
     MU_OBS,
-    '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual (ver la fila de delta_min).',
-    '<b>Banda de ETF y factibilidad.</b> El código garantiza que lleguen suficientes ETF para cumplir el piso (ceil(piso / max_weight), 4 en el Conservador) y revisa que las restricciones se puedan cumplir antes de optimizar. Parámetro nuevo, común a los tres perfiles: etf_band_relax_if_infeasible = True.',
+    '<b>Banda de beta.</b> Selección: beta en [beta_asset_min, beta_asset_max] y vol residual ≤ percentil 0.85 antes del QUBO (Sharpe + decorrelación). La decorrelación tiende a dejar fuera a los nombres de beta alta, así que si el pool no cubre la banda se completa con los mejores candidatos del lado que falta. QP: dos columnas, Σ wᵢβᵢ ≥ beta_port_lo y ≤ beta_port_hi, compartidas con la frontera y la comparación de lambdas. Chequeo de factibilidad antes de quadprog: si la banda no se alcanza, se acerca al rango alcanzable (beta_band_relax_if_infeasible = True) y se avisa.',
+    '<b>ETF.</b> Sin cuota: pct_etf_deseado, pct_etf_tolerancia, la reserva de ETF y la reposición de ETF en MFIS ya no existen. Un ETF entra si pasa la beta y los demás filtros.',
+    '<b>delta_strike_mode = "otm"</b> en los dos QU (ya no "rf"). Con strike OTM, delta_min actúa como tope de IV anual; en QU normal es global (0.15).',
     '<b>Rellenos de candidatos.</b> Ya no reintroducen nombres que el filtro de IV frente a la vol realizada descartó.'
    ]},
   {id:"bl", title:"Black-Litterman", file:"~/AM-PM/black_litterman.py · Bloques 3–5 y 11", live:"hoy: agresivo",

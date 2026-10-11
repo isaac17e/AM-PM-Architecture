@@ -89,6 +89,8 @@ bkm_mfik_max_hard = 80.0
 tail_risk_min_hist_weeks = 26
 tail_risk_filter_confidence = 0.95
 cornish_fisher_confidence = 0.95
+# El VaR_CF solo recorta: sale el peor tail_risk_cut_pct y el resto se ordena por Sharpe.
+tail_risk_cut_pct = 0.20
 
 # ------------------------------------------------------------------------------
 # FALLBACK HISTORICO DEL FILTRO DE TAIL RISK
@@ -110,10 +112,28 @@ n_pre_seasonal = 45
 n_divers_candidates = 30
 
 # ------------------------------------------------------------------------------
-# PERCENTILES DE FILTRO Y NUMERO MAXIMO DE ACTIVOS
+# BETA CONTRA SPY: LA PALANCA DE PERFIL
 # ------------------------------------------------------------------------------
-volatility_percentile = 0.97
-correlation_percentile = 0.90
+# El perfil se expresa como un rango de beta del portafolio: el conservador
+# busca moverse menos que el mercado, no refugiarse en activos de vol baja.
+# beta_asset_min/max: elegibilidad por activo (solo descarta extremos).
+# beta_port_lo/hi: restriccion del QP, sum(w_i * beta_i) dentro del rango por
+# unidad de capital invertido. Minima varianza tiende a pegarse al piso.
+# Beta OLS sobre retornos semanales en USD de beta_window_weeks, encogida
+# hacia 1 (Blume). Un activo sin beta_min_obs_weeks semanas no es elegible.
+beta_window_weeks = 104
+beta_min_obs_weeks = 52
+beta_asset_min = 0.50
+beta_asset_max = 2.00
+beta_port_lo = 0.95
+beta_port_hi = 1.30
+# Vol residual (la que no explica SPY): solo descarta el extremo erratico.
+# Global: el riesgo de mercado ya lo fija la beta.
+resid_vol_percentile = 0.85
+
+# ------------------------------------------------------------------------------
+# NUMERO MAXIMO DE ACTIVOS Y PODA
+# ------------------------------------------------------------------------------
 max_assets_in_portfolio = 6
 tail_prune_rule = "min_weight"
 dedupe_share_classes = True
@@ -134,15 +154,9 @@ min_total_weight = 1.00
 max_total_weight = 1.00
 
 # ------------------------------------------------------------------------------
-# RESTRICCION DE PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL
-# ------------------------------------------------------------------------------
-use_etf_constraint = True
-etf_min_weight = 0.00
-etf_max_weight = 0.05
-
-# ------------------------------------------------------------------------------
 # ETFs EN EL PORTAFOLIO RESULTANTE
 # ------------------------------------------------------------------------------
+# Sin cuota de ETF: entran por merito si pasan la beta y los demas filtros.
 include_etfs_in_portfolio = True
 
 # ------------------------------------------------------------------------------
@@ -160,7 +174,9 @@ annualization_factor = 52
 # FILTRO DELTA (COLCHON OTM), IV ATM (~30 DTE) Y GRIEGAS DE DIAGNOSTICO
 # ------------------------------------------------------------------------------
 use_delta_filter = True
-# Conservador 0.24, moderado 0.18, agresivo 0.15.
+# Global (antes 0.24 / 0.18 / 0.15 por perfil): con strike OTM el colchon es
+# un tope de IV anual, y la beta ya fija el riesgo de mercado del perfil.
+# 0.15 (~52% de IV) solo descarta nombres con vol implicita extrema.
 delta_min = 0.15
 delta_otm_log_m = 0.08
 delta_otm_ref_months = 2
@@ -223,12 +239,12 @@ use_country_factor = True
 # ------------------------------------------------------------------------------
 RISK_PRESETS = {
     "conservador": {
-        "volatility_percentile": 0.55,
-        "correlation_percentile": 0.60,
+        "beta_asset_min": 0.20,
+        "beta_asset_max": 1.30,
+        "beta_port_lo": 0.60,
+        "beta_port_hi": 0.80,
         "max_assets_in_portfolio": 15,
         "max_weight_per_asset": 0.12,
-        "etf_min_weight": 0.30,
-        "etf_max_weight": 0.55,
         "shrinkage_min": 0.35,
         "shrinkage_max": 0.85,
         "ratio_band": 0.30,
@@ -238,15 +254,14 @@ RISK_PRESETS = {
         "max_fx_exposure": 0.20,
         "tail_risk_filter_confidence": 0.99,
         "cornish_fisher_confidence": 0.99,
-        "delta_min": 0.24,
     },
     "moderado": {
-        "volatility_percentile": 0.85,
-        "correlation_percentile": 0.75,
+        "beta_asset_min": 0.40,
+        "beta_asset_max": 1.50,
+        "beta_port_lo": 0.80,
+        "beta_port_hi": 0.95,
         "max_assets_in_portfolio": 10,
         "max_weight_per_asset": 0.22,
-        "etf_min_weight": 0.00,
-        "etf_max_weight": 0.20,
         "shrinkage_min": 0.02,
         "shrinkage_max": 0.70,
         "ratio_band": 0.25,
@@ -256,15 +271,14 @@ RISK_PRESETS = {
         "max_fx_exposure": 0.35,
         "tail_risk_filter_confidence": 0.975,
         "cornish_fisher_confidence": 0.975,
-        "delta_min": 0.18,
     },
     "agresivo": {
-        "volatility_percentile": 0.97,
-        "correlation_percentile": 0.90,
+        "beta_asset_min": 0.50,
+        "beta_asset_max": 2.00,
+        "beta_port_lo": 0.95,
+        "beta_port_hi": 1.30,
         "max_assets_in_portfolio": 6,
         "max_weight_per_asset": 0.35,
-        "etf_min_weight": 0.00,
-        "etf_max_weight": 0.05,
         "shrinkage_min": 0.02,
         "shrinkage_max": 0.40,
         "ratio_band": 0.20,
@@ -274,7 +288,6 @@ RISK_PRESETS = {
         "max_fx_exposure": 0.50,
         "tail_risk_filter_confidence": 0.95,
         "cornish_fisher_confidence": 0.95,
-        "delta_min": 0.15,
     },
 }
 RISK_PROFILE = pipeline_io.resolve_risk_profile("agresivo")
@@ -291,6 +304,14 @@ if not (1 <= options_horizon_cap_months <= 12):
     raise ValueError("Error: options_horizon_cap_months debe ser un entero entre 1 y 12.")
 if not (math.isfinite(delta_min) and delta_min >= 0):
     raise ValueError("Error: delta_min debe ser finito y >= 0")
+if not (beta_asset_min <= beta_asset_max and beta_port_lo <= beta_port_hi):
+    raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max)")
+if not (0 < resid_vol_percentile <= 1):
+    raise ValueError("Error: resid_vol_percentile debe estar en (0, 1]")
+if not (isinstance(beta_window_weeks, int) and beta_window_weeks >= beta_min_obs_weeks >= 26):
+    raise ValueError("Error: beta_window_weeks >= beta_min_obs_weeks >= 26 (enteros)")
+if not (0 <= tail_risk_cut_pct < 1):
+    raise ValueError("Error: tail_risk_cut_pct debe estar en [0, 1)")
 if not (math.isfinite(delta_otm_log_m) and delta_otm_log_m > 0):
     raise ValueError("Error: delta_otm_log_m debe ser finito y > 0")
 if not (delta_otm_ref_months > 0):
@@ -747,40 +768,51 @@ asset_stats = pd.DataFrame({
 })
 asset_stats["Sharpe"] = (asset_stats["Mean_Return"] - risk_free_rate) / asset_stats["Volatility"]
 
-correlations = log_returns.apply(lambda col: col.corr(benchmark_returns.iloc[:, 0]))
-asset_stats["Correlation_SPY"] = correlations.values
+# Beta contra SPY (retornos simples semanales en USD de la ventana del perfil)
+# y vol residual: la palanca de perfil reemplaza a los percentiles de vol y
+# de |correlacion con SPY|.
+_ret_beta = np.expm1(log_returns.tail(beta_window_weeks))
+_mkt_beta = np.expm1(benchmark_returns.iloc[:, 0].tail(beta_window_weeks))
+beta_stats = rk.market_beta(_ret_beta, _mkt_beta, min_obs=beta_min_obs_weeks)
+asset_stats["Beta"] = beta_stats["beta"].reindex(asset_stats["Symbol"]).values
+asset_stats["Resid_Vol"] = beta_stats["resid_vol"].reindex(asset_stats["Symbol"]).values
 
 mdd_values = log_returns.apply(lambda col: max_drawdown_from_returns(col))
 asset_stats["Max_Drawdown"] = mdd_values.values
 
 asset_stats = asset_stats[
-    asset_stats["Sharpe"].notna() & asset_stats["Volatility"].notna() & asset_stats["Correlation_SPY"].notna()
+    asset_stats["Sharpe"].notna() & asset_stats["Volatility"].notna() & asset_stats["Beta"].notna()
+    & asset_stats["Resid_Vol"].notna()
     & np.isfinite(asset_stats["Sharpe"]) & np.isfinite(asset_stats["Volatility"])
-].sort_values("Correlation_SPY").reset_index(drop=True)
+].reset_index(drop=True)
 
 print(f"[INFO] Activos con metricas validas: {len(asset_stats)}\n")
 
-vol_threshold = asset_stats["Volatility"].quantile(volatility_percentile)
-corr_threshold = asset_stats["Correlation_SPY"].abs().quantile(correlation_percentile)
+resid_threshold = asset_stats["Resid_Vol"].quantile(resid_vol_percentile)
 
-asset_stats["Passes_Vol"] = asset_stats["Volatility"] <= vol_threshold
-asset_stats["Passes_Corr"] = asset_stats["Correlation_SPY"].abs() <= corr_threshold
+asset_stats["Passes_Beta"] = asset_stats["Beta"].between(beta_asset_min, beta_asset_max)
+asset_stats["Passes_Resid"] = asset_stats["Resid_Vol"] <= resid_threshold
 asset_stats["Passes_Return"] = asset_stats["Mean_Return"] > 0
-asset_stats["Passes_All"] = asset_stats["Passes_Vol"] & asset_stats["Passes_Corr"] & asset_stats["Passes_Return"]
-asset_stats = asset_stats.sort_values("Volatility").reset_index(drop=True)
+asset_stats["Passes_All"] = asset_stats["Passes_Beta"] & asset_stats["Passes_Resid"] & asset_stats["Passes_Return"]
+asset_stats = asset_stats.sort_values("Sharpe", ascending=False).reset_index(drop=True)
 
-selected_pre_seasonal = (
-    asset_stats[asset_stats["Passes_All"]].sort_values("Volatility").head(n_pre_seasonal)["Symbol"].tolist()
-)
+print(f"[INFO] Beta contra SPY ({min(beta_window_weeks, len(log_returns))} semanas, Blume): "
+      f"mediana {asset_stats['Beta'].median():.2f} | elegibles {beta_asset_min:.2f}-{beta_asset_max:.2f}: "
+      f"{int(asset_stats['Passes_Beta'].sum())} | banda del portafolio {beta_port_lo:.2f}-{beta_port_hi:.2f}")
+print(f"[INFO] Vol residual <= percentil {resid_vol_percentile:.2f} ({resid_threshold * 100:.1f}% anual): "
+      f"{int(asset_stats['Passes_Resid'].sum())} | retorno > 0: {int(asset_stats['Passes_Return'].sum())}")
+
+# Sharpe descendente: el pool premia a los mejor posicionados, no a los de menor vol.
+selected_pre_seasonal = asset_stats[asset_stats["Passes_All"]].head(n_pre_seasonal)["Symbol"].tolist()
 
 if len(selected_pre_seasonal) < 5:
-    print("\n[ADVERTENCIA] Muy pocos activos pasan todos los filtros. Relajando filtro de correlacion...")
+    print("\n[ADVERTENCIA] Muy pocos activos pasan todos los filtros. Se omite el filtro de vol residual...")
     selected_pre_seasonal = (
-        asset_stats[asset_stats["Passes_Vol"] & asset_stats["Passes_Return"]]
-        .sort_values("Volatility").head(n_pre_seasonal)["Symbol"].tolist()
+        asset_stats[asset_stats["Passes_Beta"] & asset_stats["Passes_Return"]]
+        .head(n_pre_seasonal)["Symbol"].tolist()
     )
 
-print(f"\n[INFO] Pool pre-filtro de volatilidad: {len(selected_pre_seasonal)} candidatos "
+print(f"\n[INFO] Pool pre-filtro (beta + vol residual, por Sharpe): {len(selected_pre_seasonal)} candidatos "
       f"(max configurado: {n_pre_seasonal})")
 
 # ==============================================================================
@@ -1240,8 +1272,33 @@ print(f"  OK Con VaR_CF calculable (>={hv_min_obs_weeks} sem hist.): {n_con_tail
 print(f"  ADVERTENCIA Descartados (sin cobertura BKM o con MFIS/MFIK inadmisibles): {n_sin_tail}")
 print("  " + qm.texto_ajuste_iv(qm.resumen_ajuste_iv(bkm_moments_cache.values()), risk_free_rate))
 
-tail_risk_final = tail_risk_stats.head(n_divers_candidates)
-print(f"  OK Seleccionados (<={n_divers_candidates}, menor VaR_CF/Tail Risk Score): {len(tail_risk_final)}")
+# El VaR_CF solo recorta la cola: sale el peor tail_risk_cut_pct (tail_risk_stats
+# viene ordenado por VaR_CF ascendente) y el resto se ordena por Sharpe.
+n_corte_cola = int(math.floor(n_con_tail * tail_risk_cut_pct))
+tail_risk_final = (tail_risk_stats.iloc[:n_con_tail - n_corte_cola]
+                   .merge(asset_stats[["Symbol", "Sharpe"]], on="Symbol", how="left")
+                   .sort_values("Sharpe", ascending=False)
+                   .head(n_divers_candidates)
+                   .reset_index(drop=True))
+print(f"  OK Recorte de cola: fuera el peor {tail_risk_cut_pct * 100:.0f}% por VaR_CF ({n_corte_cola} de {n_con_tail})")
+# El orden por Sharpe no mira la beta: si el pool no cubre la banda del perfil,
+# se completa con los mejores del recorte (por Sharpe) del lado que falta.
+_pasan_cola = (tail_risk_stats.iloc[:n_con_tail - n_corte_cola]
+               .merge(asset_stats[["Symbol", "Sharpe", "Beta"]], on="Symbol", how="left")
+               .sort_values("Sharpe", ascending=False))
+_betas_cola = dict(zip(_pasan_cola["Symbol"], _pasan_cola["Beta"]))
+_extra_beta = pq.beta_coverage_additions(
+    tail_risk_final["Symbol"].tolist(), _pasan_cola["Symbol"].tolist(), _betas_cola,
+    beta_port_lo, beta_port_hi, max_weight=max_weight_per_asset,
+    max_add=max(3, math.ceil(1 / max_weight_per_asset)))
+if _extra_beta:
+    print(f"  OK Agregados para cubrir la banda de beta {beta_port_lo:.2f}-{beta_port_hi:.2f}: "
+          f"{', '.join(_extra_beta)}")
+    tail_risk_final = pd.concat(
+        [tail_risk_final, _pasan_cola[_pasan_cola["Symbol"].isin(_extra_beta)].drop(columns="Beta")],
+        ignore_index=True)
+print(f"  OK Seleccionados (<={n_divers_candidates}, mayor Sharpe entre los que pasan el recorte): "
+      f"{len(tail_risk_final)}")
 
 if len(tail_risk_final) < tail_risk_min_survivors:
     print("\n  Diagnostico de llamadas a Polygon:")
@@ -1258,9 +1315,7 @@ if len(tail_risk_final) < n_divers_candidates * 0.5:
     print(f"\n  ADVERTENCIA: solo {len(tail_risk_final)} tickers sobrevivieron el filtro de Tail Risk.")
     print("     Considera ampliar bkm_moneyness_lo/hi o relajar options_horizon_cap_months.")
 
-tail_risk_final = tail_risk_final.merge(asset_stats[["Symbol", "Sharpe"]], on="Symbol", how="left")
-
-print("\n  Candidatos finales ordenados por VaR_CF (Tail Risk Score, Cornish-Fisher):")
+print("\n  Candidatos finales ordenados por Sharpe (VaR_CF Cornish-Fisher solo como recorte):")
 disp_tr = tail_risk_final.copy()
 disp_tr["VaR_CF"] = disp_tr["VaR_CF"].map(lambda x: f"{x * 100:.3f}%")
 disp_tr["MFIV"] = disp_tr["MFIV"].map(lambda x: f"{x:.5f}" if pd.notna(x) else "N/D")
@@ -1751,7 +1806,6 @@ print(f"  Rango beta_mercado: {beta_hist_arr.min():.3f} - {beta_hist_arr.max():.
 # OPTIMIZACION MINIMO RIESGO DE COLA (quadprog, SOBRE Sigma_modificada)
 # ==============================================================================
 etf_excluded_from_portfolio = set(etf_tickers) - set(commodity_tickers)
-use_etf_band = use_etf_constraint and include_etfs_in_portfolio
 
 if include_etfs_in_portfolio:
     optimization_pool = list(selected_tickers)
@@ -1766,27 +1820,30 @@ else:
         raise RuntimeError(
             f"Error: con include_etfs_in_portfolio = False quedan {len(optimization_pool)} acciones/commodities "
             f"elegibles y max_weight_per_asset = {max_weight_per_asset:.2f} no alcanza min_total_weight = "
-            f"{min_total_weight:.2f}.\n   Amplia el pool (n_pre_seasonal, volatility_percentile, "
-            "correlation_percentile) o sube max_weight_per_asset."
+            f"{min_total_weight:.2f}.\n   Amplia el pool (n_pre_seasonal, n_divers_candidates, "
+            "beta_asset_min/max) o sube max_weight_per_asset."
         )
 
+# Banda de beta del portafolio: la palanca de perfil dentro del QP. Si el pool
+# no la alcanza con los topes de peso, se acerca al rango alcanzable con aviso.
+beta_map = asset_stats.set_index("Symbol")["Beta"].to_dict()
+_sin_beta = [t for t in optimization_pool if not np.isfinite(beta_map.get(t, np.nan))]
+if _sin_beta:
+    print(f"  ADVERTENCIA sin beta para {', '.join(_sin_beta)}: se usa 1.0 en la banda")
+    for t in _sin_beta:
+        beta_map[t] = 1.0
+beta_lo, beta_hi = beta_port_lo, beta_port_hi
+_betas_pool = [beta_map[t] for t in optimization_pool]
+_b_min, _b_max = pq.beta_range_reachable(_betas_pool, max_weight_per_asset, min_weight_per_asset, min_total_weight)
+beta_lo, beta_hi, _nota_beta = pq.relax_beta_band(
+    _betas_pool, beta_lo, beta_hi, max_weight=max_weight_per_asset,
+    min_weight=min_weight_per_asset, total=min_total_weight)
+print(f"[INFO] Banda de beta del portafolio: {beta_lo:.2f}-{beta_hi:.2f} "
+      f"(alcanzable con el pool: {_b_min:.2f}-{_b_max:.2f})")
+if _nota_beta:
+    print(f"  ADVERTENCIA Banda de beta: {_nota_beta}")
 n_etf_en_pool = sum(1 for t in optimization_pool if t in etf_universe_tickers)
-if use_etf_band:
-    _etf_min, _etf_max, _nota_banda = pq.relax_group_band(
-        n_etf_en_pool, len(optimization_pool) - n_etf_en_pool, max_weight_per_asset,
-        etf_min_weight, etf_max_weight)
-    etf_min_weight, etf_max_weight = _etf_min, _etf_max
-    if _nota_banda:
-        print(f"  ADVERTENCIA Banda ETF: {_nota_banda}")
-    if n_etf_en_pool == 0:
-        use_etf_band = False
-if use_etf_band:
-    print(f"[INFO] Restriccion de participacion ETF activa: {etf_min_weight * 100:.0f}%-{etf_max_weight * 100:.0f}% "
-          f"del capital invertido")
-    print(f"[INFO] ETFs/commodities en el pool tras filtros previos: {n_etf_en_pool} de {len(optimization_pool)} activos")
-    if n_etf_en_pool == 0:
-        print("  ADVERTENCIA Ningun ETF sobrevivio a los filtros de score/volatilidad/correlacion/")
-        print("     Tail Risk - la restriccion de % ETF no tendra efecto.")
+print(f"[INFO] ETFs/commodities en el pool: {n_etf_en_pool} de {len(optimization_pool)} (sin cuota: entran por merito)")
 
 n_fx_en_pool = sum(1 for t in optimization_pool if get_currency_for_ticker(t) != "USD")
 if use_fx_factor:
@@ -1798,22 +1855,19 @@ if use_fx_factor:
         print("     de exposicion cambiaria no tendra efecto.")
 
 print(f"\n[INFO] Ejecutando optimizacion iterativa - maximo {max_assets_in_portfolio} activos...")
-print("[INFO] Poda ETF/FX-aware activa (constraints_feasible v2)\n")
+print("[INFO] Poda beta/FX-aware activa (constraints_feasible v3)\n")
 
 
 # ==============================================================================
-# INTERVENCION 4b (PRE-REQUISITO): CHEQUEO DE FACTIBILIDAD ESTRUCTURAL DE LAS BANDAS ETF/FX
+# INTERVENCION 4b (PRE-REQUISITO): CHEQUEO DE FACTIBILIDAD ESTRUCTURAL DE BETA/FX
 # ==============================================================================
 def constraints_feasible(tickers_list):
     if len(tickers_list) == 0:
         return False
-    if use_etf_band:
-        n_etf = sum(1 for t in tickers_list if t in etf_universe_tickers)
-        n_stock = len(tickers_list) - n_etf
-        if n_stock * max_weight_per_asset < (1 - etf_max_weight) - 1e-9:
-            return False
-        if n_etf * max_weight_per_asset < etf_min_weight - 1e-9:
-            return False
+    b_min, b_max = pq.beta_range_reachable([beta_map[t] for t in tickers_list], max_weight_per_asset,
+                                           min_weight_per_asset, min_total_weight)
+    if not (np.isfinite(b_min) and b_min <= beta_hi + 1e-9 and b_max >= beta_lo - 1e-9):
+        return False
     if use_fx_factor:
         n_fx = sum(1 for t in tickers_list if get_currency_for_ticker(t) != "USD")
         n_usd = len(tickers_list) - n_fx
@@ -1831,13 +1885,12 @@ def build_qp_constraints(tickers_subset):
         min_total=min_total_weight,
         max_total=max_total_weight,
         require_full_investment=require_full_investment,
-        is_etf=[t in etf_universe_tickers for t in tickers_subset],
-        use_etf_band=use_etf_band,
-        etf_min_weight=etf_min_weight,
-        etf_max_weight=etf_max_weight,
         is_non_usd=[get_currency_for_ticker(t) != "USD" for t in tickers_subset],
         use_fx_cap=use_fx_factor,
         max_fx_exposure=max_fx_exposure,
+        betas=[beta_map[t] for t in tickers_subset],
+        beta_lo=beta_lo,
+        beta_hi=beta_hi,
     )
 
 
@@ -1865,7 +1918,7 @@ def run_minvar_qp(tickers_subset):
     w = solve_attempt(Amat_full, bvec_full)
 
     if w is None and extra_cols:
-        print("  ADVERTENCIA Restriccion de % ETF/exposicion cambiaria infactible para este subset - "
+        print("  ADVERTENCIA Banda de beta/exposicion cambiaria infactible para este subset - "
               "optimizando sin restricciones adicionales")
         w = solve_attempt(Amat_base, bvec_base)
 
@@ -1969,11 +2022,11 @@ while True:
             break
         else:
             print(f"    (saltando '{candidate}' como candidato a eliminar - "
-                  f"dejaria la banda ETF/FX estructuralmente infactible)")
+                  f"dejaria la banda de beta/FX estructuralmente infactible)")
 
     if drop_ticker is None:
         drop_ticker = orden_poda[0]
-        print("    ADVERTENCIA: ninguna eliminacion preserva la banda ETF/FX factible - "
+        print("    ADVERTENCIA: ninguna eliminacion preserva la banda de beta/FX factible - "
               f"eliminando igual ({tail_prune_rule})")
 
     current_tickers = [t for t in current_tickers if t != drop_ticker]
@@ -1988,8 +2041,8 @@ if w_last_valid is None:
     raise RuntimeError(
         "Error: la optimizacion de minimo riesgo de cola no encontro ninguna solucion factible.\n"
         "   Revisa: (1) que cov_mat sea PSD, (2) min_weight_per_asset * n_activos <= max_total_weight,\n"
-        "   (3) max_weight_per_asset * n_activos >= min_total_weight, (4) la restriccion ETF\n"
-        "   (etf_min_weight/etf_max_weight) si use_etf_constraint e include_etfs_in_portfolio = True, y (5) la restriccion\n"
+        "   (3) max_weight_per_asset * n_activos >= min_total_weight, (4) la banda de beta del perfil\n"
+        "   (beta_port_lo/hi) frente a las betas del pool, y (5) la restriccion\n"
         "   de exposicion cambiaria (max_fx_exposure) si use_fx_factor = True."
     )
 
@@ -1998,7 +2051,11 @@ selected_tickers = w_iter[w_iter > 0.001].index.tolist()
 w_final_implied = w_iter[selected_tickers]
 
 print(f"\nOK Portafolio final: {len(selected_tickers)} activos (limite: {max_assets_in_portfolio})")
-print(f"  Activos: {', '.join(selected_tickers)}\n")
+print(f"  Activos: {', '.join(selected_tickers)}")
+beta_portafolio = float(sum(w_final_implied[t] * beta_map[t] for t in selected_tickers)
+                        / max(float(w_final_implied.sum()), 1e-12))
+print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {beta_lo:.2f}-{beta_hi:.2f}"
+      f"{', relajada desde la pedida' if _nota_beta else ''})\n")
 
 log_returns_selected = log_returns[selected_tickers]
 mean_ret = log_returns_selected.mean()
@@ -2041,7 +2098,7 @@ for target_ret in target_returns:
 
 efficient_frontier = pd.DataFrame(efficient_frontier_rows, columns=["Return", "Risk"])
 print(f"[INFO] Frontera eficiente calculada con {len(efficient_frontier)} puntos"
-      f"{f' ({n_ef_infactibles} objetivos infactibles con las bandas ETF/FX)' if n_ef_infactibles else ''}.")
+      f"{f' ({n_ef_infactibles} objetivos infactibles con las bandas de beta/FX)' if n_ef_infactibles else ''}.")
 
 # ==============================================================================
 # SECCION 10: EXTRACCION DE METRICAS
@@ -2526,10 +2583,13 @@ pipeline_io.export_portfolio(
         "max_weight_per_asset": max_weight_per_asset,
         "min_weight_per_asset": min_weight_per_asset,
         "max_assets_in_portfolio": max_assets_in_portfolio,
-        "etf_min_weight": etf_min_weight,
-        "etf_max_weight": etf_max_weight,
+        "beta_port_lo": beta_port_lo,
+        "beta_port_hi": beta_port_hi,
+        "beta_band_used": [beta_lo, beta_hi],
+        "beta_portfolio": beta_portafolio,
+        "beta_asset_min": beta_asset_min,
+        "beta_asset_max": beta_asset_max,
         "include_etfs_in_portfolio": include_etfs_in_portfolio,
-        "use_etf_constraint": use_etf_constraint,
         "max_fx_exposure": max_fx_exposure,
         "shrinkage_min": shrinkage_min,
         "shrinkage_max": shrinkage_max,
@@ -2540,8 +2600,8 @@ pipeline_io.export_portfolio(
         "cov_halflife_days": cov_halflife_days,
         "horizon_months": horizon_months,
         "prune_below_weight": prune_below_weight,
-        "volatility_percentile": volatility_percentile,
-        "correlation_percentile": correlation_percentile,
+        "resid_vol_percentile": resid_vol_percentile,
+        "tail_risk_cut_pct": tail_risk_cut_pct,
         "cornish_fisher_confidence": cornish_fisher_confidence,
         "delta_min": delta_min,
     },

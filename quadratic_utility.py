@@ -33,6 +33,7 @@ import risk_estimators as rk
 import polygon_client as pc
 import market_data as md
 import qu_metrics as qm
+import portfolio_constraints as pq
 import pipeline_io
 
 # ==============================================================================
@@ -117,10 +118,24 @@ qubo_exact_threshold = 2e6
 qubo_sa_iterations = 20000
 
 # ------------------------------------------------------------------------------
-# PERCENTILES DE VOLATILIDAD Y CORRELACION
+# BETA CONTRA SPY: LA PALANCA DE PERFIL
 # ------------------------------------------------------------------------------
-volatility_percentile = 0.85
-correlation_percentile = 0.85
+# El perfil se expresa como un rango de beta del portafolio: el conservador
+# busca moverse menos que el mercado, no refugiarse en activos de vol baja.
+# beta_asset_min/max: elegibilidad por activo (solo descarta extremos).
+# beta_port_lo/hi: restriccion del QP, sum(w_i * beta_i) dentro del rango.
+# Beta OLS sobre retornos semanales en USD de beta_window_weeks, encogida
+# hacia 1 (Blume). Un activo sin beta_min_obs_weeks semanas no es elegible.
+beta_window_weeks = 104
+beta_min_obs_weeks = 52
+beta_asset_min = 0.50
+beta_asset_max = 2.00
+beta_port_lo = 0.95
+beta_port_hi = 1.30
+beta_band_relax_if_infeasible = True
+# Vol residual (la que no explica SPY): solo descarta el extremo erratico.
+# Global: el riesgo de mercado ya lo fija la beta.
+resid_vol_percentile = 0.85
 
 # ------------------------------------------------------------------------------
 # FILTRO DE VOLATILIDAD RECIENTE
@@ -192,11 +207,6 @@ use_svix_expected_return = False
 svix_blend = 0.50
 
 # ------------------------------------------------------------------------------
-# ORDEN DE CORRELACION
-# ------------------------------------------------------------------------------
-correlation_order = 0
-
-# ------------------------------------------------------------------------------
 # OBSERVACIONES MINIMAS E IDEALES
 # ------------------------------------------------------------------------------
 min_observations = 24
@@ -206,7 +216,9 @@ ideal_observations = 60
 # FILTRO DELTA
 # ------------------------------------------------------------------------------
 use_delta_filter = True
-# Conservador 0.24, moderado 0.18, agresivo 0.15.
+# Global (antes 0.24 / 0.18 / 0.15 por perfil): con strike OTM el colchon es
+# un tope de IV anual, y la beta ya fija el riesgo de mercado del perfil.
+# 0.15 (~52% de IV) solo descarta nombres con vol implicita extrema.
 delta_min = 0.15
 sector_implied_min_names = 4
 delta_strike_mode = "otm"
@@ -220,16 +232,9 @@ iv_outlier_multiplier = 6.0
 max_region_weight = 0.80
 
 # ------------------------------------------------------------------------------
-# PARTICIPACION DE ETFs EN EL PORTAFOLIO FINAL
-# ------------------------------------------------------------------------------
-pct_etf_deseado = 0.10
-pct_etf_tolerancia = 0.1
-etf_floor_reserve_factor = 3
-etf_band_relax_if_infeasible = True
-
-# ------------------------------------------------------------------------------
 # ETFs EN EL PORTAFOLIO RESULTANTE
 # ------------------------------------------------------------------------------
+# Sin cuota de ETF: entran por merito si pasan la beta y los demas filtros.
 include_etfs_in_portfolio = True
 
 # ------------------------------------------------------------------------------
@@ -243,8 +248,10 @@ RISK_PRESETS = {
         "max_weight": 0.12,
         "weight_sharpe": 0.80,
         "weight_decorr": 0.20,
-        "volatility_percentile": 0.45,
-        "correlation_percentile": 0.50,
+        "beta_asset_min": 0.20,
+        "beta_asset_max": 1.30,
+        "beta_port_lo": 0.60,
+        "beta_port_hi": 0.80,
         "n_pre_filter": 80,
         "n_filter_candidates": 50,
         "recent_vol_window_min_weeks": 20,
@@ -253,9 +260,6 @@ RISK_PRESETS = {
         "recent_vol_min_survivors": 22,
         "iv_vs_realized_ratio_max": 1.15,
         "iv_min_survivors": 16,
-        "delta_min": 0.24,
-        "pct_etf_deseado": 0.55,
-        "pct_etf_tolerancia": 0.10,
         "max_region_weight": 0.35,
         "iv_outlier_multiplier": 3.0,
         "bkm_z_threshold": 1.50,
@@ -266,8 +270,10 @@ RISK_PRESETS = {
         "max_weight": 0.18,
         "weight_sharpe": 0.75,
         "weight_decorr": 0.25,
-        "volatility_percentile": 0.65,
-        "correlation_percentile": 0.65,
+        "beta_asset_min": 0.40,
+        "beta_asset_max": 1.50,
+        "beta_port_lo": 0.80,
+        "beta_port_hi": 0.95,
         "n_pre_filter": 65,
         "n_filter_candidates": 42,
         "recent_vol_window_min_weeks": 15,
@@ -276,9 +282,6 @@ RISK_PRESETS = {
         "recent_vol_min_survivors": 18,
         "iv_vs_realized_ratio_max": 1.35,
         "iv_min_survivors": 14,
-        "delta_min": 0.18,
-        "pct_etf_deseado": 0.30,
-        "pct_etf_tolerancia": 0.08,
         "max_region_weight": 0.55,
         "iv_outlier_multiplier": 4.0,
         "bkm_z_threshold": 1.75,
@@ -289,8 +292,10 @@ RISK_PRESETS = {
         "max_weight": 0.30,
         "weight_sharpe": 0.70,
         "weight_decorr": 0.30,
-        "volatility_percentile": 0.85,
-        "correlation_percentile": 0.85,
+        "beta_asset_min": 0.50,
+        "beta_asset_max": 2.00,
+        "beta_port_lo": 0.95,
+        "beta_port_hi": 1.30,
         "n_pre_filter": 45,
         "n_filter_candidates": 30,
         "recent_vol_window_min_weeks": 13,
@@ -299,9 +304,6 @@ RISK_PRESETS = {
         "recent_vol_min_survivors": 14,
         "iv_vs_realized_ratio_max": 1.80,
         "iv_min_survivors": 10,
-        "delta_min": 0.15,
-        "pct_etf_deseado": 0.10,
-        "pct_etf_tolerancia": 0.10,
         "max_region_weight": 0.80,
         "iv_outlier_multiplier": 6.0,
         "bkm_z_threshold": 2.00,
@@ -317,14 +319,14 @@ print(f"Perfil de riesgo: {RISK_PROFILE}")
 # ==============================================================================
 if not (1 <= horizon_months <= 24):
     raise ValueError("Error: horizon_months debe estar entre 1 y 24")
-if not (0 <= pct_etf_deseado <= 1):
-    raise ValueError("Error: pct_etf_deseado debe estar entre 0 y 1 (ej. 0.30 = 30%)")
 if not (math.isfinite(mu_shrink_k) and mu_shrink_k >= 0):
     raise ValueError("Error: mu_shrink_k debe ser finito y >= 0")
-if not (0 <= pct_etf_tolerancia <= 0.5):
-    raise ValueError("Error: pct_etf_tolerancia debe estar entre 0 y 0.5")
-if not (isinstance(etf_floor_reserve_factor, int) and etf_floor_reserve_factor >= 1):
-    raise ValueError("Error: etf_floor_reserve_factor debe ser un entero >= 1")
+if not (beta_asset_min <= beta_asset_max and beta_port_lo <= beta_port_hi):
+    raise ValueError("Error: beta_asset_min/max y beta_port_lo/hi deben venir en orden (min <= max)")
+if not (0 < resid_vol_percentile <= 1):
+    raise ValueError("Error: resid_vol_percentile debe estar en (0, 1]")
+if not (isinstance(beta_window_weeks, int) and beta_window_weeks >= beta_min_obs_weeks >= 26):
+    raise ValueError("Error: beta_window_weeks >= beta_min_obs_weeks >= 26 (enteros)")
 if delta_strike_mode not in ("atm", "mu", "rf", "otm"):
     raise ValueError("Error: delta_strike_mode debe ser atm, mu, rf u otm")
 if not (math.isfinite(delta_min) and delta_min >= 0):
@@ -1152,21 +1154,26 @@ if lookback_months is not None:
     benchmark_prices = benchmark_prices[benchmark_prices["date"] >= cutoff_date]
 
 # ==============================================================================
-# RETORNOS DIARIOS RECIENTES PARA FILTRO DE VOLATILIDAD RECIENTE
+# RETORNOS DIARIOS: FILTRO DE VOLATILIDAD RECIENTE Y BETA SEMANAL
 # ==============================================================================
+# Una sola descarga diaria en USD cubre las dos ventanas: la de vol reciente
+# (semanas finales) y la de beta (beta_window_weeks, retornos semanales).
 recent_vol_window_weeks = int(min(max(round(horizon_months * 4), recent_vol_window_min_weeks),
                                    recent_vol_window_max_weeks))
-print(f"Descargando retornos DIARIOS recientes para filtro de volatilidad reciente "
-      f"(ventana={recent_vol_window_weeks} semanas, ancladas a {as_of_date.isoformat()})...")
+daily_window_weeks = max(recent_vol_window_weeks, beta_window_weeks + 1)
+print(f"Descargando retornos DIARIOS ({daily_window_weeks} semanas, ancladas a {as_of_date.isoformat()}): "
+      f"vol reciente ({recent_vol_window_weeks} sem) y beta semanal ({beta_window_weeks} sem)...")
 
 recent_vol_start = (pd.Timestamp(as_of_date) - timedelta(weeks=recent_vol_window_weeks)).strftime("%Y-%m-%d")
+daily_start = (pd.Timestamp(as_of_date) - timedelta(weeks=daily_window_weeks)).strftime("%Y-%m-%d")
 recent_vol_end = (pd.Timestamp(as_of_date) + timedelta(days=1)).strftime("%Y-%m-%d")
 
-fx_prices_daily = download_fx_prices(recent_vol_start, recent_vol_end, period="1d")
+fx_prices_daily = download_fx_prices(daily_start, recent_vol_end, period="1d")
 
-df_daily_recent = download_period_returns(all_tickers, recent_vol_start, recent_vol_end, period="1d",
-                                           fx_prices=fx_prices_daily)
-df_daily_recent = df_daily_recent.rename(columns={"return": "daily_return"})
+df_daily_all = download_period_returns(list(dict.fromkeys(all_tickers + ["SPY"])), daily_start, recent_vol_end,
+                                        period="1d", fx_prices=fx_prices_daily)
+df_daily_all = df_daily_all.rename(columns={"return": "daily_return"})
+df_daily_recent = df_daily_all[df_daily_all["date"] >= pd.Timestamp(recent_vol_start)]
 
 recent_vol_min_obs = max(int(recent_vol_window_weeks * 5 * 0.6), 10)
 
@@ -1183,6 +1190,21 @@ recent_vol_stats = recent_vol_stats[
 ].sort_values("recent_vol_sd").reset_index(drop=True)
 
 print(f"Tickers con volatilidad reciente calculable: {len(recent_vol_stats)}")
+
+# Beta semanal contra SPY (USD, simple, semanas completas) y vol residual.
+_px_daily = df_daily_all.pivot_table(index="date", columns="symbol", values="adjusted").sort_index()
+if "SPY" not in _px_daily.columns or len(_px_daily) == 0:
+    raise RuntimeError("Error: sin precios diarios de SPY para estimar las betas del perfil.")
+_px_weekly, _ = md.drop_partial_last_week(_px_daily.resample("W").last(), _px_daily.index.max())
+_ret_weekly = _px_weekly.pct_change(fill_method=None).iloc[1:].tail(beta_window_weeks)
+# SPY queda en el panel: su beta es 1 y sigue elegible como cualquier ETF.
+beta_stats = rk.market_beta(_ret_weekly, _ret_weekly["SPY"], min_obs=beta_min_obs_weeks)
+beta_stats = beta_stats.rename_axis("symbol").reset_index()
+_beta_ok = beta_stats["beta"].notna()
+print(f"Betas contra SPY ({len(_ret_weekly)} semanas, Blume): {int(_beta_ok.sum())} de {len(beta_stats)} tickers | "
+      f"mediana {beta_stats.loc[_beta_ok, 'beta'].median():.2f} | "
+      f"rango elegible del perfil {beta_asset_min:.2f}-{beta_asset_max:.2f} | "
+      f"rango del portafolio {beta_port_lo:.2f}-{beta_port_hi:.2f}")
 
 # ==============================================================================
 # ESTADISTICAS DESCRIPTIVAS
@@ -1221,11 +1243,8 @@ else:
 # CORRELACIONES
 # ==============================================================================
 returns_wide = df_prices.pivot_table(index="date", columns="symbol", values="monthly_return")
+# La matriz solo alimenta el termino de decorrelacion del QUBO.
 cor_matrix_full = returns_wide.corr(min_periods=1)
-
-avg_cor_by_ticker = (
-    qm.average_abs_correlation(cor_matrix_full).rename("avg_cor").rename_axis("symbol").reset_index()
-)
 
 # ==============================================================================
 # FAMA-FRENCH
@@ -1303,11 +1322,11 @@ else:
 # ==============================================================================
 # COMBINAR METRICAS
 # ==============================================================================
-combined_stats = summary_stats.merge(avg_cor_by_ticker, on="symbol", how="left")
-combined_stats = combined_stats.merge(
+combined_stats = summary_stats.merge(
     ff_stats[["symbol", "beta_mkt", "beta_smb", "beta_hml", "ff_expected_return"]], on="symbol", how="left"
 )
-combined_stats["avg_cor"] = combined_stats["avg_cor"].fillna(combined_stats["avg_cor"].median())
+combined_stats = combined_stats.merge(
+    beta_stats[["symbol", "beta", "beta_ols", "resid_vol"]], on="symbol", how="left")
 # Retorno esperado unico del script (seleccion y QP): media historica encogida
 # hacia FF3 segun la historia de cada activo. Sin FF3 queda la media historica.
 _mu_adj, _w_hist = qm.shrink_mu_to_prior(
@@ -1407,24 +1426,31 @@ def select_candidates_qubo(symbols, h_dict, cor_matrix, n_select, weight_decorr_
 
 
 def select_optimal_candidates(df, n_candidates):
+    """Pool del pre-filtro: beta del perfil, vol residual no extrema y QUBO (Sharpe + decorrelacion).
+
+    Ya no hay percentiles de vol total ni de correlacion media: el riesgo de
+    mercado lo fija la beta (aqui por activo, en el QP para el portafolio) y
+    la decorrelacion la premia el QUBO.
+    """
     df_filtered = df[(df["n_obs"] >= min_observations) & (df["sd_return"] > 0)
                       & df["sharpe_ratio_adjusted"].notna() & np.isfinite(df["sharpe_ratio_adjusted"])].copy()
 
-    sd_threshold = df_filtered["sd_return"].quantile(volatility_percentile)
-    cor_threshold = df_filtered["avg_cor"].quantile(correlation_percentile)
-
-    if correlation_order == 1:
-        df_candidates = df_filtered[(df_filtered["sd_return"] <= sd_threshold) & (df_filtered["avg_cor"] >= cor_threshold)]
-    else:
-        df_candidates = df_filtered[(df_filtered["sd_return"] <= sd_threshold) & (df_filtered["avg_cor"] <= cor_threshold)]
+    con_beta = df_filtered["beta"].notna() & df_filtered["resid_vol"].notna()
+    en_banda = con_beta & df_filtered["beta"].between(beta_asset_min, beta_asset_max)
+    resid_threshold = df_filtered.loc[con_beta, "resid_vol"].quantile(resid_vol_percentile)
+    df_candidates = df_filtered[en_banda & (df_filtered["resid_vol"] <= resid_threshold)]
+    print(f"Filtro de beta ({beta_asset_min:.2f}-{beta_asset_max:.2f}): {int(en_banda.sum())} de "
+          f"{int(con_beta.sum())} con beta | sin beta (historia semanal corta): {int((~con_beta).sum())}")
+    print(f"Filtro de vol residual (percentil {resid_vol_percentile:.2f} = {resid_threshold * 100:.1f}% anual): "
+          f"{len(df_candidates)} candidatos")
 
     if len(df_candidates) < n_candidates * 0.5:
-        sd_threshold = df_filtered["sd_return"].quantile(0.75)
-        cor_threshold = df_filtered["avg_cor"].quantile(0.80)
-        if correlation_order == 1:
-            df_candidates = df_filtered[(df_filtered["sd_return"] <= sd_threshold) & (df_filtered["avg_cor"] >= cor_threshold)]
-        else:
-            df_candidates = df_filtered[(df_filtered["sd_return"] <= sd_threshold) & (df_filtered["avg_cor"] <= cor_threshold)]
+        print(f"   Pocos candidatos ({len(df_candidates)}): se omite el filtro de vol residual")
+        df_candidates = df_filtered[en_banda]
+    if len(df_candidates) == 0:
+        raise RuntimeError(
+            f"Error: ningun activo con beta entre {beta_asset_min:.2f} y {beta_asset_max:.2f}. "
+            "Revisa la descarga diaria (betas) o amplia beta_asset_min/max.")
 
     df_candidates = df_candidates.copy()
     sr = df_candidates["sharpe_ratio_adjusted"]
@@ -1446,39 +1472,29 @@ def select_optimal_candidates(df, n_candidates):
         weight_decorr_=weight_decorr,
     )
 
+    # El QUBO no mira la beta: si el pool no cubre la banda del perfil, se
+    # completa con los mejores candidatos elegibles del lado que falta.
+    _betas_cand = dict(zip(df_candidates["symbol"], df_candidates["beta"]))
+    _extra_beta = pq.beta_coverage_additions(
+        selected, list(df_candidates["symbol"]), _betas_cand, beta_port_lo, beta_port_hi,
+        max_weight=max_weight, max_add=max(3, math.ceil(1 / max_weight)))
+    _b_rng = pq.beta_range_reachable([_betas_cand[t] for t in selected], max_weight)
+    print(f"   Beta alcanzable con el pool del QUBO: {_b_rng[0]:.2f}-{_b_rng[1]:.2f} "
+          f"(banda {beta_port_lo:.2f}-{beta_port_hi:.2f})")
+    if _extra_beta:
+        print(f"   Agregados para cubrir la banda de beta: {', '.join(_extra_beta)}")
+        selected = list(selected) + _extra_beta
+
     print("\nTop 10 activos seleccionados (via QUBO):")
     top10 = (df_candidates[df_candidates["symbol"].isin(selected)]
              .sort_values("h_score", ascending=False)
-             .head(10)[["symbol", "sharpe_ratio_adjusted", "sd_return", "avg_cor", "n_obs", "h_score"]])
+             .head(10)[["symbol", "sharpe_ratio_adjusted", "sd_return", "beta", "resid_vol", "n_obs", "h_score"]])
     print(top10.to_string(index=False))
     return selected, list(df_candidates["symbol"])
 
 
 ticker_candidates, prefilter_ranking = select_optimal_candidates(combined_stats, n_pre_filter)
 print(f"\nPool pre-filtro: {len(ticker_candidates)} candidatos\n")
-
-# ==============================================================================
-# PISO DE ETF: CUANTOS HACEN FALTA Y RESERVA DESDE EL PRE-FILTRO
-# ==============================================================================
-etf_group_set = set(etf_tickers + commodity_tickers)
-etf_band_floor_cfg = max(0.0, pct_etf_deseado - pct_etf_tolerancia) if include_etfs_in_portfolio else 0.0
-n_etf_needed = qm.etfs_necesarios(etf_band_floor_cfg, max_weight)
-n_etf_prefilter = qm.contar_etfs(ticker_candidates, etf_group_set)
-etf_reserva = []
-if n_etf_needed > 0:
-    _eleg = combined_stats[(combined_stats["n_obs"] >= min_observations) & (combined_stats["sd_return"] > 0)
-                           & combined_stats["sharpe_ratio_adjusted"].notna()
-                           & np.isfinite(combined_stats["sharpe_ratio_adjusted"])].copy()
-    _sr = _eleg["sharpe_ratio_adjusted"]
-    _h_eleg = weight_sharpe * ((_sr - _sr.min()) / (_sr.max() - _sr.min())).fillna(0.5)
-    if "data_quality_penalty" in _eleg.columns:
-        _h_eleg = _h_eleg * _eleg["data_quality_penalty"]
-    _orden_eleg = _eleg.assign(_h=_h_eleg).sort_values("_h", ascending=False)["symbol"].tolist()
-    etf_reserva = qm.reserva_etf(prefilter_ranking + _orden_eleg, ticker_candidates, etf_group_set,
-                                 etf_floor_reserve_factor * n_etf_needed)
-    print(f"Piso de ETF: {etf_band_floor_cfg * 100:.0f}% con max_weight {max_weight:.2f} -> "
-          f"{n_etf_needed} ETF necesarios | en el pre-filtro: {n_etf_prefilter} | "
-          f"reserva: {len(etf_reserva)}{' (' + ', '.join(etf_reserva) + ')' if etf_reserva else ''}\n")
 
 # ==============================================================================
 # TENOR DE OPCIONES OBJETIVO (Polygon) - tope universal
@@ -1510,16 +1526,6 @@ if "ok" not in polygon_market_df.columns:
 
 n_polygon_ok = polygon_market_df["ok"].fillna(False).sum()
 print(f"  Datos de opciones obtenidos: {n_polygon_ok} de {len(us_candidates)} tickers US")
-
-us_reserva = [t for t in etf_reserva if is_us_ticker(t) and t not in polygon_market_list]
-if us_reserva:
-    for tk in us_reserva:
-        polygon_market_list[tk] = {"symbol": tk, **polygon_get_atm_option(tk, target_dte_polygon, polygon_dte_tol)}
-    polygon_market_df = pd.DataFrame(list(polygon_market_list.values()))
-    if "ok" not in polygon_market_df.columns:
-        polygon_market_df["ok"] = False
-    n_res_ok = int(polygon_market_df.loc[polygon_market_df["symbol"].isin(us_reserva), "ok"].fillna(False).sum())
-    print(f"  Reserva de ETF: opciones de {n_res_ok} de {len(us_reserva)} (no cuentan en el pool)")
 
 stock_us_candidates = [t for t in us_candidates if t not in (etf_tickers + commodity_tickers)]
 print(f"  Clasificando sector de {len(stock_us_candidates)} acciones US (Polygon SIC)...")
@@ -1579,7 +1585,7 @@ if use_delta_filter:
 
     T_horizon = horizon_months / 12
 
-    _delta_universo = list(dict.fromkeys(ticker_candidates + etf_reserva))
+    _delta_universo = list(ticker_candidates)
     mu_for_delta = (
         df_prices[df_prices["symbol"].isin(_delta_universo)]
         .groupby("symbol")["monthly_return"].mean().rename("mu_monthly").reset_index()
@@ -1623,13 +1629,6 @@ if use_delta_filter:
 
     delta_df = pd.DataFrame(delta_rows)
     delta_named = dict(zip(delta_df["symbol"], delta_df["delta"]))
-    _es_reserva = delta_df["symbol"].isin(set(etf_reserva) - set(ticker_candidates))
-    delta_df_reserva = delta_df[_es_reserva].copy()
-    delta_df = delta_df[~_es_reserva].copy()
-    etf_reserva = delta_df_reserva.loc[
-        delta_df_reserva["delta"].isna() | (delta_df_reserva["delta"] >= delta_min), "symbol"].tolist()
-    if len(delta_df_reserva):
-        print(f"  Reserva de ETF tras filtro Delta: {len(etf_reserva)} de {len(delta_df_reserva)}")
 
     n_delta_ok = delta_df["delta"].notna().sum()
     n_delta_na = delta_df["delta"].isna().sum()
@@ -1679,7 +1678,6 @@ def tabla_ratio_vol_reciente(tickers):
 
 
 recent_vol_ratio_stats = tabla_ratio_vol_reciente(ticker_candidates)
-reserva_ratio_stats = tabla_ratio_vol_reciente([t for t in etf_reserva if t not in set(ticker_candidates)])
 
 n_pool_post_delta = len(ticker_candidates)
 n_con_recent_vol = len(recent_vol_ratio_stats)
@@ -1762,23 +1760,6 @@ if len(iv_flow_discard) > 0:
 
 iv_descartados = set(iv_flow_discard["symbol"]) if len(iv_flow_discard) else set()
 orden_reposicion = recent_vol_ratio_stats.sort_values("recent_vol_ratio")["symbol"].tolist()
-orden_reposicion_etf = orden_reposicion + reserva_ratio_stats["symbol"].tolist()
-
-etf_piso_agregados = []
-n_etf_iv = qm.contar_etfs(iv_flow_keep, etf_group_set)
-if n_etf_needed > n_etf_iv:
-    pool_etf_piso = qm.candidatos_reposicion(
-        orden_reposicion_etf, iv_flow_keep, descartados=iv_descartados, rechaza=rechaza_iv_vs_reciente)
-    etf_piso_agregados = qm.completar_etfs(iv_flow_keep, pool_etf_piso, etf_group_set, n_etf_needed)
-    print(f"  Piso de ETF: {n_etf_iv} ETF tras filtro de IV, se necesitan {n_etf_needed} "
-          f"(piso {etf_band_floor_cfg * 100:.0f}% / max_weight {max_weight:.2f})")
-    if etf_piso_agregados:
-        print(f"  Agregando {len(etf_piso_agregados)} ETF que superan los filtros duros: "
-              f"{', '.join(etf_piso_agregados)}")
-        iv_flow_keep = iv_flow_keep + etf_piso_agregados
-    if n_etf_iv + len(etf_piso_agregados) < n_etf_needed:
-        print(f"  ADVERTENCIA: no quedan mas ETF que superen los filtros duros "
-              f"({n_etf_iv + len(etf_piso_agregados)} de {n_etf_needed}); se revisa antes de optimizar")
 
 if len(iv_flow_keep) < iv_min_survivors:
     reponer_iv_pool = qm.candidatos_reposicion(
@@ -1807,8 +1788,6 @@ print(f"   Fechas de muestreo historico: {len(sample_dates_bkm)} (freq={bkm_hist
 
 reponer_pool_bkm = qm.candidatos_reposicion(
     orden_reposicion, ticker_candidates, descartados=iv_descartados, rechaza=rechaza_iv_vs_reciente)
-reponer_pool_bkm_etf = qm.candidatos_reposicion(
-    orden_reposicion_etf, ticker_candidates, descartados=iv_descartados, rechaza=rechaza_iv_vs_reciente)
 
 bkm_current_moments = {}
 bkm_spot_series = {}
@@ -2035,12 +2014,7 @@ while por_evaluar:
         actuales_bkm = full_set + reemplazos_nuevos
         ocupados_bkm = usados_reponer_bkm | set(actuales_bkm)
         reemplazo = None
-        if qm.contar_etfs(actuales_bkm, etf_group_set) < n_etf_needed:
-            reemplazo = qm.siguiente_reposicion(
-                reponer_pool_bkm_etf, ocupados_bkm, etf_group_set, solo_etf=True)
-            if reemplazo is not None:
-                print(f"   Reponiendo con: {reemplazo} (ETF para el piso de la banda)")
-        if reemplazo is None and len(actuales_bkm) < bkm_min_survivors:
+        if len(actuales_bkm) < bkm_min_survivors:
             reemplazo = qm.siguiente_reposicion(reponer_pool_bkm, ocupados_bkm)
             if reemplazo is not None:
                 print(f"   Reponiendo con: {reemplazo} (pool de vol. reciente validado)")
@@ -2485,7 +2459,6 @@ print(f"   Rango correlaciones implicitas (off-diagonal R_implied): {tril_R.min(
 print(f"\nEjecutando optimizacion cuadratica (quadprog) con lambda={lambda_:.2f}...")
 
 etf_commodity_assets = [i for i, a in enumerate(assets) if a in (etf_tickers + commodity_tickers)]
-stock_assets = [i for i, a in enumerate(assets) if a not in (etf_tickers + commodity_tickers)]
 
 etf_excluded_from_portfolio = set(etf_tickers) - set(commodity_tickers)
 excluded_etf_assets = [] if include_etfs_in_portfolio else [
@@ -2570,18 +2543,24 @@ print(f"   QP al horizonte: mu x {horizon_months}, Sigma x {horizon_months} "
 print("   Delta: solo filtro de elegibilidad, no multiplica a mu")
 print("   Penalizacion de cola sobre mu: ELIMINADA (MFIS/MFIK son momentos Q sin calibrar)")
 
-etf_band_active = include_etfs_in_portfolio and len(etf_commodity_assets) > 0 and len(stock_assets) > 0
-etf_lo = max(0, pct_etf_deseado - pct_etf_tolerancia)
-etf_hi = min(1, pct_etf_deseado + pct_etf_tolerancia)
-etf_band_relaxed = False
-if include_etfs_in_portfolio and not etf_band_active and etf_lo > 0:
-    print(f"   ADVERTENCIA: banda de ETF {etf_lo * 100:.0f}%-{etf_hi * 100:.0f}% sin aplicar: "
-          f"{len(etf_commodity_assets)} ETF y {len(stock_assets)} acciones en el optimizador")
+# Banda de beta del portafolio: la palanca de perfil dentro del QP.
+_beta_lookup = combined_stats.set_index("symbol")["beta"]
+beta_vec = _beta_lookup.reindex(assets).to_numpy(dtype=float)
+_sin_beta = [assets[i] for i in range(n) if not np.isfinite(beta_vec[i])]
+if _sin_beta:
+    print(f"   ADVERTENCIA: sin beta para {', '.join(_sin_beta)}; se usa 1.0 en la banda")
+    beta_vec = np.where(np.isfinite(beta_vec), beta_vec, 1.0)
+beta_lo, beta_hi = beta_port_lo, beta_port_hi
+beta_band_relaxed = False
+_caps_qp = np.array([0.0 if i in excluded_etf_set else max_weight for i in range(n)])
+_b_min, _b_max = pq.beta_range_reachable(beta_vec, _caps_qp)
+print(f"   Beta alcanzable con el pool y max_weight {max_weight:.2f}: {_b_min:.2f}-{_b_max:.2f} | "
+      f"banda del perfil {beta_lo:.2f}-{beta_hi:.2f}")
 geo_groups = {"Canada": canada_assets, "Europa": europe_assets, "Japon": japan_assets}
 
 
-def armar_restricciones(etf_lo_, etf_hi_, verbose=True):
-    """Columnas de quadprog: suma 1, 0 <= w <= max_weight, banda de ETF y regiones."""
+def armar_restricciones(beta_lo_, beta_hi_, verbose=True):
+    """Columnas de quadprog: suma 1, 0 <= w <= max_weight, banda de beta y regiones."""
     A_cols = [np.ones(n)]
     b_vals = [1.0]
     for i in range(n):
@@ -2594,18 +2573,11 @@ def armar_restricciones(etf_lo_, etf_hi_, verbose=True):
         v[i] = -1
         A_cols.append(v)
         b_vals.append(0.0 if i in excluded_etf_set else -max_weight)
-    if etf_band_active:
-        stk_lo = 1 - etf_hi_
-        stk_hi = 1 - etf_lo_
-        v_etf_lo = np.zeros(n); v_etf_lo[etf_commodity_assets] = 1
-        v_etf_hi = np.zeros(n); v_etf_hi[etf_commodity_assets] = -1
-        v_stk_lo = np.zeros(n); v_stk_lo[stock_assets] = 1
-        v_stk_hi = np.zeros(n); v_stk_hi[stock_assets] = -1
-        A_cols += [v_etf_lo, v_etf_hi, v_stk_lo, v_stk_hi]
-        b_vals += [etf_lo_, -etf_hi_, stk_lo, -stk_hi]
-        if verbose:
-            print(f"   Restriccion ETFs: {etf_lo_ * 100:.0f}% - {etf_hi_ * 100:.0f}% del portafolio "
-                  f"(objetivo {pct_etf_deseado * 100:.0f}% +/- {pct_etf_tolerancia * 100:.0f}%)")
+    cols_beta, b_beta = pq.beta_band_columns(beta_vec, beta_lo_, beta_hi_)
+    A_cols += cols_beta
+    b_vals += b_beta
+    if verbose:
+        print(f"   Restriccion de beta: {beta_lo_:.2f} <= sum(w * beta) <= {beta_hi_:.2f}")
     for region_name, idx_region in geo_groups.items():
         if len(idx_region) > 0:
             v_geo = np.zeros(n)
@@ -2618,42 +2590,37 @@ def armar_restricciones(etf_lo_, etf_hi_, verbose=True):
 
 
 meq = 1
-Amat, bvec = armar_restricciones(etf_lo, etf_hi)
+Amat, bvec = armar_restricciones(beta_lo, beta_hi)
 
 # ------------------------------------------------------------------------------
 # CHEQUEO DE FACTIBILIDAD ANTES DE quadprog
 # ------------------------------------------------------------------------------
 if not qm.restricciones_factibles(Amat, bvec, meq):
-    n_etf_opt = len(etf_commodity_assets) if etf_band_active else 0
-    n_acc_opt = n - len(excluded_etf_set) - n_etf_opt if etf_band_active else n - len(excluded_etf_set)
-    razones = qm.diagnostico_banda_etf(n_etf_opt, n_acc_opt, max_weight,
-                                       etf_lo if etf_band_active else 0.0,
-                                       etf_hi if etf_band_active else 1.0)
-    if not razones:
-        razones = [f"la combinacion de max_weight {max_weight:.2f}, la banda de ETF y el tope regional "
-                   f"{max_region_weight:.2f} no deja ninguna asignacion valida"]
-    print("\n   ADVERTENCIA: las restricciones del optimizador no se pueden cumplir:")
-    for r in razones:
-        print(f"      - {r}")
-    print(f"      ETF en el optimizador ({len(etf_commodity_assets)}): "
-          f"{', '.join(assets[i] for i in etf_commodity_assets) or 'ninguno'}")
-    if etf_band_active and etf_band_relax_if_infeasible:
-        etf_lo_rel, etf_hi_rel = qm.relajar_banda_etf(n_etf_opt, n_acc_opt, max_weight, etf_lo, etf_hi)
-        Amat_rel, bvec_rel = armar_restricciones(etf_lo_rel, etf_hi_rel, verbose=False)
+    print("\n   ADVERTENCIA: las restricciones del optimizador no se pueden cumplir con la banda "
+          f"de beta {beta_lo:.2f}-{beta_hi:.2f} (alcanzable sin topes regionales: {_b_min:.2f}-{_b_max:.2f})")
+    if beta_band_relax_if_infeasible:
+        _lo_rel, _hi_rel, _nota = pq.relax_beta_band(beta_vec, beta_lo, beta_hi, max_weight=_caps_qp)
+        Amat_rel, bvec_rel = armar_restricciones(_lo_rel, _hi_rel, verbose=False)
+        if not qm.restricciones_factibles(Amat_rel, bvec_rel, meq):
+            # Los topes regionales tambien recortan el rango: se prueba sin banda
+            # para saber si la beta es la causa.
+            Amat_sb, bvec_sb = armar_restricciones(None, None, verbose=False)
+            if qm.restricciones_factibles(Amat_sb, bvec_sb, meq):
+                _lo_rel, _hi_rel = None, None
+                _nota = "la banda choca con los topes regionales; se optimiza sin banda de beta"
+                Amat_rel, bvec_rel = Amat_sb, bvec_sb
         if qm.restricciones_factibles(Amat_rel, bvec_rel, meq):
-            print(f"   Banda de ETF relajada (etf_band_relax_if_infeasible=True): "
-                  f"{etf_lo * 100:.0f}%-{etf_hi * 100:.0f}% -> {etf_lo_rel * 100:.0f}%-{etf_hi_rel * 100:.0f}%. "
-                  "Para cumplir la banda pedida hacen falta mas ETF en el pool o un max_weight mayor.\n")
-            etf_lo, etf_hi = etf_lo_rel, etf_hi_rel
+            print(f"   Banda de beta relajada (beta_band_relax_if_infeasible=True): {_nota}. "
+                  "Para cumplir la banda pedida hace falta un pool con mas variedad de beta.\n")
+            beta_lo, beta_hi = _lo_rel, _hi_rel
             Amat, bvec = Amat_rel, bvec_rel
-            etf_band_relaxed = True
-    if not etf_band_relaxed:
+            beta_band_relaxed = True
+    if not beta_band_relaxed:
         raise RuntimeError(
-            "Error: restricciones del optimizador infactibles ("
-            + "; ".join(razones)
-            + "). Amplia el pool (n_pre_filter, n_filter_candidates), sube max_weight o ajusta "
-              "pct_etf_deseado / pct_etf_tolerancia"
-            + ("" if etf_band_relax_if_infeasible else ", o activa etf_band_relax_if_infeasible")
+            f"Error: restricciones del optimizador infactibles (max_weight {max_weight:.2f}, "
+            f"banda de beta {beta_port_lo:.2f}-{beta_port_hi:.2f}, tope regional {max_region_weight:.2f}). "
+            "Amplia el pool (n_pre_filter, n_filter_candidates), sube max_weight o ajusta beta_port_lo/hi"
+            + ("" if beta_band_relax_if_infeasible else ", o activa beta_band_relax_if_infeasible")
             + ".")
 
 try:
@@ -2671,10 +2638,12 @@ weights_opt = pd.Series(weights_opt, index=assets)
 print("  Optimizacion completada")
 print(f"  Activos con peso > 1%: {(weights_opt > 0.01).sum()}")
 print(f"  Peso maximo: {weights_opt.max() * 100:.2f}% ({weights_opt.idxmax()})")
-if etf_band_active:
-    _peso_etf = float(weights_opt.iloc[etf_commodity_assets].sum())
-    print(f"  Peso en ETF/commodities: {_peso_etf * 100:.2f}% (banda {etf_lo * 100:.0f}%-{etf_hi * 100:.0f}%"
-          f"{', relajada desde la pedida' if etf_band_relaxed else ''})")
+beta_portafolio = float(weights_opt.values @ beta_vec)
+_banda_txt = (f"{beta_lo:.2f}-{beta_hi:.2f}" if beta_lo is not None else "sin banda")
+print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {_banda_txt}"
+      f"{', relajada desde la pedida' if beta_band_relaxed else ''})")
+_peso_etf = float(weights_opt.iloc[etf_commodity_assets].sum()) if etf_commodity_assets else 0.0
+print(f"  Peso en ETF/commodities: {_peso_etf * 100:.2f}% (sin cuota: entran por merito)")
 
 top_assets_idx = weights_opt.sort_values(ascending=False).head(min(10, n)).index.tolist()
 print("\n  Top activos - retorno esperado y diagnosticos de opciones (delta = colchon del filtro):")
@@ -3248,8 +3217,12 @@ pipeline_io.export_portfolio(
         "lambda_annual": lambda_annual,
         "max_weight": max_weight,
         "max_region_weight": max_region_weight,
-        "etf_floor": etf_lo,
-        "etf_cap": etf_hi,
+        "beta_port_lo": beta_port_lo,
+        "beta_port_hi": beta_port_hi,
+        "beta_band_used": [beta_lo, beta_hi],
+        "beta_portfolio": beta_portafolio,
+        "beta_asset_min": beta_asset_min,
+        "beta_asset_max": beta_asset_max,
         "include_etfs_in_portfolio": include_etfs_in_portfolio,
         "n_pre_filter": n_pre_filter,
         "n_filter_candidates": n_filter_candidates,
@@ -3260,8 +3233,8 @@ pipeline_io.export_portfolio(
         "bkm_z_threshold": bkm_z_threshold,
         "recent_vol_ratio_max": recent_vol_ratio_max,
         "iv_vs_realized_ratio_max": iv_vs_realized_ratio_max,
-        "volatility_percentile": volatility_percentile,
-        "correlation_percentile": correlation_percentile,
+        "resid_vol_percentile": resid_vol_percentile,
+        "delta_min": delta_min,
     },
     metrics={
         "expected_return": float(_ann_opt["mu"]),

@@ -222,19 +222,26 @@ def test_relajar_banda_sube_el_techo_si_faltan_acciones():
 FUENTE = (ROOT / "quadratic_utility.py").read_text(encoding="utf-8")
 
 
-def test_script_delta_min_agresivo_es_015():
+def test_script_delta_min_es_global_015():
     assert re.search(r"^delta_min = 0\.15\b", FUENTE, re.M)
-    assert "Conservador 0.24, moderado 0.18, agresivo 0.15" in FUENTE
+    assert "Global (antes 0.24 / 0.18 / 0.15 por perfil)" in FUENTE
 
 
 def test_script_reposiciones_excluyen_descartados_por_iv():
-    assert FUENTE.count("descartados=iv_descartados, rechaza=rechaza_iv_vs_reciente") >= 4
+    assert FUENTE.count("descartados=iv_descartados, rechaza=rechaza_iv_vs_reciente") >= 2
     assert "reponer_pool_bkm = qm.candidatos_reposicion(" in FUENTE
     assert "reponer_iv_pool = qm.candidatos_reposicion(" in FUENTE
+
+
+def test_script_sin_cuota_de_etf():
+    # La banda de ETF se reemplazo por la banda de beta: los ETF entran por merito.
+    for nombre in ("pct_etf_deseado", "pct_etf_tolerancia", "etf_reserva", "n_etf_needed",
+                   "etf_band_relax_if_infeasible", "reponer_pool_bkm_etf"):
+        assert nombre not in FUENTE
 
 
 def test_script_chequea_factibilidad_antes_de_quadprog():
     i_chk = FUENTE.index("qm.restricciones_factibles(Amat, bvec, meq)")
     i_qp = FUENTE.index("sol = quadprog.solve_qp(Dmat, dvec, Amat, bvec, meq)")
     assert i_chk < i_qp
-    assert re.search(r"^etf_band_relax_if_infeasible = True\b", FUENTE, re.M)
+    assert re.search(r"^beta_band_relax_if_infeasible = True\b", FUENTE, re.M)

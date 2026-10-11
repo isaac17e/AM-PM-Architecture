@@ -584,3 +584,50 @@ def test_portfolio_log_returns_dataframe_reindexes_weights():
     assert list(out.index) == [0, 1]
     manual = np.log1p(np.expm1(df.values) @ np.array([0.70, 0.30]))
     assert out.to_numpy() == pytest.approx(manual)
+
+
+# ------------------------------------------------------------------------------
+# 9. Beta de mercado (palanca de perfil de QU y MV)
+# ------------------------------------------------------------------------------
+
+def _mercado_y_activos(T=400, seed=11):
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2022-01-07", periods=T, freq="W-FRI")
+    mkt = pd.Series(rng.normal(0.002, 0.02, T), index=idx)
+    ruido = rng.normal(0.0, 0.01, (T, 3))
+    activos = pd.DataFrame({
+        "BAJA": 0.5 * mkt.values + ruido[:, 0],
+        "ALTA": 1.6 * mkt.values + ruido[:, 1],
+        "CORTA": 1.0 * mkt.values + ruido[:, 2],
+    }, index=idx)
+    activos.iloc[:-30, 2] = np.nan          # solo 30 semanas de historia
+    return activos, mkt
+
+
+def test_market_beta_recupera_la_beta_y_la_encoge_hacia_uno():
+    activos, mkt = _mercado_y_activos()
+    out = rk.market_beta(activos, mkt, min_obs=52)
+    assert out.loc["BAJA", "beta_ols"] == pytest.approx(0.5, abs=0.06)
+    assert out.loc["ALTA", "beta_ols"] == pytest.approx(1.6, abs=0.06)
+    for t in ("BAJA", "ALTA"):
+        b = out.loc[t, "beta_ols"]
+        assert out.loc[t, "beta"] == pytest.approx(rk.BLUME_WEIGHT * b + 1 - rk.BLUME_WEIGHT)
+        assert abs(out.loc[t, "beta"] - 1.0) < abs(b - 1.0)
+    # Vol residual anual ~ 0.01 * sqrt(52).
+    assert out.loc["BAJA", "resid_vol"] == pytest.approx(0.01 * np.sqrt(52), rel=0.10)
+
+
+def test_market_beta_sin_historia_suficiente_queda_en_nan():
+    activos, mkt = _mercado_y_activos()
+    out = rk.market_beta(activos, mkt, min_obs=52)
+    assert out.loc["CORTA", "n_obs"] == 30
+    assert np.isnan(out.loc["CORTA", "beta"]) and np.isnan(out.loc["CORTA", "resid_vol"])
+    assert rk.market_beta(activos, mkt, min_obs=20).loc["CORTA", "beta"] == pytest.approx(1.0, abs=0.1)
+
+
+def test_market_beta_sin_encogimiento_es_ols():
+    activos, mkt = _mercado_y_activos()
+    out = rk.market_beta(activos[["ALTA"]], mkt, blume_weight=1.0)
+    assert out.loc["ALTA", "beta"] == pytest.approx(out.loc["ALTA", "beta_ols"])
+    plano = pd.Series(0.0, index=mkt.index)
+    assert np.isnan(rk.market_beta(activos[["ALTA"]], plano).loc["ALTA", "beta"])
