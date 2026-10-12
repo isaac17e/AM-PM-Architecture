@@ -662,3 +662,54 @@ def test_scale_relative_no_reescala_lambda():
     assert mult.max() <= 1.25 + 1e-12
     # direct sobre ATM ~0.5 si seria un recorte uniforme. relative no.
     assert mult[2] > 0.9
+
+
+# ------------------------------------------------------------------------------
+# MFIS: no procesados fuera del pool y limite de reloj real
+# ------------------------------------------------------------------------------
+
+def test_pool_mfis_excluye_los_no_procesados():
+    pool = ["A", "B", "AMD", "C", "D"]
+    out = qm.pool_sin_no_procesados_mfis(pool, ["AMD"], piso=3)
+    assert out["pool"] == ["A", "B", "C", "D"]
+    assert out["excluidos"] == ["AMD"]
+    assert out["sin_cribar"] == []
+
+
+def test_pool_mfis_bajo_el_piso_conserva_los_mejor_rankeados_sin_cribar():
+    pool = ["A", "X1", "B", "X2", "X3"]
+    out = qm.pool_sin_no_procesados_mfis(pool, ["X1", "X2", "X3"], piso=4,
+                                         prioridad=["X3", "X2", "X1"])
+    # 2 cribados (A, B): faltan 2, entran X3 y X2 por prioridad.
+    assert out["sin_cribar"] == ["X3", "X2"]
+    assert out["excluidos"] == ["X1"]
+    assert out["pool"] == ["A", "B", "X2", "X3"]  # orden del pool
+
+
+def test_pool_mfis_sin_no_procesados_no_cambia_nada():
+    out = qm.pool_sin_no_procesados_mfis(["A", "B", "A"], [], piso=5)
+    assert out == {"pool": ["A", "B"], "excluidos": [], "sin_cribar": []}
+
+
+def test_pool_mfis_todos_no_procesados_y_piso_mayor_que_el_pool():
+    out = qm.pool_sin_no_procesados_mfis(["X1", "X2"], ["X1", "X2"], piso=12)
+    assert out["pool"] == ["X1", "X2"]
+    assert out["sin_cribar"] == ["X1", "X2"] and out["excluidos"] == []
+
+
+def test_mfis_deadline_es_reloj_real_y_none_sin_limite():
+    assert qm.mfis_deadline(100.0, None) is None
+    assert qm.mfis_deadline(100.0, 8) == pytest.approx(100.0 + 480.0)
+    qm.mfis_check_deadline(None)                       # sin limite: no lanza
+    qm.mfis_check_deadline(580.0, now=579.9)           # a tiempo
+    with pytest.raises(qm.MfisTiempoAgotado):
+        qm.mfis_check_deadline(580.0, now=580.0)
+    with pytest.raises(qm.MfisTiempoAgotado):
+        qm.mfis_check_deadline(580.0, now=900.0)
+
+
+def test_mfis_check_deadline_usa_perf_counter_por_defecto(monkeypatch):
+    monkeypatch.setattr(qm.time, "perf_counter", lambda: 50.0)
+    qm.mfis_check_deadline(51.0)
+    with pytest.raises(qm.MfisTiempoAgotado):
+        qm.mfis_check_deadline(50.0)

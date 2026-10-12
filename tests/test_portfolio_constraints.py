@@ -263,3 +263,25 @@ def test_banda_sin_techo():
     assert extra == ["E", "G"]                       # solo beta >= piso + margen; F (0.2) nunca entra
     nuevo = [betas[t] for t in ["A", "B", "C", "D"] + extra]
     assert pq.beta_range_reachable(nuevo, 0.30)[1] >= 0.95 + pq.BETA_COVERAGE_MARGIN
+
+
+# ------------------------------------------------------------------------------
+# clip_to_band: beta reportada dentro de la banda salvo violaciones reales
+# ------------------------------------------------------------------------------
+
+def test_clip_to_band_recorta_ruido_numerico_sobre_el_techo_y_bajo_el_piso():
+    assert pq.clip_to_band(0.8 + 1e-7, 0.6, 0.8) == 0.8
+    assert pq.clip_to_band(0.6 - 1e-7, 0.6, 0.8) == 0.6
+    assert pq.clip_to_band(0.7, 0.6, 0.8) == 0.7
+
+
+def test_clip_to_band_no_esconde_una_violacion_real():
+    assert pq.clip_to_band(0.8 + 1e-3, 0.6, 0.8) == pytest.approx(0.801)
+    assert pq.clip_to_band(0.6 - 1e-3, 0.6, 0.8) == pytest.approx(0.599)
+
+
+def test_clip_to_band_cotas_none_y_nan():
+    assert pq.clip_to_band(1.4, 0.95, None) == 1.4
+    assert pq.clip_to_band(0.95 - 1e-7, 0.95, None) == 0.95
+    assert pq.clip_to_band(0.3, None, None) == 0.3
+    assert math.isnan(pq.clip_to_band(float("nan"), 0.6, 0.8))

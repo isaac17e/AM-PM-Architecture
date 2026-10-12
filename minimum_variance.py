@@ -778,7 +778,9 @@ asset_stats["Sharpe"] = (asset_stats["Mean_Return"] - risk_free_rate) / asset_st
 # de |correlacion con SPY|.
 _ret_beta = np.expm1(log_returns.tail(beta_window_weeks))
 _mkt_beta = np.expm1(benchmark_returns.iloc[:, 0].tail(beta_window_weeks))
-beta_stats = rk.market_beta(_ret_beta, _mkt_beta, min_obs=beta_min_obs_weeks)
+beta_stats = rk.market_beta(_ret_beta, _mkt_beta, min_obs=beta_min_obs_weeks,
+                            extra_raw=commodity_tickers)
+beta_source = beta_stats["beta_source"].to_dict()
 asset_stats["Beta"] = beta_stats["beta"].reindex(asset_stats["Symbol"]).values
 asset_stats["Resid_Vol"] = beta_stats["resid_vol"].reindex(asset_stats["Symbol"]).values
 
@@ -802,7 +804,7 @@ asset_stats["Passes_Return"] = asset_stats["Mean_Return"] > 0
 asset_stats["Passes_All"] = asset_stats["Passes_Beta"] & asset_stats["Passes_Resid"] & asset_stats["Passes_Return"]
 asset_stats = asset_stats.sort_values("Sharpe", ascending=False).reset_index(drop=True)
 
-print(f"[INFO] Beta contra SPY ({min(beta_window_weeks, len(log_returns))} semanas, Blume): "
+print(f"[INFO] Beta contra SPY ({min(beta_window_weeks, len(log_returns))} semanas, Blume; OLS crudo en caja y commodities): "
       f"mediana {asset_stats['Beta'].median():.2f} | elegibles {pq.beta_band_text(beta_asset_min, beta_asset_max)}: "
       f"{int(asset_stats['Passes_Beta'].sum())} | banda del portafolio {pq.beta_band_text(beta_port_lo, beta_port_hi)}")
 print(f"[INFO] Vol residual <= percentil {resid_vol_percentile:.2f} ({resid_threshold * 100:.1f}% anual): "
@@ -2062,8 +2064,10 @@ w_final_implied = w_iter[selected_tickers]
 
 print(f"\nOK Portafolio final: {len(selected_tickers)} activos (limite: {max_assets_in_portfolio})")
 print(f"  Activos: {', '.join(selected_tickers)}")
-beta_portafolio = float(sum(w_final_implied[t] * beta_map[t] for t in selected_tickers)
-                        / max(float(w_final_implied.sum()), 1e-12))
+beta_portafolio = pq.clip_to_band(
+    float(sum(w_final_implied[t] * beta_map[t] for t in selected_tickers)
+          / max(float(w_final_implied.sum()), 1e-12)),
+    beta_lo, beta_hi)
 print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {pq.beta_band_text(beta_lo, beta_hi)}"
       f"{', relajada desde la pedida' if _nota_beta else ''})\n")
 
@@ -2597,6 +2601,7 @@ pipeline_io.export_portfolio(
         "beta_port_hi": beta_port_hi,
         "beta_band_used": [beta_lo, beta_hi],
         "beta_portfolio": beta_portafolio,
+        "beta_source": {t: beta_source.get(t) for t in w_final.index},
         "beta_asset_min": beta_asset_min,
         "beta_asset_max": beta_asset_max,
         "include_etfs_in_portfolio": include_etfs_in_portfolio,
@@ -2618,5 +2623,6 @@ pipeline_io.export_portfolio(
     metrics={
         "expected_return": float(metrics_minvar["Return_Annual"]),
         "volatility": float(metrics_minvar["Risk_Annual"]),
+        "sharpe": float(metrics_minvar["Sharpe_Annual"]),
     },
 )

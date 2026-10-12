@@ -33,6 +33,7 @@ __all__ = [
     "relax_beta_band",
     "beta_coverage_additions",
     "beta_band_text",
+    "clip_to_band",
     "BETA_COVERAGE_MARGIN",
     "prune_order",
 ]
@@ -255,6 +256,23 @@ def relax_beta_band(betas, beta_lo, beta_hi, *, max_weight, min_weight=0.0, tota
 
 
 BETA_COVERAGE_MARGIN = 0.25
+
+
+def clip_to_band(value, lo=None, hi=None, tol=1e-6):
+    """Valor reportado dentro de la banda si el exceso es ruido numerico.
+
+    El QP deja la beta del portafolio ~1e-7 por encima del techo (o por
+    debajo del piso). Un exceso de hasta `tol` se recorta a la cota; uno
+    mayor se devuelve tal cual, para no esconder una violacion real.
+    """
+    v = float(value)
+    if not math.isfinite(v):
+        return v
+    if hi is not None and hi < v <= float(hi) + tol:
+        return float(hi)
+    if lo is not None and float(lo) - tol <= v < lo:
+        return float(lo)
+    return v
 
 
 def beta_band_text(beta_lo, beta_hi):

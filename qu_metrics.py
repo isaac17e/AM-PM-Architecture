@@ -18,6 +18,7 @@
 
 import math
 import os
+import time
 from datetime import date, timedelta
 
 import numpy as np
@@ -65,6 +66,10 @@ __all__ = [
     "contract_agg_ranges",
     "plan_bkm_history_budget",
     "mfis_max_minutes_from_env",
+    "MfisTiempoAgotado",
+    "mfis_deadline",
+    "mfis_check_deadline",
+    "pool_sin_no_procesados_mfis",
     "orden_prioridad_mfis",
     "frontier_lambda_grid",
     "portfolio_mu_final_metrics",
@@ -908,6 +913,57 @@ def mfis_max_minutes_from_env(default=60.0, env=None):
         print(f"ADVERTENCIA: MFIS_MAX_MINUTES={crudo!r} invalido; se usan {default:g} min.")
         return default
     return None if minutos == 0 else minutos
+
+
+class MfisTiempoAgotado(Exception):
+    """Se acabo el tiempo de reloj del bloque MFIS (MFIS_MAX_MINUTES)."""
+
+
+def mfis_deadline(t0, max_minutes):
+    """Instante (mismo reloj que `t0`, p. ej. time.perf_counter) en que vence el
+    bloque MFIS, o None si no hay limite de minutos."""
+    if max_minutes is None:
+        return None
+    return float(t0) + float(max_minutes) * 60.0
+
+
+def mfis_check_deadline(deadline, now=None):
+    """Lanza MfisTiempoAgotado si `deadline` ya paso. Con None no hace nada.
+
+    `now` es el instante actual en el reloj de `deadline` (default
+    time.perf_counter()).
+    """
+    if deadline is None:
+        return
+    ahora = time.perf_counter() if now is None else now
+    if ahora >= deadline:
+        raise MfisTiempoAgotado("MFIS_MAX_MINUTES agotado")
+
+
+def pool_sin_no_procesados_mfis(pool, no_procesados, piso, prioridad=None):
+    """Pool final del filtro MFIS sin los nombres que quedaron sin cribar.
+
+    Un `no_procesado` (sin presupuesto o sin tiempo) no paso por el z-score,
+    asi que sale del pool. Solo si quedaran menos de `piso` nombres cribados
+    se conservan los mejor rankeados (orden de `prioridad`; los que no estan
+    en ella, al final y en el orden del pool) hasta completar el piso.
+
+    Devuelve dict(pool, excluidos, sin_cribar): `sin_cribar` son los
+    no procesados que se quedaron para cumplir el piso.
+    """
+    sin_proc = set(no_procesados)
+    cribados = [t for t in pool if t not in sin_proc]
+    pendientes = [t for t in dict.fromkeys(pool) if t in sin_proc]
+    rank = {t: i for i, t in enumerate(prioridad or [])}
+    pendientes.sort(key=lambda t: rank.get(t, len(rank)))  # estable: empate en orden del pool
+    faltan = max(int(piso) - len(cribados), 0)
+    sin_cribar = pendientes[:faltan]
+    conservar = set(cribados) | set(sin_cribar)
+    return {
+        "pool": [t for t in dict.fromkeys(pool) if t in conservar],
+        "excluidos": [t for t in pendientes if t not in set(sin_cribar)],
+        "sin_cribar": sin_cribar,
+    }
 
 
 def _clave_cap(ticker, market_caps):

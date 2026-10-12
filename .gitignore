@@ -16,3 +16,6 @@ graphify-out/cache/
 graphify-out/cost.json
 graphify-out/.graphify_*
 graphify-out/.needs_update
+
+# cache local de factores Fama-French (market_data.default_ff_cache_dir)
+.cache/fama_french/

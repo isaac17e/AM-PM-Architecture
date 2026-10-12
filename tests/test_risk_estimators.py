@@ -631,3 +631,38 @@ def test_market_beta_sin_encogimiento_es_ols():
     assert out.loc["ALTA", "beta"] == pytest.approx(out.loc["ALTA", "beta_ols"])
     plano = pd.Series(0.0, index=mkt.index)
     assert np.isnan(rk.market_beta(activos[["ALTA"]], plano).loc["ALTA", "beta"])
+
+
+def test_market_beta_caja_y_commodities_usan_ols_crudo_sin_blume():
+    rng = np.random.default_rng(5)
+    idx = pd.date_range("2022-01-07", periods=300, freq="W-FRI")
+    mkt = pd.Series(rng.normal(0.002, 0.02, 300), index=idx)
+    activos = pd.DataFrame({
+        "SGOV": 0.0 * mkt.values + rng.normal(0.0, 0.0005, 300),   # caja: beta ~0
+        "gld": 0.2 * mkt.values + rng.normal(0.0, 0.01, 300),      # minuscula: no importa
+        "PEPE": 0.2 * mkt.values + rng.normal(0.0, 0.01, 300),     # accion: Blume
+        "SLV2": 0.2 * mkt.values + rng.normal(0.0, 0.01, 300),     # commodity del script
+    }, index=idx)
+    out = rk.market_beta(activos, mkt, extra_raw=["slv2"])
+    for t in ("SGOV", "gld", "SLV2"):
+        assert out.loc[t, "beta_source"] == "raw"
+        assert out.loc[t, "beta"] == pytest.approx(out.loc[t, "beta_ols"])
+    assert abs(out.loc["SGOV", "beta"]) < 0.05          # Blume lo habria subido a ~0.33
+    assert out.loc["PEPE", "beta_source"] == "blume"
+    assert out.loc["PEPE", "beta"] == pytest.approx(
+        rk.BLUME_WEIGHT * out.loc["PEPE", "beta_ols"] + 1 - rk.BLUME_WEIGHT)
+
+
+def test_raw_beta_tickers_cubre_caja_oro_y_materias_primas():
+    esperados = {"SGOV", "BIL", "SHV", "SHY", "BILS", "TFLO", "USFR", "GBIL", "GLD", "IAU", "SLV",
+                 "PPLT", "UNG", "USO", "DBC", "DBA", "PDBC", "GSG", "BNO", "CPER"}
+    assert esperados <= set(rk.RAW_BETA_TICKERS)
+    assert "SPY" not in rk.RAW_BETA_TICKERS
+
+
+def test_market_beta_raw_tickers_vacio_aplica_blume_a_todos():
+    activos, mkt = _mercado_y_activos()
+    activos = activos.rename(columns={"BAJA": "SGOV"})
+    out = rk.market_beta(activos, mkt, raw_tickers=())
+    assert out.loc["SGOV", "beta_source"] == "blume"
+    assert out.loc["SGOV", "beta"] != pytest.approx(out.loc["SGOV", "beta_ols"])

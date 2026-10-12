@@ -76,6 +76,7 @@ __all__ = [
     "max_drawdown",
     "portfolio_log_returns",
     "BLUME_WEIGHT",
+    "RAW_BETA_TICKERS",
     "market_beta",
 ]
 
@@ -1186,20 +1187,42 @@ def iv_at_rate(iv, S, K, T, carry, rate, is_call):
 # extremos se revierten hacia 1 (Blume, 1975), asi que se encoge:
 # beta = BLUME_WEIGHT * beta_ols + (1 - BLUME_WEIGHT). La vol residual
 # (anualizada) mide el riesgo que no viene del mercado.
+#
+# Blume no aplica a caja ni a materias primas: empuja una beta de ~0 hacia
+# 0.33 (SGOV -0.0006 -> 0.333; GLD 0.21 -> 0.48) y suma beta falsa a la banda
+# del portafolio. Esos instrumentos no revierten hacia la beta del mercado, asi
+# que usan la beta OLS cruda (RAW_BETA_TICKERS). El resto, Blume.
 # ==============================================================================
 
 BLUME_WEIGHT = 2.0 / 3.0
 
+# Caja / T-bills / tesoros cortos y oro / materias primas: beta OLS cruda.
+# Los optimizadores le suman su propia lista de commodities (`extra_raw`).
+RAW_BETA_TICKERS = frozenset({
+    # caja, T-bills y tesoros de muy corto plazo
+    "SGOV", "BIL", "SHV", "SHY", "BILS", "TFLO", "USFR", "GBIL",
+    # metales preciosos e industriales
+    "GLD", "IAU", "SLV", "PPLT", "CPER",
+    # energia, agricolas y canastas de materias primas
+    "UNG", "USO", "DBC", "DBA", "PDBC", "GSG", "BNO",
+})
+
 
 def market_beta(returns, market, *, min_obs=52, blume_weight=BLUME_WEIGHT,
-                periods_per_year=WEEKS_PER_YEAR):
-    """Beta contra el mercado, beta OLS, vol residual anual y observaciones por activo.
+                periods_per_year=WEEKS_PER_YEAR, raw_tickers=RAW_BETA_TICKERS,
+                extra_raw=()):
+    """Beta contra el mercado, beta OLS, vol residual anual, observaciones y fuente por activo.
 
     returns: DataFrame (fechas x activos) de retornos simples; market: Series
     de retornos simples del mercado en las mismas fechas. Cada activo usa sus
     propias fechas validas. Con menos de `min_obs` observaciones o mercado sin
     varianza, la fila queda en NaN.
+
+    Los tickers de `raw_tickers` y `extra_raw` (sin distinguir mayusculas)
+    reciben la beta OLS cruda (`beta_source` = "raw"); el resto, la beta
+    ajustada por Blume ("blume").
     """
+    crudos = {str(t).strip().upper() for t in raw_tickers} | {str(t).strip().upper() for t in extra_raw}
     if isinstance(returns, pd.Series):
         returns = returns.to_frame()
     mkt = pd.Series(market, dtype=float)
@@ -1208,7 +1231,10 @@ def market_beta(returns, market, *, min_obs=52, blume_weight=BLUME_WEIGHT,
         par = pd.concat([pd.Series(returns[col], dtype=float), mkt], axis=1, join="inner")
         par = par.replace([np.inf, -np.inf], np.nan).dropna()
         n = len(par)
-        fila = dict(beta=np.nan, beta_ols=np.nan, resid_vol=np.nan, n_obs=n)
+        es_crudo = str(col).strip().upper() in crudos
+        peso_blume = 1.0 if es_crudo else blume_weight
+        fila = dict(beta=np.nan, beta_ols=np.nan, resid_vol=np.nan, n_obs=n,
+                    beta_source="raw" if es_crudo else "blume")
         if n >= max(int(min_obs), 3):
             y = par.iloc[:, 0].to_numpy()
             x = par.iloc[:, 1].to_numpy()
@@ -1218,10 +1244,10 @@ def market_beta(returns, market, *, min_obs=52, blume_weight=BLUME_WEIGHT,
                 a = float(y.mean() - b * x.mean())
                 resid = y - a - b * x
                 fila.update(
-                    beta=blume_weight * b + (1.0 - blume_weight),
+                    beta=peso_blume * b + (1.0 - peso_blume),
                     beta_ols=b,
                     resid_vol=float(np.std(resid, ddof=2) * np.sqrt(periods_per_year)),
                 )
         filas[col] = fila
     return pd.DataFrame.from_dict(filas, orient="index",
-                                  columns=["beta", "beta_ols", "resid_vol", "n_obs"])
+                                  columns=["beta", "beta_ols", "resid_vol", "n_obs", "beta_source"])

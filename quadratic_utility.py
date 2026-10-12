@@ -21,7 +21,6 @@ import requests
 from bs4 import BeautifulSoup
 
 import yfinance as yf
-import pandas_datareader.data as pdr
 import statsmodels.api as sm
 from scipy.stats import norm
 import quadprog
@@ -722,6 +721,7 @@ def bkm_precios_en_rango(needed, window_days=5):
     barras = {}
     ok = {}
     for contrato, (desde, hasta) in rangos.items():
+        qm.mfis_check_deadline(_bkm_deadline["t"])
         series, definitivo = pc.fetch_option_aggs(contrato, desde, hasta, api_key=POLYGON_API_KEY)
         barras[contrato] = series
         ok[contrato] = definitivo
@@ -1203,10 +1203,13 @@ if "SPY" not in _px_daily.columns or len(_px_daily) == 0:
 _px_weekly, _ = md.drop_partial_last_week(_px_daily.resample("W").last(), _px_daily.index.max())
 _ret_weekly = _px_weekly.pct_change(fill_method=None).iloc[1:].tail(beta_window_weeks)
 # SPY queda en el panel: su beta es 1 y sigue elegible como cualquier ETF.
-beta_stats = rk.market_beta(_ret_weekly, _ret_weekly["SPY"], min_obs=beta_min_obs_weeks)
+beta_stats = rk.market_beta(_ret_weekly, _ret_weekly["SPY"], min_obs=beta_min_obs_weeks,
+                            extra_raw=commodity_tickers)
 beta_stats = beta_stats.rename_axis("symbol").reset_index()
 _beta_ok = beta_stats["beta"].notna()
-print(f"Betas contra SPY ({len(_ret_weekly)} semanas, Blume): {int(_beta_ok.sum())} de {len(beta_stats)} tickers | "
+beta_source = dict(zip(beta_stats["symbol"], beta_stats["beta_source"]))
+print(f"Betas contra SPY ({len(_ret_weekly)} semanas, Blume; OLS crudo en caja y commodities): "
+      f"{int(_beta_ok.sum())} de {len(beta_stats)} tickers | "
       f"mediana {beta_stats.loc[_beta_ok, 'beta'].median():.2f} | "
       f"rango elegible del perfil {pq.beta_band_text(beta_asset_min, beta_asset_max)} | "
       f"rango del portafolio {pq.beta_band_text(beta_port_lo, beta_port_hi)}")
@@ -1255,21 +1258,28 @@ cor_matrix_full = returns_wide.corr(min_periods=1)
 # FAMA-FRENCH
 # ==============================================================================
 print("Descargando datos Fama-French...")
-try:
-    ff_raw = pdr.DataReader("F-F_Research_Data_Factors", "famafrench",
-                             start=history_start, end=history_end)[0]
-    ff_raw = ff_raw.copy()
-    ff_raw.index = ff_raw.index.to_timestamp()
-    ff_raw = ff_raw.rename(columns={"Mkt-RF": "Mkt-RF", "SMB": "SMB", "HML": "HML"})
-    ff_raw = ff_raw[ff_raw.index.year.isin(target_years)]
-    if lookback_months is not None:
-        cutoff_date = ff_raw.index.max() - relativedelta(months=lookback_months - 1)
-        ff_raw = ff_raw[ff_raw.index >= cutoff_date]
-    ff_raw = ff_raw / 100.0
-    ff_data = ff_raw[["Mkt-RF", "SMB", "HML", "RF"]]
-except Exception as e:
-    print(f"Error con Fama-French ({e}). Continuando sin ellos.")
-    ff_data = None
+ff_result = md.fetch_fama_french(start=history_start, end=history_end)
+ff_status = ff_result["status"]
+ff_data = None
+if ff_result["data"] is not None:
+    try:
+        ff_raw = ff_result["data"].copy()
+        ff_raw.index = ff_raw.index.to_timestamp()
+        ff_raw = ff_raw[ff_raw.index.year.isin(target_years)]
+        if lookback_months is not None:
+            cutoff_date = ff_raw.index.max() - relativedelta(months=lookback_months - 1)
+            ff_raw = ff_raw[ff_raw.index >= cutoff_date]
+        ff_raw = ff_raw / 100.0
+        ff_data = ff_raw[["Mkt-RF", "SMB", "HML", "RF"]]
+    except Exception as e:
+        print(f"Error procesando Fama-French ({e}). Continuando sin ellos.")
+        ff_status = "failed"
+if ff_data is None:
+    print("!" * 70)
+    print("ADVERTENCIA FUERTE: sin factores Fama-French. El retorno esperado de cada activo es su "
+          "media historica cruda (puede ser muy alta); el resultado NO es comparable con una corrida con FF.")
+    print("!" * 70)
+print(f"Estado Fama-French: {ff_status}")
 
 # ==============================================================================
 # BETAS FF3
@@ -1798,6 +1808,9 @@ reponer_pool_bkm = qm.candidatos_reposicion(
 bkm_current_moments = {}
 bkm_spot_series = {}
 _bkm_presupuesto = {"usadas": 0.0}
+# Vence el bloque MFIS (MFIS_MAX_MINUTES) en reloj real: lo mira cada ticker al
+# empezar y cada contrato que baja. None = sin limite.
+_bkm_deadline = {"t": None}
 
 
 def bkm_fechas_pendientes(ticker):
@@ -1897,6 +1910,15 @@ def _rank_bkm(ticker):
 
 
 def evaluar_historia_bkm(ticker, max_fechas_nuevas=None, solo_cache=False):
+    try:
+        qm.mfis_check_deadline(_bkm_deadline["t"])
+        return _evaluar_historia_bkm(ticker, max_fechas_nuevas, solo_cache)
+    except qm.MfisTiempoAgotado:
+        return _fila_bkm(ticker, bkm_current_moments.get(ticker), "no_procesado",
+                         "historia_no_procesada_tiempo")
+
+
+def _evaluar_historia_bkm(ticker, max_fechas_nuevas=None, solo_cache=False):
     mom_actual = bkm_current_moments[ticker]
 
     def _fila(decision, motivo, z=np.nan):
@@ -1967,8 +1989,16 @@ por_evaluar = qm.orden_prioridad_mfis(ticker_candidates, sp500_caps, prefilter_r
 print("   Orden de la cola MFIS: " + ", ".join(por_evaluar))
 ronda_bkm = 1
 t0_bkm = time.perf_counter()
+_bkm_deadline["t"] = qm.mfis_deadline(t0_bkm, bkm_hist_max_minutes)
 
 while por_evaluar:
+    if _bkm_deadline["t"] is not None and time.perf_counter() >= _bkm_deadline["t"]:
+        print(f"   MFIS_MAX_MINUTES={bkm_hist_max_minutes:g} agotado: {len(por_evaluar)} activo(s) "
+              f"quedan como no procesados")
+        for t in por_evaluar:
+            resultados_log.append(_fila_bkm(
+                t, bkm_current_moments.get(t), "no_procesado", "historia_no_procesada_tiempo"))
+        break
     print(f"   [Ronda {ronda_bkm}] {len(por_evaluar)} activo(s) en orden de prioridad (market cap)...")
     _asegurar_momentos_actuales(por_evaluar)
     plan = _plan_ronda_bkm(por_evaluar)
@@ -2055,7 +2085,26 @@ if len(full_set) < bkm_min_survivors:
     print(f"   Advertencia: solo {len(full_set)} tickers tras filtro BKM "
           f"(piso deseado: {bkm_min_survivors}) - pool de reposicion agotado")
 
-ticker_candidates = full_set
+# Un nombre no procesado (sin presupuesto o sin tiempo) no paso por el z-score:
+# sale del pool, salvo los mejor rankeados que hagan falta para el piso.
+_no_procesados_mfis = [] if not len(bkm_log_df) else \
+    bkm_log_df.loc[bkm_log_df["decision"] == "no_procesado", "symbol"].tolist()
+_pool_mfis = qm.pool_sin_no_procesados_mfis(
+    full_set, _no_procesados_mfis, bkm_min_survivors,
+    prioridad=qm.orden_prioridad_mfis(_no_procesados_mfis, sp500_caps, prefilter_ranking))
+mfis_unscreened = _pool_mfis["sin_cribar"]
+mfis_excluded_unprocessed = _pool_mfis["excluidos"]
+if mfis_excluded_unprocessed:
+    print(f"   Excluidos del pool por no procesados (sin z-score MFIS): "
+          f"{', '.join(mfis_excluded_unprocessed)}")
+if mfis_unscreened:
+    print("!" * 70)
+    print(f"ADVERTENCIA: sin presupuesto de MFIS el pool quedaria bajo el piso ({bkm_min_survivors}). "
+          f"Se conservan {len(mfis_unscreened)} nombre(s) SIN cribar por MFIS (mejor rankeados): "
+          f"{', '.join(mfis_unscreened)}")
+    print("   Sube MFIS_MAX_MINUTES (o 0 = sin limite) para cribarlos.")
+    print("!" * 70)
+ticker_candidates = _pool_mfis["pool"]
 print(f"\nConjunto FINAL tras filtro BKM (MFIS): {len(ticker_candidates)} tickers\n")
 
 for tk in ticker_candidates:
@@ -2644,7 +2693,7 @@ weights_opt = pd.Series(weights_opt, index=assets)
 print("  Optimizacion completada")
 print(f"  Activos con peso > 1%: {(weights_opt > 0.01).sum()}")
 print(f"  Peso maximo: {weights_opt.max() * 100:.2f}% ({weights_opt.idxmax()})")
-beta_portafolio = float(weights_opt.values @ beta_vec)
+beta_portafolio = pq.clip_to_band(float(weights_opt.values @ beta_vec), beta_lo, beta_hi)
 print(f"  Beta del portafolio contra SPY: {beta_portafolio:.3f} (banda {pq.beta_band_text(beta_lo, beta_hi)}"
       f"{', relajada desde la pedida' if beta_band_relaxed else ''})")
 _peso_etf = float(weights_opt.iloc[etf_commodity_assets].sum()) if etf_commodity_assets else 0.0
@@ -3226,6 +3275,11 @@ pipeline_io.export_portfolio(
         "beta_port_hi": beta_port_hi,
         "beta_band_used": [beta_lo, beta_hi],
         "beta_portfolio": beta_portafolio,
+        "ff_status": ff_status,
+        "mfis_unscreened": mfis_unscreened,
+        "mfis_excluded_unprocessed": mfis_excluded_unprocessed,
+        "ff_cache_age_days": ff_result["age_days"] if ff_status == "cache" else None,
+        "beta_source": {t: beta_source.get(t) for t in pesos["symbol"]},
         "beta_asset_min": beta_asset_min,
         "beta_asset_max": beta_asset_max,
         "include_etfs_in_portfolio": include_etfs_in_portfolio,
@@ -3244,5 +3298,6 @@ pipeline_io.export_portfolio(
     metrics={
         "expected_return": float(_ann_opt["mu"]),
         "volatility": float(_ann_opt["sd"]),
+        "sharpe": float((_ann_opt["mu"] - rf_rate) / _ann_opt["sd"]) if _ann_opt["sd"] > 0 else None,
     },
 )

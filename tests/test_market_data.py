@@ -436,3 +436,126 @@ def test_single_retries_do_not_overlap():
     for hilo in hilos:
         hilo.join()
     assert en_vuelo["max"] == 1
+
+
+# ------------------------------------------------------------------------------
+# 5. Factores Fama-French: https + timeout + reintentos + cache local (sin red)
+# ------------------------------------------------------------------------------
+
+def _zip_ff(n_meses=36, desplazo=0.0):
+    import io
+    import zipfile
+    filas = []
+    for i in range(n_meses):
+        anio, mes = 2020 + i // 12, i % 12 + 1
+        filas.append(f"{anio}{mes:02d},{1.0 + i * 0.1 + desplazo:8.2f},{-0.5:8.2f},{0.3:8.2f},{0.02:8.2f}")
+    texto = ("This file was created by CMPT_ME_BEME_RETS using the 202509 CRSP database.\r\n\r\n"
+             ",Mkt-RF,SMB,HML,RF\r\n" + "\r\n".join(filas) + "\r\n\r\n"
+             " Annual Factors: January-December \r\n,Mkt-RF,SMB,HML,RF\r\n2020,   10.00,    1.00,    2.00,    0.50\r\n")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("F-F_Research_Data_Factors.CSV", texto)
+    return buf.getvalue()
+
+
+class _Resp:
+    def __init__(self, content=b"", status=200):
+        self.content = content
+        self.status = status
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+
+class _GetterFalso:
+    """Devuelve las respuestas (o lanza las excepciones) en orden; registra las llamadas."""
+
+    def __init__(self, *respuestas):
+        self.respuestas = list(respuestas)
+        self.llamadas = []
+
+    def __call__(self, url, timeout=None):
+        self.llamadas.append((url, timeout))
+        r = self.respuestas.pop(0) if len(self.respuestas) > 1 else self.respuestas[0]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+def _ff(tmp_path, getter, **kw):
+    pausas = []
+    out = md.fetch_fama_french(cache_dir=str(tmp_path), getter=getter, sleep=pausas.append, **kw)
+    return out, pausas
+
+
+def test_parse_fama_french_zip_devuelve_la_tabla_mensual_en_porcentaje():
+    tabla = md.parse_fama_french_zip(_zip_ff())
+    assert list(tabla.columns) == ["Mkt-RF", "SMB", "HML", "RF"]
+    assert len(tabla) == 36 and str(tabla.index[0]) == "2020-01"
+    assert tabla["Mkt-RF"].iloc[0] == pytest.approx(1.0)
+    recorte = md.parse_fama_french_zip(_zip_ff(), start="2021-01-01", end="2021-12-31")
+    assert len(recorte) == 12
+
+
+def test_ff_descarga_ok_usa_https_timeout_y_guarda_cache(tmp_path):
+    getter = _GetterFalso(_Resp(_zip_ff()))
+    out, pausas = _ff(tmp_path, getter)
+    assert out["status"] == "downloaded" and out["age_days"] == 0.0 and len(out["data"]) == 36
+    assert getter.llamadas == [(md.FF_URL.format(dataset="F-F_Research_Data_Factors"), 30)]
+    assert getter.llamadas[0][0].startswith("https://")
+    assert pausas == []
+    assert (tmp_path / "F-F_Research_Data_Factors_CSV.zip").read_bytes() == _zip_ff()
+
+
+def test_ff_reintenta_con_backoff_y_luego_baja(tmp_path):
+    getter = _GetterFalso(TimeoutError("timed out"), _Resp(status=503), _Resp(_zip_ff()))
+    out, pausas = _ff(tmp_path, getter, retries=3, backoff=2.0)
+    assert out["status"] == "downloaded"
+    assert len(getter.llamadas) == 3
+    assert pausas == [2.0, 4.0]
+
+
+def test_ff_si_falla_usa_la_cache_con_su_edad(tmp_path, capsys):
+    import os
+    ruta = tmp_path / "F-F_Research_Data_Factors_CSV.zip"
+    ruta.write_bytes(_zip_ff())
+    hace_10_dias = os.path.getmtime(ruta) + 10 * 86400
+    getter = _GetterFalso(TimeoutError("timed out"))
+    pausas = []
+    out = md.fetch_fama_french(cache_dir=str(tmp_path), getter=getter, sleep=pausas.append,
+                               retries=2, now=lambda: hace_10_dias)
+    assert out["status"] == "cache"
+    assert out["age_days"] == pytest.approx(10.0)
+    assert len(out["data"]) == 36 and "timed out" in out["error"]
+    assert len(getter.llamadas) == 2 and pausas == [2.0]
+    assert "hace 10 dias" in capsys.readouterr().out
+
+
+def test_ff_sin_red_ni_cache_es_failed_con_aviso_fuerte(tmp_path, capsys):
+    out, _ = _ff(tmp_path, _GetterFalso(ConnectionError("sin red")), retries=2)
+    assert out["status"] == "failed" and out["data"] is None and out["age_days"] is None
+    assert "sin red" in out["error"]
+    assert "ADVERTENCIA FUERTE" in capsys.readouterr().out
+
+
+def test_ff_cache_corrupta_cuenta_como_failed_y_un_zip_invalido_no_pisa_la_cache(tmp_path):
+    ruta = tmp_path / "F-F_Research_Data_Factors_CSV.zip"
+    ruta.write_bytes(_zip_ff())
+    # Respuesta 200 pero basura: no se parsea, no sobreescribe la copia buena.
+    out, _ = _ff(tmp_path, _GetterFalso(_Resp(b"<html>mantenimiento</html>")), retries=1)
+    assert out["status"] == "cache"
+    assert ruta.read_bytes() == _zip_ff()
+    ruta.write_bytes(b"corrupto")
+    out, _ = _ff(tmp_path, _GetterFalso(_Resp(b"<html></html>")), retries=1)
+    assert out["status"] == "failed"
+
+
+def test_ff_cache_dir_por_defecto_esta_ignorada_por_git(monkeypatch):
+    monkeypatch.delenv("AMPM_FF_CACHE_DIR", raising=False)
+    ruta = md.default_ff_cache_dir()
+    assert ruta.endswith("/.cache/fama_french")
+    monkeypatch.setenv("AMPM_FF_CACHE_DIR", "/tmp/otra")
+    assert md.default_ff_cache_dir() == "/tmp/otra"
+    gitignore = (__import__("pathlib").Path(md.__file__).parent / ".gitignore").read_text()
+    assert ".cache/fama_french/" in gitignore.splitlines()

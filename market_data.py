@@ -16,17 +16,23 @@
 #      si la semana no esta completa (B-6).
 #   4. Orden de los internacionales por market cap en USD antes de tomar el
 #      top N: la lista fija ponia primero los 15 .TO.
+#   5. Factores Fama-French: descarga por https con timeout y reintentos, y
+#      copia local del ultimo archivo bueno como respaldo.
 # ==============================================================================
 
+import io
 import json
 import math
 import os
 import re
+import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 __all__ = [
@@ -54,6 +60,10 @@ __all__ = [
     "market_caps_usd",
     "ordenar_por_market_cap",
     "tabla_market_cap_texto",
+    "FF_URL",
+    "default_ff_cache_dir",
+    "parse_fama_french_zip",
+    "fetch_fama_french",
 ]
 
 # Un solo hilo toca el reintento de un ticker. La descarga en bloque va
@@ -807,3 +817,126 @@ def tabla_market_cap_texto(resultado, sangria="  "):
                                 "moneda": "Moneda", "region": "Region"})
     disp.index = range(1, len(disp) + 1)
     return sangria + disp.to_string().replace("\n", "\n" + sangria)
+
+
+# ==============================================================================
+# 5. FACTORES FAMA-FRENCH (DESCARGA CON REINTENTOS Y CACHE LOCAL)
+# ==============================================================================
+# pandas_datareader baja el archivo por http:// sin timeout propio y en cada
+# corrida se colgaba; los retornos esperados caian en silencio a la media
+# historica cruda. Aqui el archivo se baja por https con timeout y
+# reintentos con backoff, el ultimo archivo bueno queda en disco y se usa si la
+# red falla (con aviso de antiguedad). El estado queda en `status`:
+# "downloaded" | "cache" | "failed".
+# ==============================================================================
+
+FF_URL = ("https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+          "{dataset}_CSV.zip")
+FF_FACTOR_COLUMNS = ("Mkt-RF", "SMB", "HML", "RF")
+
+
+def default_ff_cache_dir():
+    """Carpeta de la copia local, ignorada por git (`.cache/fama_french` del repo).
+
+    AMPM_FF_CACHE_DIR la cambia.
+    """
+    env = os.environ.get("AMPM_FF_CACHE_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "fama_french")
+
+
+def parse_fama_french_zip(raw, dataset="F-F_Research_Data_Factors", start=None, end=None):
+    """Tabla mensual (indice PeriodIndex "M", en %) de los bytes del zip de Ken French.
+
+    Usa el parser de pandas_datareader sobre el archivo ya descargado; no toca la red.
+    Lanza ValueError si el archivo no trae las columnas Mkt-RF, SMB, HML y RF.
+    """
+    from pandas_datareader.famafrench import FamaFrenchReader
+
+    class _ZipEnMemoria(FamaFrenchReader):
+        def _read_zipfile(self, url):
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                return zf.open(zf.namelist()[0]).read().decode("utf-8", "ignore")
+
+    reader = _ZipEnMemoria(symbols=dataset,
+                           start=pd.Timestamp(start) if start is not None else pd.Timestamp("1900-01-01"),
+                           end=pd.Timestamp(end) if end is not None else pd.Timestamp("2100-01-01"))
+    tablas = reader._read_one_data(None, {})
+    tabla = tablas.get(0)
+    if tabla is None:
+        raise ValueError("el archivo Fama-French no trae tablas")
+    tabla = tabla.rename(columns=lambda c: str(c).strip())
+    faltan = [c for c in FF_FACTOR_COLUMNS if c not in tabla.columns]
+    if faltan:
+        raise ValueError(f"al archivo Fama-French le faltan columnas: {faltan}")
+    return tabla
+
+
+def _escribir_atomico(ruta, contenido):
+    os.makedirs(os.path.dirname(ruta), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ruta), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(contenido)
+        os.replace(tmp, ruta)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def fetch_fama_french(dataset="F-F_Research_Data_Factors", *, start=None, end=None,
+                      cache_dir=None, timeout=30, retries=3, backoff=2.0,
+                      getter=None, sleep=time.sleep, now=time.time):
+    """Factores Fama-French mensuales (en %) con reintentos y respaldo en disco.
+
+    Hasta `retries` intentos por https con `timeout` segundos; entre intentos
+    espera backoff, 2*backoff, ... Si se baja y parsea bien, guarda el zip en
+    `cache_dir`. Si todos fallan usa la copia local (con su antiguedad en el
+    aviso). Nunca lanza.
+
+    Devuelve dict(status, data, age_days, error): status es "downloaded",
+    "cache" o "failed"; data es el DataFrame mensual (None si "failed");
+    age_days es la antiguedad de la copia usada (0 si se bajo, None si failed).
+    """
+    getter = getter or requests.get
+    cache_dir = cache_dir or default_ff_cache_dir()
+    ruta_cache = os.path.join(cache_dir, f"{dataset}_CSV.zip")
+    url = FF_URL.format(dataset=dataset)
+    ultimo_error = None
+
+    for intento in range(1, max(int(retries), 1) + 1):
+        try:
+            resp = getter(url, timeout=timeout)
+            resp.raise_for_status()
+            raw = resp.content
+            data = parse_fama_french_zip(raw, dataset, start, end)
+        except Exception as exc:
+            ultimo_error = f"{type(exc).__name__}: {exc}"
+            print(f"ADVERTENCIA: Fama-French intento {intento}/{retries} fallo ({ultimo_error}).")
+            if intento < retries:
+                sleep(float(backoff) * 2 ** (intento - 1))
+            continue
+        try:
+            _escribir_atomico(ruta_cache, raw)
+        except OSError as exc:
+            print(f"ADVERTENCIA: no se pudo guardar la copia local de Fama-French ({exc}).")
+        return dict(status="downloaded", data=data, age_days=0.0, error=None)
+
+    try:
+        with open(ruta_cache, "rb") as fh:
+            raw = fh.read()
+        data = parse_fama_french_zip(raw, dataset, start, end)
+        edad = max((now() - os.path.getmtime(ruta_cache)) / 86400.0, 0.0)
+    except Exception as exc:
+        print("!" * 70)
+        print("ADVERTENCIA FUERTE: no se pudo descargar Fama-French y no hay copia local "
+              f"utilizable ({type(exc).__name__}: {exc}).")
+        print("   Los retornos esperados caen a la media historica cruda (sin ancla de factores).")
+        print("!" * 70)
+        return dict(status="failed", data=None, age_days=None,
+                    error=ultimo_error or f"{type(exc).__name__}: {exc}")
+    print(f"ADVERTENCIA: Fama-French no se pudo descargar ({ultimo_error}); "
+          f"se usa la copia local de hace {edad:.0f} dias ({ruta_cache}).")
+    return dict(status="cache", data=data, age_days=float(edad), error=ultimo_error)
