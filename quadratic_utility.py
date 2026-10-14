@@ -10,7 +10,6 @@ import math
 import re
 import itertools
 import io
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
@@ -18,11 +17,10 @@ from dateutil.relativedelta import relativedelta
 import numpy as np
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 import yfinance as yf
-import statsmodels.api as sm
-from scipy.stats import norm
+from statsmodels.stats.moment_helpers import corr2cov, cov2corr
+from scipy.stats import norm, percentileofscore
 import quadprog
 
 import plotly.express as px
@@ -404,22 +402,19 @@ def clean_symbol_table(tbl):
     return tbl.reset_index(drop=True)
 
 
+def _pct(decimales):
+    """Formateador de to_string: fraccion -> porcentaje con `decimales` decimales."""
+    return lambda x: f"{x * 100:.{decimales}f}%"
+
+
 # ==============================================================================
 # FUNCIONES AUXILIARES: Polygon.io
 # ==============================================================================
-def is_us_ticker(ticker):
-    return pc.is_us_ticker(ticker)
-
-
-def polygon_format_ticker(ticker):
-    return pc.polygon_format_ticker(ticker)
-
-
 def polygon_get_atm_option(ticker, target_dte, dte_tol=21, api_key=None, contract_type="call"):
     api_key = api_key or POLYGON_API_KEY
     vacio = dict(iv=np.nan, delta=np.nan, gamma=np.nan, vega=np.nan, theta=np.nan,
                  dte=np.nan, strike=np.nan, ok=False)
-    if not is_us_ticker(ticker):
+    if not pc.is_us_ticker(ticker):
         return vacio
 
     hoy = date.today()
@@ -435,7 +430,7 @@ def polygon_get_atm_option(ticker, target_dte, dte_tol=21, api_key=None, contrac
     # Calls y puts juntos: los pares del mismo strike calibran el acarreo con
     # el que Polygon invirtio la IV (rk.calibrate_iv_carry).
     url_chain = (
-        f"https://api.polygon.io/v3/snapshot/options/{polygon_format_ticker(ticker)}?"
+        f"https://api.polygon.io/v3/snapshot/options/{pc.polygon_format_ticker(ticker)}?"
         f"{filtro_strike}"
         f"expiration_date.gte={fecha_min}&expiration_date.lte={fecha_max}&"
         f"limit=250"
@@ -491,19 +486,8 @@ def polygon_get_atm_option(ticker, target_dte, dte_tol=21, api_key=None, contrac
 
 
 # ==============================================================================
-# FUNCIONES AUXILIARES: Black-Scholes y contratos historicos (Polygon)
+# FUNCIONES AUXILIARES: contratos historicos (Polygon)
 # ==============================================================================
-def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
-    if T_yrs <= 0 or sigma <= 0:
-        return np.nan
-    d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T_yrs) / (sigma * math.sqrt(T_yrs))
-    d2 = d1 - sigma * math.sqrt(T_yrs)
-    if tipo == "call":
-        return S * norm.cdf(d1) - K * math.exp(-r * T_yrs) * norm.cdf(d2)
-    else:
-        return K * math.exp(-r * T_yrs) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
-
 def polygon_contracts_asof(ticker, strike_lo, strike_hi, exp_min, exp_max, as_of, api_key=None):
     """Calls y puts vigentes en `as_of` dentro de la ventana de strike y vencimiento.
 
@@ -512,7 +496,7 @@ def polygon_contracts_asof(ticker, strike_lo, strike_hi, exp_min, exp_max, as_of
     """
     url_ref = (
         f"https://api.polygon.io/v3/reference/options/contracts?"
-        f"underlying_ticker={polygon_format_ticker(ticker)}&"
+        f"underlying_ticker={pc.polygon_format_ticker(ticker)}&"
         f"strike_price.gte={strike_lo:.4f}&strike_price.lte={strike_hi:.4f}&"
         f"expiration_date.gte={exp_min}&expiration_date.lte={exp_max}&"
         f"as_of={as_of}&limit=1000"
@@ -566,10 +550,8 @@ def bkm_iv_chain_to_prices(S, r, T, chain_df, carry=None):
         return chain_df
     tasa = r if carry is None else carry
     chain_df = chain_df.copy()
-    chain_df["price"] = [
-        bs_price(S, k, T, tasa, iv, tipo)
-        for k, iv, tipo in zip(chain_df["strike"], chain_df["iv"], chain_df["type"])
-    ]
+    chain_df["price"] = rk.bs_price(
+        S, chain_df["strike"], T, tasa, chain_df["iv"], chain_df["type"] == "call")
     chain_df = chain_df[chain_df["price"].notna() & (chain_df["price"] > 0)]
     return chain_df
 
@@ -631,14 +613,14 @@ def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_
     fecha_min = (hoy + timedelta(days=max(target_dte - dte_tol, 1))).strftime("%Y-%m-%d")
     fecha_max = (hoy + timedelta(days=target_dte + dte_tol)).strftime("%Y-%m-%d")
     return pc.fetch_otm_chain(
-        polygon_format_ticker(ticker), S, fecha_min, fecha_max, S * moneyness_lo, S * moneyness_hi,
+        pc.polygon_format_ticker(ticker), S, fecha_min, fecha_max, S * moneyness_lo, S * moneyness_hi,
         target_dte, api_key=api_key or POLYGON_API_KEY, strike_fmt="{:.4f}",
         min_dte=polygon_dte_min)
 
 def bkm_get_current_moments(ticker, target_dte, dte_tol, rf):
     vacio = dict(mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False,
                  spot=np.nan, dte=np.nan, motivo="sin_spot")
-    if not is_us_ticker(ticker):
+    if not pc.is_us_ticker(ticker):
         vacio.update(motivo="sin_opciones_us", transitorio=False)
         return vacio
     S = get_spot_safe_bkm(ticker)
@@ -761,7 +743,7 @@ def bkm_reconstruct_mfis_history(ticker, spot_series, sample_dates, target_dte, 
     a hoy. max_fechas_nuevas limita cuantas fechas sin cache se bajan (para
     dejar la cache tibia cuando el presupuesto no alcanza al ticker entero).
     """
-    if not is_us_ticker(ticker):
+    if not pc.is_us_ticker(ticker):
         return np.full(len(sample_dates), np.nan)
     n_fechas = len(sample_dates)
     slots = []
@@ -848,10 +830,10 @@ sector_keywords = {
 
 
 def polygon_get_sic_description(ticker, api_key=None):
-    if not is_us_ticker(ticker):
+    if not pc.is_us_ticker(ticker):
         return None
     api_key = api_key or POLYGON_API_KEY
-    url_ref = f"https://api.polygon.io/v3/reference/tickers/{polygon_format_ticker(ticker)}"
+    url_ref = f"https://api.polygon.io/v3/reference/tickers/{pc.polygon_format_ticker(ticker)}"
     try:
         data, _ = pc.get_json(url_ref, api_key=api_key, permanente=True)
         if data is None:
@@ -1065,7 +1047,7 @@ def download_fx_prices(start, end, period="1mo"):
             s.index = pd.to_datetime(s.index).tz_localize(None)
             if info["invert"]:
                 s = 1 / s
-            fx_prices[cur] = s.sort_index()
+            fx_prices[cur] = s.dropna().sort_index()
         except Exception:
             pass
     return fx_prices
@@ -1101,17 +1083,13 @@ def download_period_returns(tickers, start, end, period="1mo", fx_prices=None):
                       f"contradice al proveedor {c['proveedor']}; se usa {c['proveedor']}")
             cur = ticker_currency[tk]
             if cur != "USD" and fx_prices is not None and cur in fx_prices:
-                fx_aligned = fx_prices[cur].reindex(
-                    fx_prices[cur].index.union(hist.index)
-                ).sort_index().ffill().reindex(hist.index)
-                hist["adjusted"] = hist["adjusted"] * fx_aligned
+                hist["adjusted"] = hist["adjusted"] * fx_prices[cur].reindex(hist.index, method="ffill")
                 n_convertidos += 1
 
             hist["return"] = hist["adjusted"].pct_change()
             hist = hist.dropna(subset=["return"])
             hist["symbol"] = tk
             hist = hist.reset_index().rename(columns={"Date": "date", "index": "date"})
-            hist["date"] = pd.to_datetime(hist["date"]).dt.tz_localize(None)
             all_rows.append(hist[["symbol", "date", "return", "adjusted"]])
         except Exception:
             pass
@@ -1294,32 +1272,27 @@ if ff_data is not None:
     df_prices_m["period"] = df_prices_m["date"].dt.to_period("M")
     df_prices_m = df_prices_m[df_prices_m["period"].isin(ff_data_m_reset["period"])]
 
-    rows = []
-    if len(df_prices_m) > 0:
-        for sym, g in df_prices_m.groupby("symbol"):
-            if len(g) < 3:
-                continue
-            merged = g.merge(ff_data_m_reset, on="period", how="inner")
-            if len(merged) < 3:
-                continue
-            try:
-                merged["excess_return"] = merged["monthly_return"] - merged["RF"]
-                X = sm.add_constant(merged[["Mkt-RF", "SMB", "HML"]])
-                y = merged["excess_return"]
-                mat = np.asarray(X, dtype=float)
-                yy = np.asarray(y, dtype=float)
-                filas_ok = np.isfinite(mat).all(axis=1) & np.isfinite(yy)
-                if int(filas_ok.sum()) < mat.shape[1] or np.linalg.matrix_rank(mat[filas_ok]) < mat.shape[1]:
-                    rows.append(dict(symbol=sym, beta_mkt=np.nan, beta_smb=np.nan, beta_hml=np.nan))
-                    continue
-                model = sm.OLS(y, X, missing="drop").fit()
-                rows.append(dict(symbol=sym, beta_mkt=model.params.get("Mkt-RF", np.nan),
-                                  beta_smb=model.params.get("SMB", np.nan),
-                                  beta_hml=model.params.get("HML", np.nan)))
-            except Exception:
-                rows.append(dict(symbol=sym, beta_mkt=np.nan, beta_smb=np.nan, beta_hml=np.nan))
+    ff_cols = ["Mkt-RF", "SMB", "HML"]
+    ff_beta_cols = ["beta_mkt", "beta_smb", "beta_hml"]
+    ff_panel = df_prices_m.merge(ff_data_m_reset, on="period")
+    ff_panel = ff_panel[ff_panel.groupby("symbol")["symbol"].transform("size") >= 3].copy()
+    ff_panel["excess_return"] = ff_panel["monthly_return"] - ff_panel["RF"]
 
-    ff_stats = pd.DataFrame(rows, columns=["symbol", "beta_mkt", "beta_smb", "beta_hml"])
+    def _ff3_betas(g):
+        """OLS del exceso de retorno sobre MKT/SMB/HML; NaN si faltan filas finitas o hay rango deficiente."""
+        d = g.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(d) < len(ff_cols) + 1:
+            return pd.Series(np.nan, index=ff_beta_cols)
+        coef, _, rango, _ = np.linalg.lstsq(
+            np.column_stack([np.ones(len(d)), d[ff_cols]]), d["excess_return"], rcond=None)
+        return pd.Series(coef[1:] if rango == len(ff_cols) + 1 else np.nan, index=ff_beta_cols)
+
+    if len(ff_panel) > 0:
+        ff_stats = (ff_panel.groupby("symbol")[["excess_return"] + ff_cols]
+                    .apply(_ff3_betas).reset_index())
+    else:
+        ff_stats = pd.DataFrame(columns=["symbol"] + ff_beta_cols)
+
     if len(ff_stats) > 0:
         market_premium = ff_data["Mkt-RF"].mean()
         smb_premium = ff_data["SMB"].mean()
@@ -1524,8 +1497,8 @@ print(f"Tenor de opciones objetivo (Polygon): {target_dte_polygon} dias "
 # ==============================================================================
 print("Consultando datos de mercado (Polygon) para tickers estadounidenses...")
 
-us_candidates = [t for t in ticker_candidates if is_us_ticker(t)]
-intl_candidates = [t for t in ticker_candidates if not is_us_ticker(t)]
+us_candidates = [t for t in ticker_candidates if pc.is_us_ticker(t)]
+intl_candidates = [t for t in ticker_candidates if not pc.is_us_ticker(t)]
 
 print(f"  Tickers US: {len(us_candidates)} | Tickers internacionales (sin cobertura Polygon): {len(intl_candidates)}")
 
@@ -1648,8 +1621,8 @@ if use_delta_filter:
 
     n_delta_ok = delta_df["delta"].notna().sum()
     n_delta_na = delta_df["delta"].isna().sum()
-    n_below = ((delta_df["delta"].notna()) & (delta_df["delta"] < delta_min)).sum()
-    n_pass = ((delta_df["delta"].notna()) & (delta_df["delta"] >= delta_min)).sum()
+    n_below = (delta_df["delta"] < delta_min).sum()
+    n_pass = (delta_df["delta"] >= delta_min).sum()
     n_real = (delta_df["strike_mode"] == "polygon_real").sum()
 
     n_bs = int(delta_df["strike_mode"].astype(str).str.startswith(f"bs_{delta_strike_mode}").sum())
@@ -1659,14 +1632,13 @@ if use_delta_filter:
     print(f"  Descartados (delta < {delta_min:.2f}): {n_below}")
     print(f"  Superan el filtro (delta >= {delta_min:.2f}): {n_pass}")
 
-    discarded_delta = delta_df[(delta_df["delta"].notna()) & (delta_df["delta"] < delta_min)].sort_values("delta")
+    discarded_delta = delta_df[delta_df["delta"] < delta_min].sort_values("delta")
     if len(discarded_delta) > 0:
-        disp = discarded_delta.copy()
-        disp["Delta"] = disp["delta"].map(lambda x: f"{x:.3f}")
-        disp["IV_anual"] = disp["iv_used"].map(lambda x: f"{x * 100:.1f}%")
         print("\nActivos descartados por Delta insuficiente:")
-        print(disp[["symbol", "Delta", "IV_anual", "strike_mode"]]
-              .rename(columns={"symbol": "Symbol", "strike_mode": "Fuente"}).to_string(index=False))
+        print(discarded_delta[["symbol", "delta", "iv_used", "strike_mode"]]
+              .rename(columns={"symbol": "Symbol", "delta": "Delta", "iv_used": "IV_anual",
+                               "strike_mode": "Fuente"})
+              .to_string(index=False, formatters={"Delta": "{:.3f}".format, "IV_anual": _pct(1)}))
 
     tickers_pass_delta = delta_df[(delta_df["delta"].isna()) | (delta_df["delta"] >= delta_min)]["symbol"].tolist()
     ticker_candidates = tickers_pass_delta
@@ -1717,14 +1689,14 @@ if len(recent_vol_pass) > n_filter_candidates:
 
 recent_vol_candidates = recent_vol_pass.copy()
 
-disp = recent_vol_candidates.copy()
-disp["Vol_Reciente_Anual"] = disp["recent_vol_annual"].map(lambda x: f"{x * 100:.2f}%")
-disp["Vol_General_Anual"] = disp["general_vol_anual"].map(lambda x: f"{x * 100:.2f}%")
-disp["Ratio"] = disp["recent_vol_ratio"].map(lambda x: f"{x:.2f}x")
-disp["Sharpe"] = disp["sharpe_ratio_adjusted"].map(lambda x: f"{x:.3f}")
-print(disp.rename(columns={"symbol": "Symbol", "n_obs": "Obs_Mensuales"})
+print(recent_vol_candidates
+      .rename(columns={"symbol": "Symbol", "recent_vol_annual": "Vol_Reciente_Anual",
+                       "general_vol_anual": "Vol_General_Anual", "recent_vol_ratio": "Ratio",
+                       "sharpe_ratio_adjusted": "Sharpe", "n_obs": "Obs_Mensuales"})
       [["Symbol", "Vol_Reciente_Anual", "Vol_General_Anual", "Ratio", "Sharpe", "Obs_Mensuales"]]
-      .to_string(index=False))
+      .to_string(index=False, formatters={
+          "Vol_Reciente_Anual": _pct(2), "Vol_General_Anual": _pct(2),
+          "Ratio": "{:.2f}x".format, "Sharpe": "{:.3f}".format}))
 
 ticker_candidates = recent_vol_candidates["symbol"].tolist()
 print(f"\nConjunto tras filtro de volatilidad reciente: {len(ticker_candidates)} tickers\n")
@@ -1768,11 +1740,10 @@ print(f"  Descartados por IV anomala respecto a vol. reciente (ratio > {iv_vs_re
       f"{len(iv_flow_discard)}")
 
 if len(iv_flow_discard) > 0:
-    disp2 = iv_flow_discard.copy()
-    disp2["IV"] = disp2["iv"].map(lambda x: f"{x * 100:.1f}%")
-    disp2["Vol_Reciente"] = disp2["recent_vol"].map(lambda x: f"{x * 100:.1f}%")
-    disp2["Ratio"] = disp2["iv_ratio"].map(lambda x: f"{x:.2f}x")
-    print(disp2.rename(columns={"symbol": "Symbol"})[["Symbol", "IV", "Vol_Reciente", "Ratio"]].to_string(index=False))
+    print(iv_flow_discard
+          .rename(columns={"symbol": "Symbol", "iv": "IV", "recent_vol": "Vol_Reciente", "iv_ratio": "Ratio"})
+          [["Symbol", "IV", "Vol_Reciente", "Ratio"]]
+          .to_string(index=False, formatters={"IV": _pct(1), "Vol_Reciente": _pct(1), "Ratio": "{:.2f}x".format}))
 
 iv_descartados = set(iv_flow_discard["symbol"]) if len(iv_flow_discard) else set()
 orden_reposicion = recent_vol_ratio_stats.sort_values("recent_vol_ratio")["symbol"].tolist()
@@ -1881,9 +1852,9 @@ def _asegurar_momentos_actuales(tickers):
     El snapshot no se cachea. Cuesta 2 llamadas (call y put) y se descuenta
     del mismo presupuesto que la historia.
     """
-    nuevos_us = [t for t in tickers if is_us_ticker(t) and t not in bkm_current_moments]
+    nuevos_us = [t for t in tickers if pc.is_us_ticker(t) and t not in bkm_current_moments]
     for t in tickers:
-        if not is_us_ticker(t) and t not in bkm_current_moments:
+        if not pc.is_us_ticker(t) and t not in bkm_current_moments:
             bkm_current_moments[t] = dict(
                 mfiv=np.nan, mfis=np.nan, mfik=np.nan, mu=np.nan, ok=False,
                 spot=np.nan, dte=np.nan, motivo="sin_opciones_us", transitorio=False)
@@ -1898,7 +1869,7 @@ def _asegurar_momentos_actuales(tickers):
 
 def _rank_bkm(ticker):
     mom = bkm_current_moments.get(ticker) or {}
-    us = is_us_ticker(ticker)
+    us = pc.is_us_ticker(ticker)
     mfis_ok = us and bool(mom.get("ok")) and np.isfinite(mom.get("mfis", np.nan))
     return {
         "ticker": ticker,
@@ -2214,19 +2185,14 @@ else:
 
 def get_iv_rank(ticker, iv_current):
     try:
-        hist_ret = df_prices.loc[df_prices["symbol"] == ticker, "monthly_return"].values
+        hist_ret = df_prices.loc[df_prices["symbol"] == ticker, "monthly_return"]
         if len(hist_ret) < 12:
             return 0.5
-        n_roll = 3
-        vol_history = []
-        for i in range(n_roll - 1, len(hist_ret)):
-            window = hist_ret[i - n_roll + 1: i + 1]
-            vol_history.append(np.std(window, ddof=1) * math.sqrt(12))
-        vol_history = np.array(vol_history)
+        vol_history = (hist_ret.rolling(3).std() * math.sqrt(12)).to_numpy()
         vol_history = vol_history[np.isfinite(vol_history) & (vol_history > 0)]
         if len(vol_history) < 6:
             return 0.5
-        return float(np.mean(vol_history <= iv_current))
+        return percentileofscore(vol_history, iv_current, kind="weak") / 100
     except Exception:
         return 0.5
 
@@ -2236,20 +2202,13 @@ iv_ranks = {t: get_iv_rank(t, iv_final_dict[t]) for t in assets}
 
 has_iv_real = np.array([not pd.isna(iv_assets_implied[a]) for a in assets])
 
-alpha_per_asset = np.zeros(n_assets)
-for i, t in enumerate(assets):
-    rank = iv_ranks[t]
-    if not has_iv_real[i]:
-        alpha_per_asset[i] = alpha_min
-        continue
-    if iv_rank_low <= rank <= iv_rank_high:
-        center_dist = 1 - 2 * abs(rank - 0.5)
-        alpha_per_asset[i] = alpha_min + (alpha_max - alpha_min) * center_dist
-    else:
-        alpha_per_asset[i] = alpha_min
+rank_arr = np.array([iv_ranks[t] for t in assets])
+center_dist = 1 - 2 * np.abs(rank_arr - 0.5)
+alpha_per_asset = np.where(
+    has_iv_real & (rank_arr >= iv_rank_low) & (rank_arr <= iv_rank_high),
+    alpha_min + (alpha_max - alpha_min) * center_dist, alpha_min)
 
-alpha_global = np.nanmean(alpha_per_asset)
-alpha_global = max(alpha_min, min(alpha_max, alpha_global))
+alpha_global = np.clip(np.nanmean(alpha_per_asset), alpha_min, alpha_max)
 
 n_alpha_full = int((alpha_per_asset > alpha_min).sum())
 n_alpha_min = int((alpha_per_asset <= alpha_min).sum())
@@ -2283,7 +2242,7 @@ if use_daily_cov:
               f"baja cobertura={align_info['dropped_low_coverage'] or 'ninguno'}")
         daily_names = list(align_info["kept"])
         if len(aligned_px) >= 2 and aligned_px.shape[1] >= 2:
-            daily_wide = aligned_px.pct_change().iloc[1:].dropna(how="any")
+            daily_wide = aligned_px.pct_change().dropna(how="any")
         else:
             daily_wide = aligned_px.iloc[0:0]
         print(f"   Retornos diarios alineados: {daily_wide.shape[0]} dias x {daily_wide.shape[1]} activos")
@@ -2358,9 +2317,7 @@ var_spy_impl = iv_spy_implied ** 2
 weighted_var_i = np.sum(w_disp ** 2 * sigma_i_q ** 2)
 sigma_total_sq = (np.sum(w_disp * sigma_i_q)) ** 2
 
-d_hist = np.sqrt(np.clip(np.diag(Sigma_hist), 1e-300, None))
-R_hist_full = Sigma_hist / np.outer(d_hist, d_hist)
-np.fill_diagonal(R_hist_full, 1.0)
+R_hist_full = cov2corr(Sigma_hist)
 
 tril_idx = np.tril_indices(n_assets, k=-1)
 rho_realized_avg = float(np.nanmean(R_hist_full[tril_idx]))
@@ -2442,45 +2399,24 @@ for etf in etf_sectoriales:
 n_sectores_ok = sum(1 for v in rho_sector_lookup.values() if not pd.isna(v))
 print(f"   Correlacion sectorial calculada para {n_sectores_ok} de {len(etf_sectoriales)} sectores")
 
-R_implied = np.eye(n_assets)
-for i in range(n_assets):
-    for j in range(n_assets):
-        if i == j:
-            continue
-        rho_hist_ij = R_hist_full[i, j]
-        if pd.isna(rho_hist_ij) or not np.isfinite(rho_hist_ij):
-            rho_hist_ij = rho_implied_avg
-
-        sector_i = sector_map.get(assets[i])
-        sector_j = sector_map.get(assets[j])
-
-        if sector_i is not None and sector_j is not None and sector_i == sector_j and not pd.isna(rho_sector_lookup.get(sector_i)):
-            rho_ancla = rho_sector_lookup[sector_i]
-        else:
-            rho_ancla = rho_implied_avg
-
-        scale_factor = (rho_hist_ij / rho_hist_avg_ref) if rho_hist_avg_ref > 0 else 1.0
-        rho_ij_impl = max(-0.999, min(0.999, rho_ancla * scale_factor))
-        R_implied[i, j] = rho_ij_impl
-
+# Ancla de cada par: la correlacion sectorial si ambos son del mismo sector con
+# rho calculada; si no, la global. Se escala por la correlacion historica del par.
+rho_hist_pair = np.where(np.isfinite(R_hist_full), R_hist_full, rho_implied_avg)
+sectores = np.array([sector_map.get(a) for a in assets], dtype=object)
+rho_sector_i = np.array([rho_sector_lookup.get(sec, np.nan) for sec in sectores], dtype=float)
+mismo_sector = (sectores[:, None] == sectores[None, :]) & np.isfinite(rho_sector_i)[:, None]
+rho_ancla = np.where(mismo_sector, rho_sector_i[:, None], rho_implied_avg)
+scale_factor = rho_hist_pair / rho_hist_avg_ref if rho_hist_avg_ref > 0 else 1.0
+R_implied = np.clip(rho_ancla * scale_factor, -0.999, 0.999)
 R_implied = (R_implied + R_implied.T) / 2
 np.fill_diagonal(R_implied, 1.0)
-eig_vals_R, eig_vecs_R = np.linalg.eigh(R_implied)
-if np.any(eig_vals_R < 0):
-    eig_vals_R = np.maximum(eig_vals_R, 1e-8)
-    R_implied = eig_vecs_R @ np.diag(eig_vals_R) @ eig_vecs_R.T
-    D_norm = np.diag(1 / np.sqrt(np.diag(R_implied)))
-    R_implied = D_norm @ R_implied @ D_norm
-    np.fill_diagonal(R_implied, 1.0)
+R_implied = cov2corr(rk.nearest_psd(R_implied, eps_rel=1e-8))
+np.fill_diagonal(R_implied, 1.0)
 
-D_implied = np.diag(sigma_i)
-Sigma_impl = D_implied @ R_implied @ D_implied
+Sigma_impl = corr2cov(R_implied, sigma_i)
 
-Sigma_blend = np.zeros((n_assets, n_assets))
-for i in range(n_assets):
-    for j in range(n_assets):
-        a_ij = (alpha_per_asset[i] + alpha_per_asset[j]) / 2
-        Sigma_blend[i, j] = a_ij * Sigma_impl[i, j] + (1 - a_ij) * Sigma_hist[i, j]
+alpha_pair = (alpha_per_asset[:, None] + alpha_per_asset[None, :]) / 2
+Sigma_blend = alpha_pair * Sigma_impl + (1 - alpha_pair) * Sigma_hist
 
 cov_mat = Sigma_blend / 12
 
@@ -2616,18 +2552,8 @@ geo_groups = {"Canada": canada_assets, "Europa": europe_assets, "Japon": japan_a
 
 def armar_restricciones(beta_lo_, beta_hi_, verbose=True):
     """Columnas de quadprog: suma 1, 0 <= w <= max_weight, banda de beta y regiones."""
-    A_cols = [np.ones(n)]
-    b_vals = [1.0]
-    for i in range(n):
-        v = np.zeros(n)
-        v[i] = 1
-        A_cols.append(v)
-        b_vals.append(0.0)
-    for i in range(n):
-        v = np.zeros(n)
-        v[i] = -1
-        A_cols.append(v)
-        b_vals.append(0.0 if i in excluded_etf_set else -max_weight)
+    A_cols = [np.ones(n), *np.eye(n), *-np.eye(n)]
+    b_vals = [1.0, *np.zeros(n), *-_caps_qp]
     cols_beta, b_beta = pq.beta_band_columns(beta_vec, beta_lo_, beta_hi_)
     A_cols += cols_beta
     b_vals += b_beta
@@ -2741,11 +2667,7 @@ if lambda_annual is None and np.isfinite(_ratio_pen) and _ratio_pen < 0.05:
     print("    el default no cambia. Ver el comentario de lambda_annual.")
 
 
-def portfolio_returns_series(returns_df, weights_series):
-    return qm.portfolio_returns_skipna(returns_df, weights_series)
-
-
-portfolio_returns_full = portfolio_returns_series(df_xts[ticker_candidates], weights_opt)
+portfolio_returns_full = qm.portfolio_returns_skipna(df_xts[ticker_candidates], weights_opt)
 var_parametric = ret_opt - norm.ppf(0.95) * sd_opt
 q05 = portfolio_returns_full.quantile(0.05)
 cvar_95 = portfolio_returns_full[portfolio_returns_full <= q05].mean()
@@ -2803,7 +2725,7 @@ else:
           "para el panel - VaR/CVaR Cornish-Fisher = NaN")
 
 benchmark_series = benchmark_prices.set_index("date")["benchmark_return"]
-portfolio_returns_aligned = portfolio_returns_series(
+portfolio_returns_aligned = qm.portfolio_returns_skipna(
     df_xts[ticker_candidates], weights_opt
 ).reindex(benchmark_series.index).dropna()
 benchmark_aligned = benchmark_series.reindex(portfolio_returns_aligned.index)
@@ -3005,11 +2927,11 @@ if len(results_comparison) > 0:
     print("=" * 70 + "\n")
     print("pen_ret = (λ/2 w'Σw) / w'μ_final con el λ de cada fila: cuanto pesa el riesgo frente al")
     print("retorno en el objetivo. ~0 = casi solo maximiza retorno; ~1 = la penalizacion iguala al retorno.\n")
-    disp = results_comparison.copy()
-    for col in ["retorno", "volatilidad", "sharpe", "utilidad", "max_peso", "pen_ret"]:
-        disp[col] = disp[col].map(lambda x: f"{x:.4f}")
-    print(disp[["lambda_", "retorno", "volatilidad", "sharpe", "pen_ret", "n_activos", "max_peso", "utilidad"]]
-          .to_string(index=False))
+    print(results_comparison[["lambda_", "retorno", "volatilidad", "sharpe", "pen_ret", "n_activos",
+                              "max_peso", "utilidad"]]
+          .to_string(index=False, formatters={
+              c: "{:.4f}".format
+              for c in ["retorno", "volatilidad", "sharpe", "pen_ret", "max_peso", "utilidad"]}))
     _fila_cfg = results_comparison.loc[(results_comparison["lambda_"] - float(lambda_)).abs().idxmin()]
     print(f"\n  λ configurado ({lambda_:.2f}): pen_ret={_fila_cfg['pen_ret']:.3f} | "
           f"{int(_fila_cfg['n_activos'])} activos | peso maximo {_fila_cfg['max_peso']:.1f}%")
@@ -3062,7 +2984,6 @@ print("\nOptimizacion completada exitosamente")
 print("\n\n=== ANALISIS DE MAXIMUM DRAWDOWN DEL PORTAFOLIO ===")
 
 tickers_portfolio = pesos["symbol"].tolist()
-weights_dict = dict(zip(pesos["symbol"], pesos["weight"]))
 
 
 def calc_mdd(returns_vector):
@@ -3100,30 +3021,16 @@ print(f"  Datos historicos ({_mdd_fuente}): {portfolio_hist['date'].nunique()} d
 
 portfolio_wide = portfolio_hist.pivot_table(index="date", columns="symbol", values="monthly_return").sort_index()
 
-rows = []
-for dt_, row in portfolio_wide.iterrows():
-    valid_cols = [t for t in tickers_portfolio if t in portfolio_wide.columns and not pd.isna(row[t])]
-    available_tickers = len(valid_cols)
-    if available_tickers > 0:
-        valid_weights = np.array([weights_dict[t] for t in valid_cols])
-        normalized_weights = valid_weights / valid_weights.sum()
-        valid_returns = np.array([row[t] for t in valid_cols])
-        portfolio_return = float(np.sum(valid_returns * normalized_weights))
-    else:
-        portfolio_return = np.nan
-    rows.append(dict(date=dt_, year=dt_.year, portfolio_return=portfolio_return, available_tickers=available_tickers))
-
-portfolio_returns_by_year = pd.DataFrame(rows)
-
-valid_returns_mdd = portfolio_returns_by_year[
-    portfolio_returns_by_year["portfolio_return"].notna() & np.isfinite(portfolio_returns_by_year["portfolio_return"])
-]
+# Retorno por fecha con el peso renormalizado sobre los tickers que tienen dato (qm, M-1).
+portfolio_ret_mdd = qm.portfolio_returns_skipna(portfolio_wide, pesos.set_index("symbol")["weight"])
+valid_returns_mdd = pd.DataFrame({
+    "year": portfolio_ret_mdd.index.year,
+    "portfolio_return": portfolio_ret_mdd.to_numpy(),
+    "available_tickers": portfolio_wide.notna().sum(axis=1).reindex(portfolio_ret_mdd.index).to_numpy(),
+})
 
 if len(valid_returns_mdd) >= 2:
-    cumulative_values = np.cumprod(1 + valid_returns_mdd["portfolio_return"].values)
-    peak = np.maximum.accumulate(cumulative_values)
-    drawdown = (cumulative_values - peak) / peak
-    global_mdd = np.nanmin(drawdown)
+    global_mdd = calc_mdd(valid_returns_mdd["portfolio_return"])
     print(f"\n  MDD Global ({valid_returns_mdd['year'].min()}-{valid_returns_mdd['year'].max()}): {global_mdd * 100:.2f}%")
 
 all_years = pd.DataFrame({"year": range(mdd_start_year, max(target_years) + 1)})
@@ -3250,11 +3157,12 @@ print(f"  Con penalizacion: {(portfolio_data_quality['data_quality_penalty'] < 1
       f"({(portfolio_data_quality['data_quality_penalty'] < 1.0).mean() * 100:.1f}%)")
 
 if (portfolio_data_quality["data_quality_penalty"] < 1.0).any():
-    limited_data = portfolio_data_quality[portfolio_data_quality["data_quality_penalty"] < 1.0].copy()
-    limited_data["Peso"] = limited_data["weight"].map(lambda x: f"{x * 100:.2f}%")
-    limited_data["Penalizacion"] = limited_data["data_quality_penalty"].map(lambda x: f"{x * 100:.1f}%")
-    print(limited_data.rename(columns={"symbol": "Symbol", "n_obs": "Obs", "sharpe_ratio_adjusted": "Sharpe"})
-          [["Symbol", "Peso", "Obs", "Penalizacion", "Sharpe"]].to_string(index=False))
+    limited_data = portfolio_data_quality[portfolio_data_quality["data_quality_penalty"] < 1.0]
+    print(limited_data.rename(columns={"symbol": "Symbol", "weight": "Peso", "n_obs": "Obs",
+                                       "data_quality_penalty": "Penalizacion",
+                                       "sharpe_ratio_adjusted": "Sharpe"})
+          [["Symbol", "Peso", "Obs", "Penalizacion", "Sharpe"]]
+          .to_string(index=False, formatters={"Peso": _pct(2), "Penalizacion": _pct(1)}))
 
 print("\nScript completado con exito!")
 

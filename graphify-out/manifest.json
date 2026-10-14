@@ -6,9 +6,9 @@
     "semantic_hash": "402fcb61a7c2b0438231b9cf05a58fff"
   },
   "black_litterman.py": {
-    "mtime": 1791480337.1827788,
-    "seen": 1791790234.1055439,
-    "ast_hash": "820e803a978aa2f76c8b2af7c0a4753a",
+    "mtime": 1791948255.1030905,
+    "seen": 1791948486.4051578,
+    "ast_hash": "32e73bfe526140e5686045a7428b295b",
     "semantic_hash": ""
   },
   "market_data.py": {
@@ -18,9 +18,9 @@
     "semantic_hash": ""
   },
   "minimum_variance.py": {
-    "mtime": 1791790191.201774,
-    "seen": 1791790234.105546,
-    "ast_hash": "af96ddba289138d877383a8a2bb45ca2",
+    "mtime": 1791948087.2162702,
+    "seen": 1791948486.40516,
+    "ast_hash": "a5467a930e046c85361687fb211c8883",
     "semantic_hash": ""
   },
   "minimum_variance_(seasonal_version).py": {
@@ -54,9 +54,9 @@
     "semantic_hash": ""
   },
   "quadratic_utility.py": {
-    "mtime": 1791790191.2034743,
-    "seen": 1791790234.10555,
-    "ast_hash": "3c9c237f9498e09cf6efbbd53afbc96a",
+    "mtime": 1791947879.276095,
+    "seen": 1791948486.405165,
+    "ast_hash": "b77b67ffb463bf1df9db7ddb3bc206fb",
     "semantic_hash": ""
   },
   "quadratic_utility_(seasonal_version).py": {
@@ -192,9 +192,9 @@
     "semantic_hash": "e53d268a313f788c4446941bdb5b922d"
   },
   "tests/test_ajuste_iv_tasa.py": {
-    "mtime": 1791330639.19216,
-    "seen": 1791790234.105553,
-    "ast_hash": "e3c01a71bcd532247f24ba553a2763cf",
+    "mtime": 1791948095.505276,
+    "seen": 1791948486.405168,
+    "ast_hash": "6f8972e06651c4f3e5852afc81e070f6",
     "semantic_hash": ""
   },
   "tests/test_cycle2_fixes.py": {

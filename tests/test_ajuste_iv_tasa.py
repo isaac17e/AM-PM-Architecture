@@ -196,8 +196,7 @@ def _funcion(fuente, nombre):
 def test_chain_to_prices_uses_calibrated_carry(nombre):
     import pandas as pd
     fuente = _fuente(nombre)
-    ns = {"math": math, "norm": norm, "np": np}
-    exec(_funcion(fuente, "bs_price"), ns)
+    ns = {"math": math, "norm": norm, "np": np, "rk": rk}
     exec(_funcion(fuente, "bkm_iv_chain_to_prices"), ns)
     chain = pd.DataFrame({"strike": [95.0, 105.0], "iv": [0.25, 0.25], "type": ["put", "call"]})
     con_tasa = ns["bkm_iv_chain_to_prices"](S, RF, T, chain)
@@ -207,6 +206,13 @@ def test_chain_to_prices_uses_calibrated_carry(nombre):
     assert np.allclose(con_tasa["price"].values,
                        rk.bs_price(S, chain["strike"].values, T, RF, 0.25,
                                    chain["type"].values == "call"), rtol=1e-10)
+
+
+@pytest.mark.parametrize("nombre", SCRIPTS)
+def test_reprecia_con_bs_price_de_rk(nombre):
+    fuente = _fuente(nombre)
+    assert "def bs_price(" not in fuente
+    assert "rk.bs_price(" in _funcion(fuente, "bkm_iv_chain_to_prices")
 
 
 @pytest.mark.parametrize("nombre", SCRIPTS)

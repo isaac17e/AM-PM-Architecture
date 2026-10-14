@@ -8,15 +8,15 @@ import re
 import io
 import time
 import math
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 import yfinance as yf
 import statsmodels.api as sm
+from statsmodels.stats.moment_helpers import corr2cov
 from scipy.stats import norm, skew, kurtosis
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
@@ -490,10 +490,6 @@ provider_currency = {}
 ticker_currency = {}
 
 
-def is_non_us_exchange(ticker):
-    return not pc.is_us_ticker(ticker)
-
-
 def get_currency_for_ticker(ticker):
     if ticker in ticker_currency:
         return ticker_currency[ticker]
@@ -695,7 +691,7 @@ for t in prices_weekly_usd.columns:
             print(f"  ADVERTENCIA: sin serie FX para {t} ({cur}) - queda en moneda local")
 print(f"  OK Tickers convertidos a USD: {n_convertidos}")
 
-weekly_returns = np.log(prices_weekly_usd / prices_weekly_usd.shift(1)).dropna(how="all")
+weekly_returns = np.log(prices_weekly_usd).diff().dropna(how="all")
 weekly_returns = weekly_returns.dropna()
 
 # ==============================================================================
@@ -713,15 +709,15 @@ for t in prices_daily_usd.columns:
         fx_series = fx_daily_price_usd[cur].reindex(prices_daily_usd.index).ffill()
         prices_daily_usd[t] = prices_daily_usd[t] * fx_series
 
-daily_returns = np.log(prices_daily_usd / prices_daily_usd.shift(1)).dropna(how="all")
+daily_returns = np.log(prices_daily_usd).diff().dropna(how="all")
 daily_returns = daily_returns.replace([np.inf, -np.inf], np.nan)
 print(f"[INFO] Retornos diarios disponibles para Sigma: {len(daily_returns)} dias")
 
-fx_weekly_returns = np.log(fx_weekly_price_usd / fx_weekly_price_usd.shift(1)).dropna(how="all")
+fx_weekly_returns = np.log(fx_weekly_price_usd).diff().dropna(how="all")
 
 benchmark_daily = benchmark_data.set_index("date")["adjusted"]
 benchmark_weekly_prices, _ = md.drop_partial_last_week(benchmark_daily.resample("W").last(), last_daily_date)
-benchmark_returns_full = np.log(benchmark_weekly_prices / benchmark_weekly_prices.shift(1)).dropna()
+benchmark_returns_full = np.log(benchmark_weekly_prices).diff().dropna()
 benchmark_returns_full = benchmark_returns_full.rename("SPY").to_frame()
 
 common_dates = weekly_returns.index.intersection(benchmark_returns_full.index)
@@ -742,10 +738,7 @@ print(f"[INFO] Horizonte de inversion: {horizon_label}\n")
 
 if log_returns.isna().any().any() or np.isinf(log_returns.values).any():
     print("[ADVERTENCIA] Limpiando NAs/Inf...")
-    bad_mask = log_returns.isna().any() | np.isinf(log_returns).any()
-    bad_cols = log_returns.columns[bad_mask]
-    good_cols = [c for c in log_returns.columns if c not in bad_cols]
-    log_returns = log_returns[good_cols]
+    log_returns = log_returns.loc[:, np.isfinite(log_returns).all()]
     print(f"   Tickers restantes: {log_returns.shape[1]}")
 
 if log_returns.shape[1] < 5:
@@ -759,11 +752,6 @@ print("\n" + "=" * 67)
 print("ANALISIS DE SELECCION DE ACTIVOS")
 print(f"Entrenamiento: {n_weeks} semanas | Horizonte: {horizon_label} (~{horizon_weeks:.1f} semanas)")
 print("=" * 67 + "\n")
-
-
-def max_drawdown_from_returns(returns_series):
-    """MDD de una serie de LOG-retornos (riqueza = exp(cumsum)), B-1."""
-    return rk.max_drawdown(returns_series, log_returns=True)
 
 
 asset_stats = pd.DataFrame({
@@ -784,8 +772,8 @@ beta_source = beta_stats["beta_source"].to_dict()
 asset_stats["Beta"] = beta_stats["beta"].reindex(asset_stats["Symbol"]).values
 asset_stats["Resid_Vol"] = beta_stats["resid_vol"].reindex(asset_stats["Symbol"]).values
 
-mdd_values = log_returns.apply(lambda col: max_drawdown_from_returns(col))
-asset_stats["Max_Drawdown"] = mdd_values.values
+# MDD de LOG-retornos (riqueza = exp(cumsum)), B-1.
+asset_stats["Max_Drawdown"] = log_returns.apply(rk.max_drawdown, log_returns=True).values
 
 asset_stats = asset_stats[
     asset_stats["Sharpe"].notna() & asset_stats["Volatility"].notna() & asset_stats["Beta"].notna()
@@ -846,7 +834,7 @@ _polygon_cache = {}
 
 
 def get_polygon_option_snapshot(ticker):
-    if is_non_us_exchange(ticker):
+    if not pc.is_us_ticker(ticker):
         return None
     if ticker in _polygon_cache:
         return _polygon_cache[ticker]
@@ -945,17 +933,6 @@ def get_atm_iv_safe(ticker):
 # ==============================================================================
 # FUNCIONES BKM (Bakshi, Kapadia y Madan, 2003)
 # ==============================================================================
-def bs_price(S, K, T_yrs, r, sigma, tipo="call"):
-    if T_yrs <= 0 or sigma <= 0:
-        return np.nan
-    d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T_yrs) / (sigma * math.sqrt(T_yrs))
-    d2 = d1 - sigma * math.sqrt(T_yrs)
-    if tipo == "call":
-        return S * norm.cdf(d1) - K * math.exp(-r * T_yrs) * norm.cdf(d2)
-    else:
-        return K * math.exp(-r * T_yrs) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
-
 def bkm_fetch_otm_chain(ticker, target_dte, dte_tol, S, moneyness_lo, moneyness_hi):
     """Cadena OTM paginada de un unico vencimiento (el mas cercano a target_dte)."""
     hoy = date.today()
@@ -977,10 +954,8 @@ def bkm_iv_chain_to_prices(S, r, T, chain_df, carry=None):
         return chain_df
     tasa = r if carry is None else carry
     chain_df = chain_df.copy()
-    chain_df["price"] = [
-        bs_price(S, k, T, tasa, iv, tipo)
-        for k, iv, tipo in zip(chain_df["strike"], chain_df["iv"], chain_df["type"])
-    ]
+    chain_df["price"] = rk.bs_price(
+        S, chain_df["strike"], T, tasa, chain_df["iv"], chain_df["type"] == "call")
     chain_df = chain_df[chain_df["price"].notna() & (chain_df["price"] > 0)]
     return chain_df
 
@@ -1081,7 +1056,7 @@ def bkm_get_current_moments_cached(ticker):
     if not use_iv_for_horizon:
         mom = _bkm_vacio(f"horizonte > cap de opciones ({options_horizon_cap_months} meses)")
         mom.update(spot=np.nan, dte=np.nan)
-    elif get_currency_for_ticker(ticker) != "USD" or is_non_us_exchange(ticker):
+    elif get_currency_for_ticker(ticker) != "USD" or not pc.is_us_ticker(ticker):
         mom = _bkm_vacio("sin_opciones_en_polygon (no cotiza en EE. UU.)")
         mom.update(spot=np.nan, dte=np.nan)
     else:
@@ -1359,9 +1334,9 @@ descriptive_stats = pd.DataFrame({
     "Volatilidad_Horizonte": log_returns_selected.std().values * horizon_sqrt,
     "Retorno_Anual": log_returns_selected.mean().values * annualization_factor,
     "Volatilidad_Anual": log_returns_selected.std().values * math.sqrt(annualization_factor),
-    "Asimetria_P": [skew(log_returns_selected[c].dropna()) for c in log_returns_selected.columns],
-    "Curtosis_P": [kurtosis(log_returns_selected[c].dropna()) for c in log_returns_selected.columns],
-    "Max_Drawdown": [max_drawdown_from_returns(log_returns_selected[c]) for c in log_returns_selected.columns],
+    "Asimetria_P": skew(log_returns_selected, nan_policy="omit"),
+    "Curtosis_P": kurtosis(log_returns_selected, nan_policy="omit"),
+    "Max_Drawdown": log_returns_selected.apply(rk.max_drawdown, log_returns=True).values,
 })
 
 descriptive_stats["MFIV_T"] = [bkm_moments_cache.get(c, {}).get("mfiv", np.nan) for c in log_returns_selected.columns]
@@ -1406,7 +1381,6 @@ print(f"  OK MFIV (BKM) validas: {n_iv_ok} | Sin datos (fallback historico): {n_
 
 sd_hist_annual = sd_ret.values * math.sqrt(annualization_factor)
 iv_final = np.where(~pd.isna(iv_assets_implied), iv_assets_implied, sd_hist_annual)
-iv_final = np.where(pd.isna(iv_final), sd_hist_annual, iv_final)
 
 # ==============================================================================
 # CORRECCION Q -> P: LA MFIV INCLUYE LA PRIMA DE RIESGO DE VARIANZA
@@ -1632,11 +1606,6 @@ beta_sector_arr = np.array([beta_sector_implied[t] for t in selected_tickers])
 beta_country_arr = np.array([beta_country_implied[t] for t in selected_tickers])
 beta_fx_arr = np.array([beta_fx_implied[t] for t in selected_tickers])
 
-beta_mercado = beta_hist_arr
-beta_sector = beta_sector_arr
-beta_pais = beta_country_arr
-beta_fx = beta_fx_arr
-
 print(f"     beta_mercado (primeros 3):        {beta_hist_arr[0]:.4f} | {beta_hist_arr[1]:.4f} | {beta_hist_arr[2]:.4f}")
 print(f"     beta_sector (primeros 3):          {beta_sector_arr[0]:.4f} | {beta_sector_arr[1]:.4f} | {beta_sector_arr[2]:.4f}")
 print(f"     beta_pais (primeros 3):            {beta_country_arr[0]:.4f} | {beta_country_arr[1]:.4f} | {beta_country_arr[2]:.4f}")
@@ -1644,14 +1613,9 @@ print(f"     beta_fx (primeros 3):              {beta_fx_arr[0]:.4f} | {beta_fx_
 
 factor_names = ["MKT"] + sectores_unicos + paises_unicos + currencies_presentes
 
-factor_returns_mat = pd.DataFrame(index=log_returns.index, columns=factor_names, dtype=float)
-factor_returns_mat["MKT"] = r_mkt_full.reindex(log_returns.index)
-for s in sectores_unicos:
-    factor_returns_mat[s] = log_returns[s]
-for p in paises_unicos:
-    factor_returns_mat[p] = log_returns[p]
-for c in currencies_presentes:
-    factor_returns_mat[c] = fx_weekly_returns[c].reindex(log_returns.index)
+factor_returns_mat = pd.concat(
+    [r_mkt_full.rename("MKT"), log_returns[sectores_unicos + paises_unicos],
+     fx_weekly_returns[currencies_presentes]], axis=1).reindex(log_returns.index)
 
 corr_factors = factor_returns_mat.corr()
 
@@ -1672,8 +1636,7 @@ print(f"     factores sector/pais con MFIV (Q->P aplicado): {n_factores_q_a_p} d
       f"{len(sectores_unicos) + len(paises_unicos)}")
 
 iv_factor_weekly = np.array([iv_factor[f] / math.sqrt(annualization_factor) for f in factor_names])
-D_factor = np.diag(iv_factor_weekly)
-F_mat = D_factor @ corr_factors.loc[factor_names, factor_names].values @ D_factor
+F_mat = corr2cov(corr_factors.loc[factor_names, factor_names].values, iv_factor_weekly)
 
 B_load = np.zeros((n_sel, len(factor_names)))
 mkt_idx = factor_names.index("MKT")
@@ -1739,7 +1702,7 @@ print(f"     sqrt(diag(cov_mat)) = vol semanal: {np.sqrt(np.diag(cov_mat.values)
 # ==============================================================================
 cov_scale_d2w = 252.0 / annualization_factor
 
-tickers_no_us_pool = [t for t in selected_tickers if is_non_us_exchange(t)]
+tickers_no_us_pool = [t for t in selected_tickers if not pc.is_us_ticker(t)]
 if hist_cov_frequency == "auto":
     cov_freq_usada = "weekly" if tickers_no_us_pool else "daily"
 else:
@@ -2143,7 +2106,7 @@ def extract_metrics(opt_obj, label):
     risk_weekly = math.sqrt(float(w_vec @ cm.values @ w_vec))
 
     port_returns = rk.portfolio_log_returns(ret_mat, w)
-    mdd = max_drawdown_from_returns(port_returns)
+    mdd = rk.max_drawdown(port_returns, log_returns=True)
 
     port_excess = port_returns.values - risk_free_rate_weekly
     downside_neg = port_excess[port_excess < 0]
@@ -2393,46 +2356,36 @@ print("ATRIBUCION DE RIESGO SINTETICA (GRIEGAS BSM) - DIAGNOSTICO")
 print("=" * 65)
 
 T_greeks = T_options
-mu_weekly_g = log_returns[list(w_final.index)].mean()
+tk_g = list(w_final.index)
+mu_g = log_returns[tk_g].mean().fillna(0.0).to_numpy()
+S_g = np.array([spot_cache.get(tk) for tk in tk_g], dtype=float)
+iv_g = np.array([iv_cache.get(tk) for tk in tk_g], dtype=float)
+iv_g = np.where(np.isfinite(iv_g) & (iv_g > 0),
+                iv_g, log_returns[tk_g].std().to_numpy() * math.sqrt(annualization_factor))
 
-greeks_rows = []
-for tk in w_final.index:
-    S = spot_cache.get(tk, np.nan)
-    iv = iv_cache.get(tk, np.nan)
-    if iv is None or pd.isna(iv) or iv <= 0:
-        iv = log_returns[tk].std() * math.sqrt(annualization_factor)
-    if S is None or pd.isna(S) or S <= 0 or pd.isna(iv) or iv <= 0:
-        greeks_rows.append(dict(Ticker=tk, Weight=w_final[tk], Delta=np.nan, Gamma=np.nan, Vega=np.nan, Theta=np.nan))
-        continue
+if delta_strike_mode == "rf":
+    K_g = S_g * (1 + risk_free_rate * T_greeks)
+elif delta_strike_mode == "mu":
+    K_g = S_g * (1 + mu_g * horizon_weeks)
+else:
+    K_g = S_g
 
-    mu_i = mu_weekly_g.get(tk, 0.0)
-    mu_i = 0.0 if pd.isna(mu_i) else mu_i
-
-    if delta_strike_mode == "atm":
-        K = S
-    elif delta_strike_mode == "rf":
-        K = S * (1 + risk_free_rate * T_greeks)
-    elif delta_strike_mode == "mu":
-        K = S * (1 + mu_i * horizon_weeks)
-    else:
-        K = S
-
-    d1 = (math.log(S / K) + (risk_free_rate + iv ** 2 / 2) * T_greeks) / (iv * math.sqrt(T_greeks))
-    d2 = d1 - iv * math.sqrt(T_greeks)
-
-    delta_i = norm.cdf(d1)
-    gamma_raw = norm.pdf(d1) / (S * iv * math.sqrt(T_greeks))
-    vega_raw = S * norm.pdf(d1) * math.sqrt(T_greeks) / 100
-    theta_raw = (-(S * norm.pdf(d1) * iv) / (2 * math.sqrt(T_greeks))
-                 - risk_free_rate * K * math.exp(-risk_free_rate * T_greeks) * norm.cdf(d2)) / 365
-
-    gamma_i = gamma_raw / S
-    vega_i = vega_raw / S
-    theta_i = theta_raw / S
-
-    greeks_rows.append(dict(Ticker=tk, Weight=w_final[tk], Delta=delta_i, Gamma=gamma_i, Vega=vega_i, Theta=theta_i))
-
-greeks_df = pd.DataFrame(greeks_rows)
+sqrt_T = math.sqrt(T_greeks)
+with np.errstate(all="ignore"):
+    d1 = (np.log(S_g / K_g) + (risk_free_rate + iv_g ** 2 / 2) * T_greeks) / (iv_g * sqrt_T)
+    d2 = d1 - iv_g * sqrt_T
+    pdf_d1 = norm.pdf(d1)
+    # Gamma, vega y theta por accion, divididas por S: por $1 de exposicion.
+    griegas = {
+        "Delta": norm.cdf(d1),
+        "Gamma": pdf_d1 / (S_g * iv_g * sqrt_T) / S_g,
+        "Vega": S_g * pdf_d1 * sqrt_T / 100 / S_g,
+        "Theta": (-(S_g * pdf_d1 * iv_g) / (2 * sqrt_T)
+                  - risk_free_rate * K_g * math.exp(-risk_free_rate * T_greeks) * norm.cdf(d2)) / 365 / S_g,
+    }
+con_datos = (S_g > 0) & (iv_g > 0)
+greeks_df = pd.DataFrame({"Ticker": tk_g, "Weight": w_final.to_numpy(),
+                          **{k: np.where(con_datos, v, np.nan) for k, v in griegas.items()}})
 
 print(f"  {'Ticker':<8} {'Peso':>7} {'Delta':>8} {'Gamma/$':>10} {'Vega/$':>8} {'Theta/$':>9}")
 print("  " + "-" * 58)

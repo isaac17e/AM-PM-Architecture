@@ -1,0 +1,1042 @@
+################################################################################
+# SALIDA COMPLETA DE: minimum_variance.py
+################################################################################
+
+Perfil de riesgo: agresivo
+
+====================================================================
+     OPTIMIZACION DE PORTAFOLIO - MINIMO RIESGO DE COLA (BKM + CORNISH-FISHER)
+     Retornos: SEMANALES | Entrenamiento: Historico completo
+====================================================================
+
+Horizonte de inversion : 1 mes desde 2026-10-06
+Semanas del horizonte  : 4.3 semanas
+Entrenamiento          : 2018-01-01 -> 2026-10-06
+Anualizacion base      : x52 | Horizonte: x4.3 semanas
+Datos de opciones (BKM): activos (horizonte <= cap de 3 meses)
+
+[INFO] Obteniendo tickers del S&P 500 (stockanalysis.com)...
+  OK S&P 500: 80 objetivo, 80 unicos obtenidos
+
+[INFO] Obteniendo tickers del NASDAQ (stockanalysis.com)...
+  OK NASDAQ: 80 objetivo, 80 unicos obtenidos
+
+[INFO] Internacionales: top 15 de 67 por market cap (USD):
+       Ticker MarketCap_USD Moneda  Region
+  1      HSBC       333.9 B    USD      US
+  2     RY.TO       272.1 B    CAD  Canada
+  3    8306.T       261.4 B    JPY   Japon
+  4     AZN.L       246.2 B    GBP  Europa
+  5    SIE.DE       240.6 B    EUR  Europa
+  6    9984.T       226.9 B    JPY   Japon
+  7     OR.PA       224.2 B    EUR  Europa
+  8    7203.T       219.5 B    JPY   Japon
+  9     MC.PA       214.1 B    EUR  Europa
+  10  SHOP.TO       211.7 B    CAD  Canada
+  11   SAN.MC       204.2 B    EUR  Europa
+  12    TD.TO       193.2 B    CAD  Canada
+  13   ITX.MC       188.9 B    EUR  Europa
+  14   TTE.PA       188.3 B    EUR  Europa
+  15   ALV.DE       179.8 B    EUR  Europa
+
+[INFO] Combinando y limpiando tickers...
+[INFO] Clase duplicada: se queda GOOGL, sale GOOG
+[INFO] Total de tickers FINAL (unicos): 231 | internacionales en el universo: 15 de 15
+
+
+===================================================================
+UNIVERSO DE INVERSION
+===================================================================
+- Tickers del S&P 500 (top 80 por cap.):      80
+- Tickers del NASDAQ (top 80 por cap.):      80
+- ETFs (todas las categorias):                90
+- Commodities:                                2
+- Internacionales (top 15 de 67): 15
+- Total unicos tras combinar:                231
+
+===================================================================
+DESCARGA DE DATOS HISTORICOS
+===================================================================
+
+[INFO] Descargando precios diarios desde Yahoo Finance...
+[INFO] Periodo: 2018-01-01 -> 2026-10-06
+[INFO] Se convertiran a retornos SEMANALES para el entrenamiento
+
+   Descargados 25/231...
+   Descargados 50/231...
+   Descargados 75/231...
+   Descargados 100/231...
+   Descargados 125/231...
+   Descargados 150/231...
+   Descargados 175/231...
+   Descargados 200/231...
+   Descargados 225/231...
+   Descargados 231/231...
+
+OK Descargados exitosamente: 231 tickers
+
+[INFO] Moneda por ticker: 231 informadas por el proveedor
+[INFO] Monedas presentes: CAD, EUR, GBP, JPY, USD
+
+[INFO] Descargando benchmark (SPY)...
+
+[INFO] Descargando pares FX para conversion a USD...
+  OK CAD (CAD=X)
+  OK EUR (EURUSD=X)
+  OK GBP (GBPUSD=X)
+  OK JPY (JPY=X)
+
+[INFO] Convirtiendo precios diarios -> retornos semanales...
+[INFO] Tickers con cobertura >= 80% del calendario SPY: 217 (descartados: ABNB, ALAB, APP, ARM, BUG, CEG, DASH, GEV...)
+[INFO] Dias rellenados por festivos locales (ffill <= 2): 699 celdas en 14 tickers | filas eliminadas por lagunas mayores: 442 de 2201
+[INFO] Ultima semana parcial descartada (ultimo dato diario: 2026-10-05)
+[INFO] Convirtiendo precios de tickers no-USD a USD...
+  OK Tickers convertidos a USD: 14
+[INFO] Retornos diarios disponibles para Sigma: 1758 dias
+[INFO] Semanas disponibles para entrenamiento: 367 (~7.1 anios)
+[INFO] Tickers validos: 217
+
+[INFO] Entrenamiento con 367 semanas completas (2019-09-29 -> 2026-10-04)
+[INFO] Horizonte de inversion: 1 mes desde 2026-10-06
+
+
+===================================================================
+ANALISIS DE SELECCION DE ACTIVOS
+Entrenamiento: 367 semanas | Horizonte: 1 mes desde 2026-10-06 (~4.3 semanas)
+===================================================================
+
+[INFO] Activos con metricas validas: 217
+
+
+[INFO] Pool pre-filtro de volatilidad: 45 candidatos (max configurado: 45)
+
+Consultando spot + IV ATM (~30 DTE) para 45 activos (uso: shrinkage de covarianza y griegas de diagnostico)...
+  OK IV ATM obtenida: 41 de 45 (el resto usa vol historica)
+
+
+Aplicando filtro Delta (colchon OTM, delta_min=0.15, T=0.083 anios = 1 mes(es))...
+   Log-moneyness OTM efectiva: 0.0566 (base 0.0800 a 2 meses)
+   IV: Polygon si hay cadena; si no, vol historica. Nombres sin vol se conservan.
+
+  Colchon y fuente de vol por ticker:
+  Symbol Colchon IV_anual        Fuente Resultado
+    GILD   0.231    32.6%    IV Polygon      pasa
+     CME   0.245    30.6%    IV Polygon      pasa
+    AAXJ   0.262    28.4%    IV Polygon      pasa
+     JNJ   0.268    27.6%    IV Polygon      pasa
+     MCD   0.277    26.6%    IV Polygon      pasa
+     IHF   0.282    26.0%    IV Polygon      pasa
+     LIN   0.284    25.8%    IV Polygon      pasa
+     IHI   0.284    25.8%    IV Polygon      pasa
+       V   0.288    25.4%    IV Polygon      pasa
+    MDLZ   0.289    25.3%    IV Polygon      pasa
+     PEP   0.300    24.2%    IV Polygon      pasa
+     WMT   0.302    24.0%    IV Polygon      pasa
+     KIE   0.311    23.2%    IV Polygon      pasa
+     FAN   0.312    23.1% vol historica      pasa
+     EWQ   0.312    23.1%    IV Polygon      pasa
+     EZU   0.314    22.9%    IV Polygon      pasa
+     EEM   0.317    22.7%    IV Polygon      pasa
+   TD.TO   0.317    22.7% vol historica      pasa
+     IBB   0.322    22.2%    IV Polygon      pasa
+     EWJ   0.323    22.1%    IV Polygon      pasa
+      VZ   0.323    22.1%    IV Polygon      pasa
+     AEP   0.325    22.0%    IV Polygon      pasa
+      KO   0.326    21.8%    IV Polygon      pasa
+     GLD   0.329    21.6%    IV Polygon      pasa
+     PPA   0.331    21.5%    IV Polygon      pasa
+     IYT   0.331    21.5%    IV Polygon      pasa
+      PG   0.334    21.3%    IV Polygon      pasa
+     PPH   0.337    21.0%    IV Polygon      pasa
+     EWP   0.338    20.9%    IV Polygon      pasa
+   RY.TO   0.345    20.4% vol historica      pasa
+    PDBC   0.354    19.7% vol historica      pasa
+     EWG   0.358    19.4%    IV Polygon      pasa
+     XLP   0.361    19.2%    IV Polygon      pasa
+     VGK   0.368    18.7%    IV Polygon      pasa
+     XLU   0.369    18.6%    IV Polygon      pasa
+    COST   0.370    18.6%    IV Polygon      pasa
+     XLV   0.377    18.1%    IV Polygon      pasa
+     EWU   0.387    17.5%    IV Polygon      pasa
+     MOO   0.395    16.9%    IV Polygon      pasa
+    XLRE   0.406    16.3%    IV Polygon      pasa
+    INDA   0.422    15.3%    IV Polygon      pasa
+   BRK-B   0.441    14.3%    IV Polygon      pasa
+     XLB   0.454    13.6%    IV Polygon      pasa
+     VWO   0.482    12.2%    IV Polygon      pasa
+     HYG   0.584     6.5%    IV Polygon      pasa
+
+  Fuente de vol: IV Polygon 41 | historica 4 | sin vol (se conservan) 0
+  Descartados (colchon < 0.15): 0 de 45 | Superan el filtro: 45
+  OK Tras filtro Delta: 45 candidatos para el filtro de cola
+
+
+Aplicando filtro de Tail Risk BKM (VaR_CF a 95% de confianza)...
+  VaR_CF al horizonte de 30 dias. MFIS/MFIK de la tabla son los de la cadena; la cola se calcula con esos momentos escalados al objetivo.
+  Fallback historico ACTIVO: los activos sin BKM valido usan momentos historicos
+  OK Candidatos previos al filtro: 45
+  OK Con VaR_CF calculable (>=26 sem hist.): 45 (BKM: 39 | historico: 6)
+  ADVERTENCIA Descartados (sin cobertura BKM o con MFIS/MFIK inadmisibles): 0
+  OK Seleccionados (<=30, menor VaR_CF/Tail Risk Score): 30
+
+  Candidatos finales ordenados por VaR_CF (Tail Risk Score, Cornish-Fisher):
+Symbol    Fuente DTE VaR_CF    MFIV   MFIS   MFIK Sharpe  Semanas
+   HYG Historico  30 4.495%     N/D    N/D    N/D -0.107      367
+ BRK-B       BKM  31 5.754% 0.00252 -2.969 55.063  0.401      367
+   XLP       BKM  31 6.248% 0.00288 -0.012  6.640  0.135      367
+   GLD       BKM  31 6.587% 0.00428 -0.195  7.661  0.542      367
+  INDA       BKM  45 6.833% 0.00300 -0.501  7.396  0.061      367
+   XLV       BKM  31 7.031% 0.00315  0.178  5.385  0.306      367
+   EWU       BKM  45 7.106% 0.00290 -1.616 10.504  0.211      367
+   PPA       BKM  45 7.137% 0.00401  0.911  2.193  0.314      367
+   EWQ       BKM  45 7.198% 0.00443  0.572  3.784  0.114      367
+   PPH       BKM  45 7.482% 0.00465  0.278  2.621  0.331      367
+   IBB       BKM  45 7.722% 0.00552  0.680  6.380  0.218      367
+  COST       BKM  31 7.749% 0.00355 -1.290 19.770  0.573      367
+   JNJ       BKM  31 7.878% 0.00525 -0.706 10.030  0.394      367
+  PDBC Historico  30 8.135%     N/D    N/D    N/D  0.399      367
+   VWO Historico  30 8.322%     N/D    N/D    N/D  0.187      367
+   VGK       BKM  45 8.402% 0.00388 -1.191  7.083  0.244      367
+   EEM       BKM  31 8.421% 0.00547 -0.445  9.247  0.224      367
+   XLU       BKM  31 8.462% 0.00308 -0.319  6.283  0.069      367
+   MCD       BKM  31 8.519% 0.00425  0.353  7.171 -0.045      367
+ RY.TO Historico  30 8.675%     N/D    N/D    N/D  0.563      367
+    PG       BKM  31 8.816% 0.00448 -0.722  5.377  0.013      367
+   PEP       BKM  31 9.107% 0.00548  0.010  6.489 -0.124      367
+   MOO       BKM  45 9.124% 0.00709 -1.906 15.821  0.009      367
+    KO       BKM  31 9.409% 0.00404 -0.843  8.885  0.230      367
+    VZ       BKM  31 9.460% 0.00694 -0.417 11.240 -0.135      367
+   EWJ       BKM  31 9.652% 0.00575 -1.692  8.028  0.276      367
+   WMT       BKM  31 9.673% 0.00473 -0.591  6.864  0.468      367
+   IYT       BKM  45 9.762% 0.00589 -0.360  5.082  0.167      367
+   IHI       BKM  45 9.901% 0.00726 -0.487  5.487 -0.077      367
+ TD.TO Historico  30 9.944%     N/D    N/D    N/D  0.429      367
+
+OK Conjunto tras filtro de Tail Risk BKM: 30 tickers
+
+
+===================================================================
+ESTADISTICAS DESCRIPTIVAS DE ACTIVOS SELECCIONADOS
+Anualizacion x52 | Horizonte: 1 mes desde 2026-10-06 (~4.3 sem)
+===================================================================
+
+Symbol Retorno_Horizonte Volatilidad_Horizonte Retorno_Anual Volatilidad_Anual  Asimetria_P  Curtosis_P Max_Drawdown MFIV_Vol_Anual_Q MFIS_Q MFIK_Q
+   HYG             0.30%                 3.10%         3.55%            10.74%        -0.46       33.61      -20.75%            8.52%    N/D    N/D
+ BRK-B             1.04%                 5.61%        12.49%            19.43%        -0.48        3.58      -26.48%           17.21%  -2.97  55.06
+   XLP             0.56%                 4.34%         6.74%            15.03%        -1.08        5.93      -22.21%           18.41%  -0.01   6.64
+   GLD             1.15%                 4.88%        13.86%            16.90%        -0.24        2.25      -23.84%           22.44%  -0.19   7.66
+  INDA             0.49%                 5.46%         5.86%            18.93%        -1.05       12.02      -39.17%           15.60%  -0.50   7.40
+   XLV             0.84%                 5.07%        10.08%            17.57%        -0.54        4.51      -24.31%           19.25%   0.18   5.39
+   EWU             0.75%                 5.90%         9.02%            20.45%        -1.27       12.03      -41.26%           15.33%  -1.62  10.50
+   PPA             1.03%                 7.09%        12.41%            24.55%        -0.72        8.73      -41.95%           18.02%   0.91   2.19
+   EWQ             0.62%                 6.81%         7.39%            23.58%        -0.72        5.86      -37.89%           18.96%   0.57   3.78
+   PPH             0.89%                 5.23%        10.70%            18.12%        -0.57        3.65      -26.38%           19.43%   0.28   2.62
+   IBB             0.81%                 6.59%         9.69%            22.83%        -0.25        1.36      -37.55%           21.16%   0.68   6.38
+  COST             1.49%                 6.65%        17.91%            23.04%        -0.55        3.72      -30.49%           20.45%  -1.29  19.77
+   JNJ             1.01%                 5.45%        12.14%            18.87%        -0.06        1.88      -20.56%           24.87%  -0.71  10.03
+  PDBC             1.05%                 5.69%        12.56%            19.71%         0.11        2.47      -31.79%              N/D    N/D    N/D
+   VWO             0.68%                 5.26%         8.11%            18.22%        -0.76        3.52      -33.48%           22.81%    N/D    N/D
+   VGK             0.82%                 6.06%         9.81%            20.98%        -0.95        7.19      -36.47%           17.75%  -1.19   7.08
+   EEM             0.76%                 5.73%         9.14%            19.86%        -0.60        2.37      -39.16%           25.37%  -0.45   9.25
+   XLU             0.52%                 6.28%         6.19%            21.75%        -0.50        9.83      -32.06%           19.03%  -0.32   6.28
+   MCD             0.31%                 5.92%         3.78%            20.49%        -0.59        6.30      -31.17%           22.38%   0.35   7.17
+ RY.TO             1.35%                 5.89%        16.18%            20.40%        -0.82        5.74      -34.26%              N/D    N/D    N/D
+    PG             0.41%                 5.29%         4.93%            18.33%        -0.57        2.69      -22.69%           22.96%  -0.72   5.38
+   PEP             0.18%                 5.93%         2.16%            20.53%        -0.66        8.96      -29.84%           25.39%   0.01   6.49
+   MOO             0.41%                 5.67%         4.88%            19.63%        -0.64        4.28      -37.05%           23.98%  -1.91  15.82
+    KO             0.80%                 6.08%         9.55%            21.06%        -1.62       13.43      -35.75%           21.82%  -0.84   8.88
+    VZ             0.15%                 6.15%         1.84%            21.30%        -0.25        2.12      -41.03%           28.59%  -0.42  11.24
+   EWJ             0.83%                 5.48%         9.95%            19.00%        -0.41        3.12      -32.49%           26.03%  -1.69   8.03
+   WMT             1.27%                 6.53%        15.29%            22.63%        -0.98        7.25      -24.58%           23.59%  -0.59   6.86
+   IYT             0.73%                 6.94%         8.72%            24.05%        -0.49        3.08      -39.17%           21.85%  -0.36   5.08
+   IHI             0.26%                 6.05%         3.08%            20.96%        -0.31        2.75      -32.74%           24.27%  -0.49   5.49
+ TD.TO             1.20%                 6.55%        14.43%            22.67%        -0.72        4.02      -36.24%              N/D    N/D    N/D
+
+===================================================================
+OPTIMIZACION DE PORTAFOLIOS - MINIMO RIESGO DE COLA (BKM)
+Datos: 367 semanas | Horizonte: 1 mes desde 2026-10-06 (~4.3 sem) | Activos: 30
+===================================================================
+
+
+Estimando MFIV (BKM) para covarianza forward-looking...
+  OK MFIV (BKM) validas: 27 | Sin datos (fallback historico): 3
+
+  CORRECCION Q -> P (prima de riesgo de varianza):
+     ratio sigma_P/sigma_Q: min=0.730 | mediana=0.962 | max=1.000
+     vol implicita media:   Q=20.94% -> P=18.84%
+
+  DIAGNOSTICO DE ESCALA:
+     sd_ret (semanal, primeros 3):      0.014897 | 0.026949 | 0.020839
+     sd_hist_annual (primeros 3):       0.107424 | 0.194333 | 0.150276
+     iv_final (post Q->P, primeros 3):  0.085201 | 0.172134 | 0.150276
+     iv_spy_implied (MFIV, Q):          0.14938262321238452
+     iv_spy_implied (post Q->P):        0.149383
+
+Construyendo modelo de correlacion de factores (mercado + sector + pais + fx)...
+  OK Sector asignado: 11 de 30 activos | 5 sectores distintos en el pool (VOX, XLF, XLP, XLV, XLY)
+  OK Pais asignado: 2 de 30 activos | 1 paises distintos en el pool (EWC)
+  OK Moneda no-USD con factor FX: 2 de 30 activos | 1 monedas distintas en el pool (CAD)
+     beta_mercado (primeros 3):        0.4481 | -0.0243 | 0.5466
+     beta_sector (primeros 3):          0.0000 | 0.6924 | 0.0000
+     beta_pais (primeros 3):            0.0000 | 0.0000 | 0.0000
+     beta_fx (primeros 3):              0.0000 | 0.0000 | 0.0000
+     factores sector/pais con MFIV (Q->P aplicado): 6 de 6
+     diag(Cov_explained) rango (semanal): 0.000023 - 0.000565
+
+  SHRINKAGE POR ACTIVO (MFIV vs historica, ancla = ratio MFIV/Hist):
+     ratio MFIV/Hist (primeros 3):      0.793 | 0.886 | 1.000
+     lambda_i rango:                    0.020 - 0.350
+     lambda_i promedio (peso historica): 0.108
+     vol_final semanal rango:           1.2785% - 3.1444%
+     varianza explicada por mercado+sector+pais+fx (rango): 0.000023 - 0.000565
+     varianza idiosincratica anadida (rango):       0.000077 - 0.000822
+     activos con varianza idiosincratica en el piso (1e-08): 0 de 30
+     diag(cov_mat) final rango:         0.000163 - 0.000989
+     sqrt(diag(cov_mat)) = vol semanal: 1.2785% - 3.1444%
+
+  Frecuencia covarianza historica: weekly (config: auto; tickers de bolsa no-EE. UU. en el pool: 2)
+  COVARIANZA HISTORICA (EWMA + Ledoit-Wolf, base semanal):
+     observaciones semanales: 367 | t_eff (Kish): 147.8
+     halflife: 52 semanas | delta shrinkage: 0.224 (22% hacia correlacion constante)
+     vol semanal media: muestral=2.781% -> EWMA+LW=2.435%
+
+  BLEND CON COVARIANZA HISTORICA (alpha=0.35):
+     |cov_hist - cov_factor| fuera de diagonal, promedio: 0.000083
+     |cov_hist - cov_factor| fuera de diagonal, max:      0.000296
+     diag(cov_mat) tras blend, rango: 0.000125 - 0.001041
+  Eigenvalue minimo (Sigma final): 0.000064
+  OK cov_mat final (factores implicitos + blend historico EWMA/Ledoit-Wolf): 30 x 30 activos
+  Rango MFIV anualizada: 8.5% - 22.7%
+  Rango beta_mercado: -0.399 - 1.083 | Rango beta_sector: 0.000 - 1.153 | Rango beta_pais: 0.000 - 0.511 | Rango beta_fx: 0.000 - 0.717
+[INFO] Restriccion de participacion ETF activa: 0%-5% del capital invertido
+[INFO] ETFs/commodities en el pool tras filtros previos: 19 de 30 activos
+[INFO] Restriccion de exposicion cambiaria activa: maximo 50% del capital invertido en tickers no-USD
+[INFO] Tickers no-USD en el pool tras filtros previos: 2 de 30 activos
+
+[INFO] Ejecutando optimizacion iterativa - maximo 6 activos...
+[INFO] Poda ETF/FX-aware activa (constraints_feasible v2)
+
+  Panel de co-momentos: 367 semanas x 30 activos
+  Iteracion 1: 23 activos activos | Vol semanal (tail-adj): 1.5618%
+    -> Recortando 20 activos con peso < 1.0%: HYG, XLP, GLD, INDA, XLV, EWU, PPA, EWQ, PPH, IBB, VWO, VGK, EEM, XLU, PEP, MOO, KO, EWJ, IYT, IHI
+  Iteracion 2: 10 activos activos | Vol semanal (tail-adj): 1.5513%
+    -> Eliminando 'TD.TO' (min_weight, MTR=0.002119, peso 4.524%)
+  Iteracion 3: 9 activos activos | Vol semanal (tail-adj): 1.5551%
+    -> Eliminando 'WMT' (min_weight, MTR=0.001591, peso 4.867%)
+  Iteracion 4: 8 activos activos | Vol semanal (tail-adj): 1.5611%
+    -> Eliminando 'PDBC' (min_weight, MTR=0.001302, peso 5.000%)
+  Iteracion 5: 7 activos activos | Vol semanal (tail-adj): 1.6148%
+    -> Eliminando 'COST' (min_weight, MTR=0.002672, peso 7.353%)
+  Iteracion 6: 6 activos activos | Vol semanal (tail-adj): 1.6250%
+
+OK Portafolio final: 6 activos (limite: 6)
+  Activos: BRK-B, JNJ, MCD, RY.TO, PG, VZ
+
+[INFO] Calculando Frontera Eficiente...
+[INFO] Frontera eficiente calculada con 41 puntos (9 objetivos infactibles con las bandas ETF/FX).
+
+  MOMENTOS DEL PORTAFOLIO (co-momentos, medida P):
+     panel: 367 semanas x 6 activos
+     asimetria semanal:          -1.0520   (atajo Q anterior: -1.0217)
+     exceso de curtosis semanal: +6.1354   (atajo Q anterior: +16.7512)
+     al horizonte (4.3 sem, iid): asimetria -0.5054 | exceso de curtosis +1.4159
+
+[INFO] Generando visualizaciones...
+
+=================================================================
+PORTAFOLIO OPTIMO - MINIMO RIESGO DE COLA (BKM + CORNISH-FISHER)
+=================================================================
+    Entrenado con : 367 semanas (2018-01-01 -> 2026-10-06)
+    Horizonte     : 1 mes desde 2026-10-06 (~4.3 semanas)
+    RF horizonte  : 0.3917%
+
+  Ticker        Peso
+  ----------------------------------------------------
+  BRK-B      21.03%   ###########
+  PG         18.58%   #########
+  VZ         17.09%   #########
+  MCD        14.85%   #######
+  JNJ        14.73%   #######
+  RY.TO      13.71%   #######
+  ----------------------------------------------------
+  TOTAL     100.00%
+
+  Activos en portafolio : 6
+  Peso maximo           : 21.03% (BRK-B)
+  Concentracion top 3   : 56.70%
+  Internacionales en el universo: 15 | en la optimizacion: 2 | con peso > 0: 1
+  RY.TO 13.7%
+  Exposicion cambiaria  : 13.71% (limite: 50%)
+  VaR Cornish-Fisher (95%, horizonte):  -5.1622%
+  CVaR Cornish-Fisher (95%, horizonte): -7.4167%
+=================================================================
+
+ATRIBUCION DE RIESGO SINTETICA (GRIEGAS BSM) - DIAGNOSTICO
+=================================================================
+  Ticker      Peso    Delta    Gamma/$   Vega/$   Theta/$
+  ----------------------------------------------------------
+  BRK-B     21.03%    0.546   0.000038 0.001144 -0.000337
+  PG        18.58%    0.538   0.000294 0.001147 -0.000466
+  VZ        17.09%    0.537   0.002940 0.001147 -0.000483
+  MCD       14.85%    0.536   0.000096 0.001147 -0.000567
+  JNJ       14.73%    0.535   0.000077 0.001147 -0.000585
+  RY.TO     13.71%    0.538   0.000087 0.001146 -0.000450
+  ----------------------------------------------------------
+  PORTF.              0.539   0.000602 0.001146 -0.000472
+
+  Gamma/Vega/Theta normalizadas por precio del subyacente (por $1 de
+  exposicion, no por accion) para ser comparables entre tickers.
+  Vega por 1% de cambio en IV | Theta por dia | Delta sin normalizar (adimensional)
+=================================================================
+
+ATRIBUCION DE RIESGO DE COLA (BKM) - DIAGNOSTICO
+=================================================================
+  MFIS/MFIK son momentos bajo la medida Q: incluyen aversion al riesgo de
+  cola, no solo riesgo. Se reportan como DIAGNOSTICO; ya no se suman a la
+  diagonal de Sigma. El riesgo de cola del portafolio se mide abajo con
+  los co-momentos del panel empirico (medida P).
+-----------------------------------------------------------------
+  Ticker      Peso   MFIS (Q)   MFIK (Q)
+  ----------------------------------------
+  BRK-B     21.03%     -2.969     55.063
+  PG        18.58%     -0.722      5.377
+  VZ        17.09%     -0.417     11.240
+  MCD       14.85%      0.353      7.171
+  JNJ       14.73%     -0.706     10.030
+  RY.TO     13.71%        N/D        N/D
+  ----------------------------------------
+  Asimetria del portafolio (P, co-momentos, semanal): -1.0520  -> horizonte: -0.5054
+  Exceso de curtosis del portafolio (P, semanal):     +6.1354  -> horizonte: +1.4159
+  VaR Cornish-Fisher (95%, horizonte):  -5.1622%
+  CVaR Cornish-Fisher (95%, horizonte): -7.4167%
+=================================================================
+
+
+====================================================================
+              METRICAS DEL PORTAFOLIO OPTIMO
+====================================================================
+
+                                   Metrica    Valor
+Retorno Esperado  (1 mes desde 2026-10-06)    0.70%
+Volatilidad       (1 mes desde 2026-10-06)    3.38%
+Sharpe Ratio      (1 mes desde 2026-10-06)    0.092
+Sortino Ratio     (1 mes desde 2026-10-06)    0.067
+           Retorno Esperado  (Anual, ref.)    8.43%
+           Volatilidad       (Anual, ref.)   11.72%
+           Sharpe Ratio      (Anual, ref.)    0.318
+           Sortino Ratio     (Anual, ref.)    0.232
+                          Maximum Drawdown  -23.23%
+                     Retorno Semanal (raw)    0.16%
+                 Volatilidad Semanal (raw)    1.63%
+                      Sharpe Semanal (raw)    0.044
+       VaR Cornish-Fisher (95%, horizonte) -5.1622%
+      CVaR Cornish-Fisher (95%, horizonte) -7.4167%
+                      Peso Total Invertido  100.00%
+                      Posicion en Efectivo   -0.00%
+                      Exposicion Cambiaria   13.71%
+
+=================================================================
+RESUMEN EJECUTIVO - HORIZONTE: 1 MES DESDE 2026-10-06
+=================================================================
+
+   BRK-B     21.03%
+   PG        18.58%
+   VZ        17.09%
+   MCD       14.85%
+   JNJ       14.73%
+   RY.TO     13.71%
+
+   -- Metricas del horizonte (1 mes desde 2026-10-06) --
+   Retorno esperado  : 0.70%
+   Volatilidad       : 3.38%
+   Sharpe Ratio      : 0.092
+   Sortino Ratio     : 0.067
+   VaR Cornish-Fisher (95%)  : -5.1622%
+   CVaR Cornish-Fisher (95%) : -7.4167%
+
+   -- Referencia anual --
+   Retorno esperado  : 8.43%
+   Volatilidad       : 11.72%
+   Sharpe Ratio      : 0.318
+   Sortino Ratio     : 0.232
+=================================================================
+
+=================================================================
+COBERTURA BKM (momentos implicitos vs fallback historico)
+=================================================================
+
+  Portafolio final: 5 con BKM completo | 1 con fallback historico
+       1  sin_opciones_en_polygon
+  Ticker MFIV MFIS_MFIK DTE                                         Motivo
+   BRK-B   OK        OK  31                                   BKM completo
+      PG   OK        OK  31                                   BKM completo
+      VZ   OK        OK  31                                   BKM completo
+     MCD   OK        OK  31                                   BKM completo
+     JNJ   OK        OK  31                                   BKM completo
+   RY.TO    -         -   - sin_opciones_en_polygon (no cotiza en EE. UU.)
+
+  Resto de tickers consultados (44): 39 con BKM completo | 5 con fallback historico
+       2  momentos_inadmisibles
+       1  pocas_opciones_otm
+       1  sin_opciones_en_polygon
+       1  sin_cadena_en_ventana_dte
+=================================================================
+
+Diagnostico de llamadas a Polygon:
+  Llamadas HTTP a Polygon: 171 (limitador: 100/min) | respuestas desde cache: 0
+     status 200: 171
+
+Script completado con exito!
+ADVERTENCIA: no se pudo crear el directorio de portafolio /workspace/pipeline/portfolio ([Errno 30] Read-only file system: '/workspace'). La corrida continua sin exportar JSON.
+EXIT_CODE=0
+
+
+################################################################################
+# SALIDA COMPLETA DE: quadratic_utility.py
+################################################################################
+
+Perfil de riesgo: agresivo
+
+============================================================
+FECHA DE REFERENCIA (as_of_date): 2026-10-06 | HORIZONTE DE INVERSION: 2 mes(es)
+ENTRENAMIENTO: todo el historico mensual disponible (sin restriccion de ventana)
+============================================================
+
+Obteniendo tickers del S&P 500...
+S&P 500: 90 tickers objetivo, 90 unicos obtenidos (ordenados por market cap real, stockanalysis.com); constituyentes conocidos 504, con cap 504
+
+Obteniendo tickers del NASDAQ...
+NASDAQ: 90 tickers objetivo, 90 unicos obtenidos
+
+Internacionales: top 50 de 67 por market cap (USD):
+       Ticker MarketCap_USD Moneda  Region
+  1      HSBC       333.9 B    USD      US
+  2     RY.TO       272.1 B    CAD  Canada
+  3    8306.T       261.4 B    JPY   Japon
+  4     AZN.L       246.2 B    GBP  Europa
+  5    SIE.DE       240.6 B    EUR  Europa
+  6    9984.T       226.9 B    JPY   Japon
+  7     OR.PA       224.2 B    EUR  Europa
+  8    7203.T       219.5 B    JPY   Japon
+  9     MC.PA       214.1 B    EUR  Europa
+  10  SHOP.TO       211.7 B    CAD  Canada
+  11   SAN.MC       204.2 B    EUR  Europa
+  12    TD.TO       193.2 B    CAD  Canada
+  13   ITX.MC       188.9 B    EUR  Europa
+  14   TTE.PA       188.3 B    EUR  Europa
+  15   ALV.DE       179.8 B    EUR  Europa
+  16    SU.PA       165.3 B    EUR  Europa
+  17   8316.T       164.5 B    JPY   Japon
+  18   6501.T       159.9 B    JPY   Japon
+  19   IBE.MC       157.8 B    EUR  Europa
+  20    RIO.L       154.7 B    GBP  Europa
+  21   SAF.PA       153.8 B    EUR  Europa
+  22   RMS.PA       151.3 B    EUR  Europa
+  23  BBVA.MC       150.4 B    EUR  Europa
+  24   6098.T       149.1 B    JPY   Japon
+  25   DTE.DE       142.3 B    EUR  Europa
+  26   6758.T       139.2 B    JPY   Japon
+  27   ULVR.L       130.6 B    GBP  Europa
+  28   6861.T       125.0 B    JPY   Japon
+  29    AI.PA       121.6 B    EUR  Europa
+  30   BNP.PA       117.4 B    EUR  Europa
+  31       BP       115.9 B    USD      US
+  32   BATS.L       114.2 B    GBP  Europa
+  33   BNS.TO       110.0 B    CAD  Canada
+  34   ENB.TO       103.9 B    CAD  Canada
+  35    CS.PA       100.7 B    EUR  Europa
+  36   CNQ.TO        99.4 B    CAD  Canada
+  37   SAN.PA        95.3 B    EUR  Europa
+  38   IFX.DE        94.7 B    EUR  Europa
+  39   AEM.TO        94.3 B    CAD  Canada
+  40    GSK.L        93.9 B    GBP  Europa
+  41   GLEN.L        89.3 B    GBP  Europa
+  42   8031.T        89.2 B    JPY   Japon
+  43   9432.T        87.1 B    JPY   Japon
+  44    BN.TO        83.3 B    CAD  Canada
+  45    SU.TO        80.7 B    CAD  Canada
+  46     NG.L        76.8 B    GBP  Europa
+  47    CP.TO        75.1 B    CAD  Canada
+  48   4063.T        72.6 B    JPY   Japon
+  49  MUV2.DE        72.6 B    EUR  Europa
+  50   DHL.DE        70.2 B    EUR  Europa
+
+Combinando y limpiando tickers...
+Total tickers FINAL (unicos): 280 | internacionales en el universo: 50 de 50
+Descargando pares FX (mensual) para conversion a USD...
+   OK Pares FX mensuales disponibles: CAD, EUR, GBP, JPY
+Descargando datos de precios MENSUALES...
+   Descargados 25/280 tickers...
+   Descargados 50/280 tickers...
+   Descargados 75/280 tickers...
+   Descargados 100/280 tickers...
+   Descargados 125/280 tickers...
+   Descargados 150/280 tickers...
+   Descargados 175/280 tickers...
+   Descargados 200/280 tickers...
+   Descargados 225/280 tickers...
+   Descargados 250/280 tickers...
+   Descargados 275/280 tickers...
+   Descargados 280/280 tickers...
+   OK Tickers convertidos a USD en esta descarga: 48
+Meses disponibles en entrenamiento: 152
+Tickers con al menos 1 observacion: 280
+Procesando benchmark (SPY)...
+   Descargados 1/1 tickers...
+Descargando retornos DIARIOS recientes para filtro de volatilidad reciente (ventana=13 semanas, ancladas a 2026-10-06)...
+   Descargados 25/280 tickers...
+   Descargados 50/280 tickers...
+   Descargados 75/280 tickers...
+   Descargados 100/280 tickers...
+   Descargados 125/280 tickers...
+   Descargados 150/280 tickers...
+   Descargados 175/280 tickers...
+   Descargados 200/280 tickers...
+   Descargados 225/280 tickers...
+   Descargados 250/280 tickers...
+   Descargados 275/280 tickers...
+   Descargados 280/280 tickers...
+   OK Tickers convertidos a USD en esta descarga: 48
+Tickers con volatilidad reciente calculable: 280
+Tickers totales: 274 | Obs mediana: 152 | Ideal: 98.5% | Minimo: 100.0%
+Descargando datos Fama-French...
+Betas calculados para 277 activos
+Retorno esperado (k=140): 274 de 274 activos encogidos hacia FF3 | peso de la historica 0.18-0.52
+   Dispersion de mu entre activos (anual): historica 14.8% -> encogida 7.5%
+combined_stats creado: 274 activos
+   QUBO: pool=192, seleccionar=45, combinaciones=1.718e+44
+   Combinaciones exceden el umbral - resolviendo via Simulated Annealing (20000 iteraciones)
+   SA completado - energia inicial=78.5940 | mejor energia=33.4906
+
+Top 10 activos seleccionados (via QUBO):
+symbol  sharpe_ratio_adjusted  sd_return  avg_cor  n_obs  h_score
+  AVGO               0.222180   0.096423 0.268860    152 0.658855
+  KLAC               0.196645   0.104853 0.324846    152 0.573176
+  MPWR               0.194113   0.102125 0.302450    152 0.564679
+  ANET               0.188566   0.116694 0.258717    147 0.546068
+  FTNT               0.171714   0.109139 0.223569    152 0.489521
+   LLY               0.169290   0.075520 0.124592    152 0.481387
+  PANW               0.168548   0.111831 0.249407    152 0.478898
+  ORLY               0.163414   0.065633 0.269747    152 0.461670
+  META               0.158404   0.096532 0.271014    152 0.444861
+6098.T               0.147232   0.105877 0.321874    143 0.407374
+
+Pool pre-filtro: 45 candidatos
+
+Tenor de opciones objetivo (Polygon): 60 dias (horizonte=2m, tope universal=90d)
+
+Consultando datos de mercado (Polygon) para tickers estadounidenses...
+  Tickers US: 37 | Tickers internacionales (sin cobertura Polygon): 8
+   Polygon IV: 10/37
+   Polygon IV: 20/37
+   Polygon IV: 30/37
+   Polygon IV: 37/37
+  Datos de opciones obtenidos: 37 de 37 tickers US
+  Clasificando sector de 32 acciones US (Polygon SIC)...
+   Sector: 10/32
+   Sector: 20/32
+   Sector: 30/32
+   Sector: 32/32
+  Sector identificado (Polygon SIC, US): 26 de 32 acciones
+  Sector identificado (mapeo manual, internacionales): 8 de 8 acciones
+  Diagnostico de llamadas a Polygon:
+     Llamadas HTTP a Polygon: 38 (limitador: 100/min) | respuestas desde cache: 31
+        status 200: 38
+
+Aplicando filtro Delta (delta_min=0.15, modo=otm, T=0.167 anios)...
+   Metrica: colchon = delta(K=S) - delta(K OTM). Alto si la vol es baja.
+   IV: Polygon si hay cadena US; si no, vol historica (internacionales incluidos).
+   Log-moneyness OTM efectiva: 0.0800 (base 0.0800 a 2 meses)
+  Deltas de mercado real (Polygon): 0 | Deltas via formula BS (modo 'otm'): 45
+  Deltas calculados: 45 | Sin datos (se conservan): 0
+  Descartados (delta < 0.15): 7
+  Superan el filtro (delta >= 0.15): 38
+
+Activos descartados por Delta insuficiente:
+Symbol Delta IV_anual            Fuente
+  KLAC 0.133    58.6% bs_otm_polygon_iv
+   GLW 0.134    57.9% bs_otm_polygon_iv
+  ORCL 0.139    55.8% bs_otm_polygon_iv
+  PANW 0.142    54.8% bs_otm_polygon_iv
+  MPWR 0.143    54.4% bs_otm_polygon_iv
+   NOW 0.145    53.6% bs_otm_polygon_iv
+  FTNT 0.150    51.9% bs_otm_polygon_iv
+
+Tras filtro Delta: 38 tickers disponibles para los siguientes filtros
+
+Aplicando filtro de volatilidad reciente (ventana=13 semanas, ratio max=1.80x)...
+Candidatos previos (post-Delta): 38 | Con ratio de vol. reciente calculable: 38
+Descartados por umbral (ratio > 1.80x): 0 | Superan el filtro: 38
+Pool post-umbral (38) supera el techo n_filter_candidates (30) - recortando por ratio ascendente
+Symbol Vol_Reciente_Anual Vol_General_Anual Ratio Sharpe  Obs_Mensuales
+IBE.MC             12.41%            20.18% 0.62x  0.143            152
+   NEE             14.58%            20.52% 0.71x  0.107            152
+  SCHW             22.49%            29.81% 0.75x  0.106            152
+   FXI             17.89%            23.68% 0.76x  0.041            152
+   UNH             21.42%            26.69% 0.80x  0.114            152
+  ABBV             21.19%            24.63% 0.86x  0.137            152
+   AEP             16.25%            18.51% 0.88x  0.102            152
+  VRTX             26.70%            30.16% 0.89x  0.109            152
+TTE.PA             22.40%            24.84% 0.90x  0.080            152
+ SU.TO             30.47%            32.87% 0.93x  0.090            152
+  REGN             30.15%            32.09% 0.94x  0.052            152
+  GILD             25.03%            24.38% 1.03x  0.068            152
+    PG             17.32%            16.05% 1.08x  0.102            152
+   LLY             28.84%            26.16% 1.10x  0.169            152
+  NTES             39.12%            34.76% 1.13x  0.124            152
+    BP             29.92%            26.47% 1.13x  0.057            152
+  QCOM             45.59%            39.95% 1.14x  0.115            152
+  ORLY             26.16%            22.74% 1.15x  0.163            152
+     T             24.58%            21.24% 1.16x  0.073            152
+   CME             22.83%            19.64% 1.16x  0.117            152
+  AVGO             39.53%            33.40% 1.18x  0.222            152
+  ANET             49.70%            40.42% 1.23x  0.189            147
+   GDX             47.05%            38.22% 1.23x  0.085            152
+  PDBC             21.39%            17.37% 1.23x  0.058            142
+  ABNB             48.80%            38.57% 1.27x  0.055             69
+9432.T             21.41%            16.91% 1.27x  0.059            152
+   SLV             38.04%            29.34% 1.30x  0.078            152
+8316.T             31.92%            23.84% 1.34x  0.114            152
+7203.T             29.35%            21.04% 1.39x  0.082            152
+   DHR             38.38%            27.11% 1.42x  0.127            152
+
+Conjunto tras filtro de volatilidad reciente: 30 tickers
+
+Aplicando filtro de IV vs volatilidad reciente (DTE=60d, ratio max=1.80x)...
+  Candidatos con IV de mercado evaluable: 24 de 30
+  Descartados por IV anomala respecto a vol. reciente (ratio > 1.80x): 0
+
+Conjunto tras filtro de IV vs volatilidad reciente: 30 tickers
+
+
+Aplicando filtro MFIS (Bakshi-Kapadia-Madan) (z_threshold=2.00, lookback=12 meses)...
+   Fechas de muestreo historico: 25 (freq=2W, ancladas a 2020-01-05)
+   Cola MFIS: upper | umbral |z|=2.00 (upper=demanda de calls, lower=demanda de puts)
+   Cache historica clave v3 en /Users/isaac17/.cache/am-pm/polygon
+   Presupuesto: 60 min a 100 llamadas/min | ~26 contratos/fecha | 12 hilos
+   [Ronda 1] 30 activo(s) en el orden de candidatos...
+   Momento BKM actual de 24 ticker(s) de EE. UU. (12 en paralelo)...
+      EE. UU. con MFIS finito: 23 | historia completa: 23 | sin presupuesto: 0 | fechas pendientes de los que entran: 25 | llamadas de historia de esta ronda: ~675
+   Precios spot sin ajustar de 1 ticker(s), una descarga (2025-09-06 a 2026-10-06)...
+   Sin precio historico tras reintentos: 0
+      ... 10/23
+      ... 20/23
+      ... 23/23
+
+   Procesados con z-score: 23 | No procesados por presupuesto: 0 | Descartados por MFIS: 0 | Repuestos: 0 | Tiempo real: 215.8 s | clave v3
+
+   COBERTURA BKM POR TICKER (A-1)
+        23  dentro_de_banda
+         6  sin_opciones_us
+         1  pocas_opciones_otm
+symbol decision             motivo  dte         z
+IBE.MC mantener    sin_opciones_us  NaN       NaN
+TTE.PA mantener    sin_opciones_us  NaN       NaN
+ SU.TO mantener    sin_opciones_us  NaN       NaN
+  PDBC mantener pocas_opciones_otm 73.0       NaN
+9432.T mantener    sin_opciones_us  NaN       NaN
+8316.T mantener    sin_opciones_us  NaN       NaN
+7203.T mantener    sin_opciones_us  NaN       NaN
+   NEE mantener    dentro_de_banda 73.0 -0.234772
+  SCHW mantener    dentro_de_banda 73.0  1.077637
+   FXI mantener    dentro_de_banda 73.0  0.127300
+   UNH mantener    dentro_de_banda 73.0  1.260699
+  ABBV mantener    dentro_de_banda 73.0  1.828625
+   AEP mantener    dentro_de_banda 73.0  0.146061
+  VRTX mantener    dentro_de_banda 73.0 -0.386924
+  REGN mantener    dentro_de_banda 73.0  0.217520
+  GILD mantener    dentro_de_banda 73.0  1.599126
+    PG mantener    dentro_de_banda 73.0  0.322151
+   LLY mantener    dentro_de_banda 73.0  0.294393
+  NTES mantener    dentro_de_banda 73.0 -1.151529
+    BP mantener    dentro_de_banda 73.0  0.516406
+  QCOM mantener    dentro_de_banda 73.0  0.940745
+  ORLY mantener    dentro_de_banda 73.0 -1.411408
+     T mantener    dentro_de_banda 73.0  1.518695
+   CME mantener    dentro_de_banda 73.0  0.594895
+  AVGO mantener    dentro_de_banda 73.0  0.480791
+  ANET mantener    dentro_de_banda 73.0 -0.304996
+   GDX mantener    dentro_de_banda 73.0  0.216504
+  ABNB mantener    dentro_de_banda 73.0  0.084314
+   SLV mantener    dentro_de_banda 73.0 -0.256842
+   DHR mantener    dentro_de_banda 73.0  1.450062
+
+Conjunto FINAL tras filtro BKM (MFIS): 30 tickers
+
+Matriz de retornos: 152 fechas x 30 activos | historia por ticker 69-152 meses | interseccion 69 meses (no se usa para la media)
+   mu del optimizador: historica encogida hacia FF3 (k=140) | peso medio de la historica en los finalistas: 0.51
+
+Estimando covarianza robusta: Shrinkage MFIV (BKM) + Historica...
+   Tenor objetivo: 60 dias (consistente con horizonte de inversion, tope universal=90d) | Cap IV: 6.0x vol historica
+   La vol anual de MFIV usa el DTE real del vencimiento elegido, no target_dte/365. T_bkm queda solo para el camino SVIX.
+   MFIV (BKM) validas: 23 | Sin datos (fallback historico): 7
+   CORRECCION Q -> P (prima de riesgo de varianza):
+      ratio sigma_P/sigma_Q: min=0.712 | mediana=0.924 | max=1.000
+      vol media: Q=29.3% -> P=26.5%
+   IV final - Min: 16.1% | Mediana: 25.5% | Max: 40.4%
+   Calculando IV Percentile Rank...
+   IV Rank - Min: 0.52 | Mediana: 0.66 | Max: 0.83
+   Alpha por activo - Pleno (>0.20): 22 | Minimo (0.20): 8 (sin MFIV real o MFIV extrema)
+   Alpha shrinkage global (promedio): 0.512 (51% implied / 49% historica)
+
+   Descargando retornos DIARIOS de los finalistas para la covarianza...
+   Descargados 25/31 tickers...
+   Descargados 31/31 tickers...
+   OK Tickers convertidos a USD en esta descarga: 6
+   Alineacion diaria (ffill<=2, calendario=SPY): 2973 dias, rellenos=616, baja cobertura=['ABNB']
+   Retornos diarios alineados: 2972 dias x 29 activos
+   COVARIANZA MIXTA: la historia corta no descarta el EWMA diario.
+      fuera de la diaria: ['ABNB']
+      obs diarias: 2972 | t_eff (Kish): 346.2 | delta shrinkage: 0.134
+      vol anual media (nombres con diaria): mensual=26.3% -> diaria+EWMA=30.9%
+   Cesta de dispersion (M-10): cap | 18 componentes de SPY con MFIV
+   Quedan fuera ETFs, internacionales y nombres sin MFIV (12 de 30).
+   Cobertura de la cesta: cap_share=7.7% de la cap conocida | n_caps=504
+   Cobertura bajo el minimo (40% y 50 caps): se usa la correlacion realizada.
+   Correlacion promedio (fallback a la realizada, piso 0): 0.0700
+   Calculando correlacion implicita por sector (MFIV de ETFs sectoriales)...
+      XLK  : 2 acciones, bajo el minimo 4; se usa la correlacion global
+      XLV  : rho Q = 0.1654 -> rho P = 0.1654 (realizada 0.2663, 6 acciones)
+      XLF  : 2 acciones, bajo el minimo 4; se usa la correlacion global
+      XLE  : 2 acciones, bajo el minimo 4; se usa la correlacion global
+      XLY  : 2 acciones, bajo el minimo 4; se usa la correlacion global
+      XLP  : 1 acciones, bajo el minimo 4; se usa la correlacion global
+      XLI  : 1 acciones, bajo el minimo 4; se usa la correlacion global
+      XLB  : 0 acciones, bajo el minimo 4; se usa la correlacion global
+      XLU  : 3 acciones, bajo el minimo 4; se usa la correlacion global
+      XLRE : 0 acciones, bajo el minimo 4; se usa la correlacion global
+      XLC  : 2 acciones, bajo el minimo 4; se usa la correlacion global
+      VOX  : 1 acciones, bajo el minimo 4; se usa la correlacion global
+   Correlacion sectorial calculada para 1 de 12 sectores
+
+   Volatilidades anualizadas (promedio):
+      Implied (MFIV): 26.5%
+      Historica:      31.1%
+      Blend:          28.8% (a_global=0.51)
+   Eigenvalue minimo (Sigma blend): 0.001472
+   cov_mat blend construida: 30 x 30 activos
+   Rango MFIV anualizada (post-cap): 16.1% - 40.4%
+   Rango correlaciones implicitas (off-diagonal R_implied): -0.181 - 0.661
+
+Ejecutando optimizacion cuadratica (quadprog) con lambda=1.50...
+   Grupos geograficos - CA: 1 | EU: 2 | JP: 3 | US/ETF: 24
+   Delta: solo filtro de elegibilidad, no multiplica a mu
+   Penalizacion de cola sobre mu: ELIMINADA (MFIS/MFIK son momentos Q sin calibrar)
+   Restriccion ETFs: 0% - 20% del portafolio (objetivo 10% +/- 10%)
+   Restriccion Canada: max 80% del portafolio
+   Restriccion Europa: max 80% del portafolio
+   Restriccion Japon: max 80% del portafolio
+  Optimizacion completada
+  Activos con peso > 1%: 5
+  Peso maximo: 30.00% (ANET)
+  Peso en ETF/commodities: 0.00% (banda 0%-20%)
+
+  Top activos - retorno esperado y diagnosticos de opciones (delta = colchon del filtro):
+  Ticker       Peso%       mu%     delta      MFIS      MFIK   mu_final%
+  --------------------------------------------------------------------
+  ANET        30.00%    2.592%    0.157    -0.145     3.127      2.592%
+  AVGO        30.00%    2.534%    0.182    -0.055     3.325      2.534%
+  LLY         23.01%    1.670%    0.206    -0.137     3.270      1.670%
+  ORLY         8.73%    1.464%    0.250    -1.325     8.277      1.464%
+  NTES         8.26%    1.632%    0.211    -0.674     4.671      1.632%
+  GDX          0.00%    1.329%    0.191     0.009     3.231      1.329%
+  PG           0.00%    0.862%    0.352    -1.018     9.174      0.862%
+  GILD         0.00%    0.871%    0.238    -0.336     4.539      0.871%
+  DHR          0.00%    1.384%    0.213    -0.132     4.738      1.384%
+  VRTX         0.00%    1.341%    0.248    -0.606     5.862      1.341%
+  Peso Canada: 0.0%
+  Peso Europa: 0.0%
+  Peso Japon: 0.0%
+  Internacionales en el universo: 50 | en la optimizacion: 7 | con peso > 0: 0
+  Ningun internacional tiene peso. No hay piso de asignacion internacional.
+  Terminos en el optimo (mu que ve el optimizador, no el mu crudo del reporte):
+    mu'w = 0.021847 | lambda/2 w'Sigma w = 0.003082 | penalizacion/retorno = 0.141
+   Panel conjunto de co-momentos: 69 meses (interseccion). Historia por ticker: min 69 / mediana 152. La media y la covarianza no usan esta interseccion.
+
+   MOMENTOS DEL PORTAFOLIO (co-momentos, medida P):
+      asimetria:          +0.2041   (atajo Q anterior: -0.2631)
+      exceso de curtosis: +0.0661   (atajo Q anterior: +0.7964)
+  Tracking error: 152 meses alineados al benchmark (interseccion completa de tickers: 69; un faltante ya no borra el mes).
+
+============================================================
+PORTAFOLIO OPTIMO - PONDERACIONES FINALES
+============================================================
+    Entrenado con: 2014-2026 (retornos mensuales)
+    Horizonte: 2 mes(es) desde 2026-10-06 | lambda = 1.50
+
+  Ticker        Peso
+  --------------------------------------------------
+  ANET       30.00%  ###############
+  AVGO       30.00%  ###############
+  LLY        23.01%  ############
+  ORLY        8.73%  ####
+  NTES        8.26%  ####
+  --------------------------------------------------
+  TOTAL     100.00%
+
+  Activos en portafolio: 5
+  Peso maximo: 30.00% (ANET)
+  Concentracion top 5: 100.00%
+============================================================
+
+
+=== METRICAS DEL PORTAFOLIO (2014-2026, base mensual) ===
+  Horizonte: 2 mes(es) desde 2026-10-06
+  Lambda: 1.50
+  Retorno Esperado mensual: 2.1847%
+  Volatilidad mensual:      6.4108%
+  Sharpe Ratio (mensual):   0.2797
+  Sortino Ratio (mensual):  0.3214
+  Utilidad Cuadratica:      0.018765
+  VaR (95%, Normal):        -8.3602%
+  CVaR (95%, Historico):    -10.2350%
+  VaR Cornish-Fisher (95%): -7.9755%
+  CVaR Cornish-Fisher (95%): -10.2953%
+  Tracking Error:           4.7017%
+  Relative VaR (95%):      -5.9874%
+
+=== METRICAS ANUALIZADAS (retorno x12, vol x sqrt(12); base mensual) ===
+  Retorno anual:     26.22%
+  Volatilidad anual: 22.21%
+
+=== ATRIBUCION DE RIESGO POR GRIEGAS (BLACK-SCHOLES) ===
+  Colchon delta OTM ponderado: 0.1884
+  Vega de portafolio:  0.8226  (sobre 100.0% del peso con datos de opciones)
+  Gamma de portafolio: 0.009491 (sobre 100.0% del peso con datos de opciones)
+
+  Griegas por activo (peso > 1%):
+Symbol   Peso Delta   Gamma  Vega
+  ANET 30.00% 0.527 0.00846 0.383
+  AVGO 30.00% 0.481 0.00561 0.677
+   LLY 23.01% 0.503 0.00209 2.061
+  ORLY  8.73% 0.554 0.03515 0.149
+  NTES  8.26% 0.518 0.02085 0.210
+
+Generando frontera eficiente restringida (barrido de lambda)...
+  61 puntos. El optimo (λ=1.50) es uno de ellos: σ=0.0641, w'μ_final=0.0218.
+
+======================================================================
+ANALISIS COMPARATIVO: Portafolios por nivel de lambda
+======================================================================
+
+Cada portafolio se resuelve con su lambda, pero la utilidad se mide con el lambda configurado (1.50) y con w'μ_final. El libro no cambia.
+  Optimizando lambda=0.50... solucion factible
+  Optimizando lambda=1.00... solucion factible
+  Optimizando lambda=1.50... solucion factible
+  Optimizando lambda=2.00... solucion factible
+  Optimizando lambda=2.50... solucion factible
+  Optimizando lambda=3.00... solucion factible
+  Optimizando lambda=4.00... solucion factible
+  Optimizando lambda=5.00... solucion factible
+  Optimizando lambda=7.50... solucion factible
+  Optimizando lambda=10.00... solucion factible
+    λ=0.50 | R(μ_final)=2.20% | σ=6.69% | U(λ=1.50)=0.0187
+    λ=1.00 | R(μ_final)=2.20% | σ=6.63% | U(λ=1.50)=0.0187
+    λ=1.50 | R(μ_final)=2.18% | σ=6.41% | U(λ=1.50)=0.0188
+    λ=2.00 | R(μ_final)=2.16% | σ=6.20% | U(λ=1.50)=0.0187
+    λ=2.50 | R(μ_final)=2.10% | σ=5.72% | U(λ=1.50)=0.0185
+    λ=3.00 | R(μ_final)=2.03% | σ=5.28% | U(λ=1.50)=0.0182
+    λ=4.00 | R(μ_final)=1.88% | σ=4.36% | U(λ=1.50)=0.0173
+    λ=5.00 | R(μ_final)=1.78% | σ=3.81% | U(λ=1.50)=0.0167
+    λ=7.50 | R(μ_final)=1.64% | σ=3.17% | U(λ=1.50)=0.0157
+    λ=10.00 | R(μ_final)=1.57% | σ=2.89% | U(λ=1.50)=0.0151
+
+======================================================================
+RESULTADOS COMPARATIVOS
+======================================================================
+
+pen_ret = (λ/2 w'Σw) / w'μ_final con el λ de cada fila: cuanto pesa el riesgo frente al
+retorno en el objetivo. ~0 = casi solo maximiza retorno; ~1 = la penalizacion iguala al retorno.
+
+ lambda_ retorno volatilidad sharpe pen_ret  n_activos max_peso utilidad
+     0.5  2.2047      6.6943 0.2708  0.0508          5  30.0000   0.0187
+     1.0  2.2015      6.6266 0.2731  0.0997          4  30.0000   0.0187
+     1.5  2.1847      6.4108 0.2797  0.1411          5  30.0000   0.0188
+     2.0  2.1600      6.1999 0.2852  0.1780          5  30.0000   0.0187
+     2.5  2.0964      5.7228 0.2979  0.1953          6  30.0000   0.0185
+     3.0  2.0304      5.2846 0.3101  0.2063          7  27.9178   0.0182
+     4.0  1.8767      4.3586 0.3407  0.2025         10  23.0490   0.0173
+     5.0  1.7773      3.8116 0.3635  0.2044         12  19.8163   0.0167
+     7.5  1.6436      3.1735 0.3945  0.2298         13  15.7081   0.0157
+    10.0  1.5686      2.8861 0.4078  0.2655         15  17.2510   0.0151
+
+  λ configurado (1.50): pen_ret=0.141 | 5 activos | peso maximo 30.0%
+
+======================================================================
+COMPARACION AL LAMBDA CONFIGURADO (1.50)
+======================================================================
+
+  Mayor utilidad de la rejilla, medida con λ=1.50 y w'μ_final: 1.50
+  - Retorno w'μ_final (mensual): 2.18% (26.2% anual)
+  - Volatilidad (mensual): 6.41% (22.2% anual)
+  - Sharpe (sobre μ_final): 0.280
+  - Utilidad al λ configurado: 0.0188
+  - Activos en ese candidato: 5
+
+  El portafolio publicado sigue siendo el QP a λ=1.50. Esta tabla no lo reemplaza.
+
+Optimizacion completada exitosamente
+
+
+=== ANALISIS DE MAXIMUM DRAWDOWN DEL PORTAFOLIO ===
+  Datos historicos (diaria): 3204 dias (15913 filas ticker-dia) | 2014-01-03 a 2026-09-30
+
+  MDD Global (2014-2026): -29.92%
+
+=== ESTADISTICAS DE MDD ===
+  Peor escenario historico (sin filtrar): -29.92%
+  Escenario conservador (P10, sin filtrar): -27.38%
+  Escenario tipico (mediana, IQR):  -14.90%
+  Promedio (IQR, 13 de 13 anos): -16.38%
+  Mejor escenario historico (sin filtrar): -7.45%
+  MDD mas reciente (2026): -14.90%
+ Anio     MDD Obs Tickers_Prom
+ 2026 -14.90% 187          5.0
+ 2025 -29.92% 250          5.0
+ 2024 -14.12% 252          5.0
+ 2023  -8.73% 250          5.0
+ 2022 -19.78% 251          5.0
+ 2021 -10.56% 252          5.0
+ 2020 -29.28% 253          5.0
+ 2019 -18.25% 252          5.0
+ 2018 -11.47% 251          5.0
+ 2017  -7.45% 251          5.0
+ 2016 -18.99% 252          5.0
+ 2015 -15.64% 252          5.0
+ 2014 -13.87% 251          4.6
+
+Analisis completado exitosamente!
+
+============================================================
+RESUMEN EJECUTIVO FINAL
+============================================================
+   Periodo de entrenamiento: 2014-2026
+   Horizonte: 2 mes(es) desde 2026-10-06
+   Activos en portafolio: 5
+   Retorno esperado mensual: 2.18%
+   Retorno anualizado:       26.22%
+   Volatilidad mensual:      6.41%
+   Volatilidad anualizada:   22.21%
+   Sharpe Ratio:             0.2797
+   Sortino Ratio:            0.3214
+   VaR Cornish-Fisher (95%): -7.9755%
+   CVaR Cornish-Fisher (95%): -10.2953%
+   MDD tipico historico:     -14.90%
+
+--- PORTAFOLIO A EJECUTAR (horizonte: 2 mes(es) desde 2026-10-06) ---
+
+   ANET      30.00%
+   AVGO      30.00%
+   LLY       23.01%
+   ORLY      8.73%
+   NTES      8.26%
+============================================================
+
+=== CALIDAD DE DATOS EN PORTAFOLIO FINAL ===
+  Activos totales: 5
+  Con datos ideales (>=60 obs): 5 (100.0%)
+  Con penalizacion: 0 (0.0%)
+
+Script completado con exito!
+ADVERTENCIA: no se pudo crear el directorio de portafolio /workspace/pipeline/portfolio ([Errno 30] Read-only file system: '/workspace'). La corrida continua sin exportar JSON.
+EXIT_CODE=0

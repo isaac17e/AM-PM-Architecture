@@ -28,13 +28,8 @@ import market_data as md
 import bl_metrics as bm
 import pipeline_io
 
-try:
-    import statsmodels.api as sm
-    HAY_STATSMODELS = True
-except ImportError:
-    HAY_STATSMODELS = False
-    print("Aviso: statsmodels no disponible. Se usara un estimador HAC interno "
-          "(Newey-West con kernel de Bartlett) para las primas de riesgo.")
+import statsmodels.api as sm
+from statsmodels.stats.moment_helpers import corr2cov, cov2corr
 
 # ==============================================================================
 # BLOQUE 0: PARAMETROS CONFIGURABLES
@@ -426,7 +421,7 @@ precios_semanales, _semana_parcial = md.drop_partial_last_week(
 if _semana_parcial:
     print("  Semana en curso incompleta descartada del resample semanal.")
 
-retornos_sem = np.log(precios_semanales / precios_semanales.shift(1)).dropna(how="all")
+retornos_sem = np.log(precios_semanales).diff().dropna(how="all")
 
 pct_na = retornos_sem.isna().mean()
 tickers_limpios = pct_na[pct_na < 0.05].index.tolist()
@@ -445,7 +440,7 @@ if n < len(TICKERS):
 # ==============================================================================
 Sigma_sem = None
 if USAR_COV_DIARIA:
-    ret_dia_cov = np.log(precios_diarios[tickers] / precios_diarios[tickers].shift(1))
+    ret_dia_cov = np.log(precios_diarios[tickers]).diff()
     ret_dia_cov = ret_dia_cov.replace([np.inf, -np.inf], np.nan).dropna()
     if len(ret_dia_cov) >= 120:
         Sigma_sem_df, cov_info_bl = rk.cov_ewma_shrunk(
@@ -467,8 +462,7 @@ if Sigma_sem is None:
     Sigma_sem = retornos_sem.cov().values
 
 Sigma_hist = Sigma_sem * factor_anualizacion
-D_hist_inv = np.diag(1 / np.sqrt(np.diag(Sigma_hist)))
-Corr_hist = D_hist_inv @ Sigma_hist @ D_hist_inv
+Corr_hist = cov2corr(Sigma_hist)
 Sigma_hist_df = pd.DataFrame(Sigma_hist, index=tickers, columns=tickers)
 mu_historico = retornos_sem.mean().values * factor_anualizacion
 
@@ -672,9 +666,7 @@ if USAR_IV_POLYGON:
     print(pd.Series({t: round(sigma_iv_horizon[t], 4) for t in tickers}))
 
     sigma_iv_horizon_vec = np.array([sigma_iv_horizon[t] for t in tickers])
-    D_IV_horizon = np.diag(sigma_iv_horizon_vec)
-    Sigma_horizon = D_IV_horizon @ Corr_hist @ D_IV_horizon
-    Sigma_horizon = pd.DataFrame(Sigma_horizon, index=tickers, columns=tickers)
+    Sigma_horizon = pd.DataFrame(corr2cov(Corr_hist, sigma_iv_horizon_vec), index=tickers, columns=tickers)
 
 else:
     print("\n=== USAR_IV_POLYGON = False - usando Sigma 100% historica al horizonte ===")
@@ -690,33 +682,20 @@ else:
 # BLOQUE 1C: MODULO BKM - MOMENTOS RISK-NEUTRAL DE ORDEN SUPERIOR
 # ==============================================================================
 
-from scipy.stats import norm
-
 Rf_anual_bkm = Rf
-
-
-def bs_price(S, K, T, r, sigma, tipo="call"):
-    if T <= 0 or sigma <= 0:
-        return max(0.0, (S - K) if tipo == "call" else (K - S))
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    if tipo == "call":
-        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 
 def sigma_desde_ssvi(K, F, T, rho, eta, gamma, theta_tau):
     k = np.log(K / F)
     w = ssvi_w(k, theta_tau, rho, eta, gamma)
-    w = max(w, 1e-8)
+    w = np.maximum(w, 1e-8)
     return np.sqrt(w / T)
 
 
 def otm_price_ssvi(K, S, F, T, r, rho, eta, gamma, theta_tau):
+    """Precio OTM (put bajo S, call desde S) con la IV de la SSVI. K escalar o arreglo."""
     sigma_k = sigma_desde_ssvi(K, F, T, rho, eta, gamma, theta_tau)
-    tipo = "put" if K < S else "call"
-    return bs_price(S, K, T, r, sigma_k, tipo=tipo)
+    return rk.bs_price(S, K, T, r, sigma_k, np.asarray(K) >= S)
 
 
 def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
@@ -726,10 +705,7 @@ def calcular_bkm_moments(S, F, T, r, rho, eta, gamma, theta_tau,
         F, sigma_atm, T, n_std=n_std, k_min=k_min, k_max=k_max)
     strikes = np.linspace(K_min, K_max, n_puntos)
 
-    precios = np.array([
-        otm_price_ssvi(K, S, F, T, r, rho, eta, gamma, theta_tau)
-        for K in strikes
-    ])
+    precios = otm_price_ssvi(strikes, S, F, T, r, rho, eta, gamma, theta_tau)
 
     lnKS = np.log(strikes / S)
 
@@ -862,7 +838,7 @@ print("\n" + "=" * 79)
 print("BLOQUE 1D: AJUSTE ECONOMETRICO Q -> P (VRP / SRP / KRP)")
 print("=" * 79)
 
-retornos_dia = np.log(precios_diarios / precios_diarios.shift(1)).dropna(how="all")
+retornos_dia = np.log(precios_diarios).diff().dropna(how="all")
 retornos_dia = retornos_dia[tickers]
 
 H_VENTANA = horizonte_dias
@@ -927,19 +903,15 @@ def momentos_realizados_rolling(serie_diaria, H=H_VENTANA, paso=PASO_VENTANA_ROL
     if len(r) < H + paso:
         return np.array([]), np.array([]), np.array([])
 
-    rv_l, rs_l, rk_l = [], [], []
-    for fin in range(H, len(r) + 1, paso):
-        w = r[fin - H:fin]
-        rv = float(np.sum(w ** 2))
-        if rv <= 0 or not np.isfinite(rv):
-            continue
-        rs = float(np.sum(w ** 3) / rv ** 1.5)
-        kurt_d = float(H * np.sum(w ** 4) / rv ** 2)
-        rk = 3.0 + (kurt_d - 3.0) / H
-        if not (np.isfinite(rs) and np.isfinite(rk)):
-            continue
-        rv_l.append(rv); rs_l.append(rs); rk_l.append(rk)
-    return np.array(rv_l), np.array(rs_l), np.array(rk_l)
+    # Ventanas de H dias que terminan en H, H + paso, ... (una fila por ventana).
+    w = np.lib.stride_tricks.sliding_window_view(r, H)[::paso]
+    with np.errstate(all="ignore"):
+        rv = (w ** 2).sum(axis=1)
+        rs = (w ** 3).sum(axis=1) / rv ** 1.5
+        kurt_d = H * (w ** 4).sum(axis=1) / rv ** 2
+        rk_ = 3.0 + (kurt_d - 3.0) / H
+    ok = (rv > 0) & np.isfinite(rv) & np.isfinite(rs) & np.isfinite(rk_)
+    return rv[ok], rs[ok], rk_[ok]
 
 
 def winsorizar(x, p=WINSOR_MOMENTOS):
@@ -972,21 +944,9 @@ def media_hac(x):
     if T == 1:
         return float(x[0]), np.nan, 1
 
-    L = _nw_lags(T)
-    if HAY_STATSMODELS:
-        try:
-            mod = sm.OLS(x, np.ones(T)).fit(cov_type="HAC",
-                                            cov_kwds=dict(maxlags=L, use_correction=True))
-            return float(mod.params[0]), float(mod.bse[0]), T
-        except Exception:
-            pass
-
-    mu = float(np.mean(x))
-    e = x - mu
-    S = float(np.dot(e, e) / T)
-    for l in range(1, L + 1):
-        S += 2.0 * (1.0 - l / (L + 1.0)) * float(np.dot(e[l:], e[:-l]) / T)
-    return mu, float(np.sqrt(max(S, 1e-18) / T)), T
+    mod = sm.OLS(x, np.ones(T)).fit(cov_type="HAC",
+                                    cov_kwds=dict(maxlags=_nw_lags(T), use_correction=True))
+    return float(mod.params[0]), float(mod.bse[0]), T
 
 
 filas_roll = []
@@ -1236,25 +1196,11 @@ def mincer_zarnowitz(y, x, se_y, nombre, dominio=None, piso=None):
                     t_b=np.nan, r2=np.nan, modelo="media_ponderada", nombre=nombre)
 
     Xr = np.column_stack([np.ones_like(x), x])
-    if HAY_STATSMODELS:
-        mod = sm.WLS(y, Xr, weights=w).fit(cov_type="HC3")
-        a, b = float(mod.params[0]), float(mod.params[1])
-        se_b = float(mod.bse[1])
-        r2 = float(mod.rsquared)
-        se_media = np.sqrt(np.maximum(
-            np.sum((Xr @ mod.cov_params()) * Xr, axis=1), 0.0))
-    else:
-        W = np.diag(w)
-        XtWX_inv = np.linalg.pinv(Xr.T @ W @ Xr)
-        beta = XtWX_inv @ (Xr.T @ W @ y)
-        a, b = float(beta[0]), float(beta[1])
-        resid = y - Xr @ beta
-        s2 = float(resid @ (w * resid) / max(len(y) - 2, 1))
-        V = s2 * XtWX_inv
-        se_b = float(np.sqrt(max(V[1, 1], 0.0)))
-        sst = float(np.sum(w * (y - np.average(y, weights=w)) ** 2))
-        r2 = 1.0 - float(np.sum(w * resid ** 2)) / max(sst, 1e-18)
-        se_media = np.sqrt(np.maximum(np.sum((Xr @ V) * Xr, axis=1), 0.0))
+    mod = sm.WLS(y, Xr, weights=w).fit(cov_type="HC3")
+    a, b = float(mod.params[0]), float(mod.params[1])
+    se_b = float(mod.bse[1])
+    r2 = float(mod.rsquared)
+    se_media = np.sqrt(np.maximum(np.sum((Xr @ mod.cov_params()) * Xr, axis=1), 0.0))
 
     t_b = b / se_b if se_b > 0 else np.nan
 
@@ -1419,8 +1365,7 @@ se_k4_vec = np.maximum(se_kurt_P * sigma_P_vec ** 4, 1e-14)
 # 1D.4  COVARIANZA BAJO LA MEDIDA FISICA P
 # ==============================================================================
 
-D_P = np.diag(sigma_P_vec)
-Sigma_P = pd.DataFrame(D_P @ Corr_hist @ D_P, index=tickers, columns=tickers)
+Sigma_P = pd.DataFrame(corr2cov(Corr_hist, sigma_P_vec), index=tickers, columns=tickers)
 
 print(f"\n  Sigma_P construida. Vol media Q: {np.mean(np.sqrt(MFIV_vec)):.4f} | "
       f"vol media P: {np.mean(sigma_P_vec):.4f} | "
@@ -1485,8 +1430,7 @@ desc_perfiles = dict(
 Rf_h = Rf * (MESES_HORIZONTE / 12)
 ret_mkt_hist = float(w_mkt @ mu_historico)
 var_mkt_hist = float(w_mkt @ Sigma_hist @ w_mkt)
-D_Q_horizon = np.diag(np.sqrt(np.maximum(MFIV_vec, 0.0)))
-var_mkt_q = float(w_mkt @ (D_Q_horizon @ Corr_hist @ D_Q_horizon) @ w_mkt)
+var_mkt_q = float(w_mkt @ corr2cov(Corr_hist, np.sqrt(np.maximum(MFIV_vec, 0.0))) @ w_mkt)
 var_mkt_p = float(w_mkt @ Sigma_P.values @ w_mkt)
 delta_mkt, delta_info = bm.market_delta(
     DELTA_MKT_MODO,
@@ -1812,7 +1756,7 @@ print(f"\nNorma Frobenius |Sigma_BL - Sigma_P|: "
 # BLOQUE 7: INTEGRACION BAYESIANA NO GAUSSIANA
 # ==============================================================================
 
-from scipy.special import logsumexp
+from scipy.special import eval_hermitenorm, logsumexp
 
 print("\n" + "=" * 79)
 print("BLOQUE 7: POSTERIOR NO GAUSSIANO")
@@ -1963,21 +1907,13 @@ kurt_obj = kurt_P.copy()
 # 7.4  OPCION B: INCLINACION DE GRAM-CHARLIER / EDGEWORTH
 # ==============================================================================
 
-def he3(z):
-    return z ** 3 - 3 * z
-
-
-def he4(z):
-    return z ** 4 - 6 * z ** 2 + 3
-
-
 def gram_charlier_pdf_ratio(z, s, k):
     """g(z)/phi(z) = 1 + (S/6) He_3(z) + ((K-3)/24) He_4(z).
 
     Serie tipo A truncada en el 4.o momento. Puede volverse negativa fuera de
     la region de validez de Barton-Dennis, por lo que se trunca por abajo.
     """
-    return 1.0 + (s / 6.0) * he3(z) + ((k - 3.0) / 24.0) * he4(z)
+    return 1.0 + (s / 6.0) * eval_hermitenorm(3, z) + ((k - 3.0) / 24.0) * eval_hermitenorm(4, z)
 
 
 def posterior_gram_charlier(X, f, mu_obj, var_obj, skew_obj, kurt_obj):
@@ -2109,8 +2045,8 @@ def var_cvar_cornish_fisher(mu, sigma, s, k, alpha):
     colas pesadas): rk.cornish_fisher_tail busca los parametros que reproducen
     esos momentos (Maillard, 2012) y da el cuantil y el ES en forma cerrada.
     """
-    cola = rk.cornish_fisher_tail(1.0 - alpha, s, k - 3.0)
-    return float(-(mu + sigma * cola["q"])), float(-(mu + sigma * cola["es"]))
+    cf = rk.var_cvar_cornish_fisher(mu, sigma, s, k - 3.0, confidence=alpha)
+    return -cf["var"], -cf["cvar"]
 
 
 def calcular_metricas_riesgo_cola(w, retornos_df, nivel_confianza=0.95,
@@ -2700,11 +2636,6 @@ print("\n=== ANALISIS DE MAXIMUM DRAWDOWN DEL PORTAFOLIO ===")
 print(f"Periodo de analisis MDD: desde {MDD_START_YEAR}")
 
 
-def calc_mdd(r):
-    """MDD de log-retornos: riqueza = exp(cumsum) (B-1)."""
-    return bm.mdd_from_log_returns(r)
-
-
 tickers_bl = w_mvsk[w_mvsk > 0].index.tolist()
 weights_bl = w_mvsk[tickers_bl]
 
@@ -2734,7 +2665,7 @@ else:
 
 if precios_mdd is not None and len(precios_mdd) >= 10:
 
-    retornos_diarios_mdd = np.log(precios_mdd / precios_mdd.shift(1)).dropna(how="all")
+    retornos_diarios_mdd = np.log(precios_mdd).diff().dropna(how="all")
 
     def port_ret_row(fila):
         return bm.log_portfolio_return(fila, weights_bl)
@@ -2746,7 +2677,7 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
     print(f"  Observaciones diarias validas: {len(port_ret)}")
     print(f"  Cobertura: {port_ret.index.min():%Y-%m-%d} a {port_ret.index.max():%Y-%m-%d}")
 
-    mdd_global = calc_mdd(port_ret)
+    mdd_global = rk.max_drawdown(port_ret, log_returns=True)   # riqueza = exp(cumsum) (B-1)
     print(f"\n  MDD Global ({MDD_START_YEAR} - hoy): {mdd_global * 100:.2f}%")
 
     years_series = port_ret.index.year
@@ -2755,7 +2686,7 @@ if precios_mdd is not None and len(precios_mdd) >= 10:
     mdd_anual_rows = []
     for y in anios_disponibles:
         r_y = port_ret[years_series == y]
-        mdd_anual_rows.append(dict(year=y, mdd=calc_mdd(r_y), n_obs=len(r_y)))
+        mdd_anual_rows.append(dict(year=y, mdd=rk.max_drawdown(r_y, log_returns=True), n_obs=len(r_y)))
     mdd_anual = pd.DataFrame(mdd_anual_rows)
     mdd_anual = mdd_anual[np.isfinite(mdd_anual["mdd"])]
 
