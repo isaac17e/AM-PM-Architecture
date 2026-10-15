@@ -33,3 +33,8 @@ git diff --quiet "$(python3 -c "import json;print(json.load(open('graphify-out/g
 - Do not commit changes under `graphify-out/` unless explicitly asked.
 - Do not commit `.claude/` (its hooks use absolute paths).
 - Leave pre-existing untracked or modified files (`.DS_Store`, `graphify-out/.Rhistory`, `salidas_*.txt`, ...) alone and never stage them.
+
+# black_litterman.py: horizon and previews mode
+
+- Horizon: `MESES_HORIZONTE` is resolved once in BLOQUE 0 by `pipeline_io.resolve_horizon`: `horizon_months` in `BL_INPUT_FILE` > env `BL_HORIZON_MONTHS` > default 2 (integer 1..12, otherwise `InvalidHorizonError`). Anything derived from it (`MAX_DIAS_VENCIMIENTO`, `BOOTSTRAP_BLOQUE`, `horizonte_dias`, `factor_anualizacion`, `tau_horizonte`, `Rf_h`, export `horizon_days`/`horizon_end`) must stay below that line. `tests/test_bl_horizonte_previews.py` enforces the ordering with an AST check.
+- Previews: `BL_MODE=previews` or `--previews` runs to the end of BLOQUE 5 and calls `sys.exit(0)` after writing `previews_<timestamp>.json` (`BL_PREVIEWS_OUT`, default `PORTFOLIO_OUT_DIR`). Returns and vols in it are at the configured horizon, not annualized. Format: README, "Previews JSON". Under `runpy` a test must catch `SystemExit`.

@@ -66,6 +66,187 @@ def resolve_risk_free_rate(default, env=None):
     return tasa
 
 
+HORIZON_MONTHS_MIN = 1
+HORIZON_MONTHS_MAX = 12
+HORIZON_ENV_VAR = "BL_HORIZON_MONTHS"
+BL_MODES = ("full", "previews")
+PREVIEWS_SCHEMA_VERSION = 1
+
+
+class InvalidHorizonError(ValueError):
+    """`BL_HORIZON_MONTHS` o `horizon_months` fuera de 1..12 o no entero."""
+
+
+def parse_horizon_months(value, origin):
+    """Entero 1..12 a partir de un int, un float entero o un texto de enteros.
+
+    `origin` nombra de donde viene el valor para el mensaje de error. Un bool,
+    un decimal con parte fraccionaria o un valor fuera de 1..12 lanza
+    InvalidHorizonError.
+    """
+    aviso = (f"{origin} invalido: {value!r}. Use un entero entre "
+             f"{HORIZON_MONTHS_MIN} y {HORIZON_MONTHS_MAX} (meses).")
+    if isinstance(value, bool):
+        raise InvalidHorizonError(aviso)
+    if isinstance(value, str):
+        texto = value.strip()
+        if not re.fullmatch(r"[+-]?\d+", texto):
+            raise InvalidHorizonError(aviso)
+        meses = int(texto)
+    elif isinstance(value, int):
+        meses = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            raise InvalidHorizonError(aviso)
+        meses = int(value)
+    else:
+        raise InvalidHorizonError(aviso)
+    if not HORIZON_MONTHS_MIN <= meses <= HORIZON_MONTHS_MAX:
+        raise InvalidHorizonError(aviso)
+    return meses
+
+
+def resolve_horizon(default, bl_input=None, env=None):
+    """Horizonte en meses y su fuente: BL_INPUT_FILE > BL_HORIZON_MONTHS > `default`.
+
+    `bl_input` es lo que devuelve `load_bl_input` (o None). Devuelve
+    (meses, fuente) con fuente en {"BL_INPUT_FILE", "BL_HORIZON_MONTHS",
+    "default"}. Un valor invalido lanza InvalidHorizonError, tambien el del
+    default.
+    """
+    del_archivo = (bl_input or {}).get("horizon_months")
+    if del_archivo is not None:
+        return parse_horizon_months(del_archivo, "horizon_months (BL_INPUT_FILE)"), "BL_INPUT_FILE"
+    crudo = (os.environ if env is None else env).get(HORIZON_ENV_VAR)
+    if crudo is not None and str(crudo).strip():
+        return parse_horizon_months(crudo, HORIZON_ENV_VAR), HORIZON_ENV_VAR
+    return parse_horizon_months(default, "horizonte por defecto"), "default"
+
+
+def resolve_horizon_months(default, bl_input=None, env=None):
+    """Como `resolve_horizon` pero devuelve solo los meses."""
+    return resolve_horizon(default, bl_input, env)[0]
+
+
+def resolve_bl_mode(argv=None, env=None):
+    """Modo de black_litterman.py: "previews" (`--previews` o BL_MODE=previews) o "full".
+
+    El flag gana a la variable. BL_MODE acepta `full` o `previews` (sin
+    distinguir mayusculas); vacio o ausente es `full`. Otro valor lanza ValueError.
+    """
+    argumentos = sys.argv[1:] if argv is None else argv
+    if "--previews" in argumentos:
+        return "previews"
+    crudo = (os.environ if env is None else env).get("BL_MODE")
+    if crudo is None or not str(crudo).strip():
+        return "full"
+    modo = str(crudo).strip().lower()
+    if modo not in BL_MODES:
+        raise ValueError(
+            f"BL_MODE invalido: {crudo!r}. Use uno de: {', '.join(BL_MODES)} "
+            "(o el flag --previews)."
+        )
+    return modo
+
+
+def build_previews_payload(*, as_of, horizon_months, horizon_trading_days, risk_profile,
+                           tau, delta_mkt, tickers, pi_eq, mu_historico, vol_horizon,
+                           w_mkt, iv_horizon=None, iv_source=None, universe_requested=None,
+                           delta_mode=None, source_repo=SOURCE_REPO, now=None):
+    """Diccionario del JSON de pre-views (BL_MODE=previews), listo para `json.dumps`.
+
+    `tickers`, `pi_eq`, `mu_historico`, `vol_horizon` y `w_mkt` van alineados
+    por posicion. `iv_horizon` es opcional: dict ticker -> vol implicita al
+    horizonte (solo los tickers con superficie SSVI/ATM; el resto, None);
+    `iv_source` dict ticker -> "ssvi" | "atm". Todo retorno y toda volatilidad
+    estan al horizonte configurado, no anualizados.
+    """
+    ahora = now or datetime.now(BOGOTA)
+    nombres = [str(t) for t in tickers]
+    columnas = {
+        "pi_eq": list(pi_eq), "mu_historico": list(mu_historico),
+        "vol_horizon": list(vol_horizon), "w_mkt": list(w_mkt),
+    }
+    for nombre, valores in columnas.items():
+        if len(valores) != len(nombres):
+            raise ValueError(f"{nombre} tiene {len(valores)} valores y hay {len(nombres)} tickers")
+    iv_horizon = iv_horizon or {}
+    iv_source = iv_source or {}
+    dias, fin = horizon_from_months(as_of, horizon_months)
+    por_ticker = {}
+    for i, ticker in enumerate(nombres):
+        pi = _num_or_none(columnas["pi_eq"][i])
+        mu = _num_or_none(columnas["mu_historico"][i])
+        iv = _num_or_none(iv_horizon.get(ticker))
+        por_ticker[ticker] = {
+            "pi_eq": pi,
+            "mu_historico": mu,
+            "diff": None if pi is None or mu is None else mu - pi,
+            "vol_horizon": _num_or_none(columnas["vol_horizon"][i]),
+            "iv_horizon": iv,
+            "iv_source": iv_source.get(ticker) if iv is not None else None,
+            "w_mkt": _num_or_none(columnas["w_mkt"][i]),
+        }
+    pedido = [str(t) for t in (universe_requested if universe_requested is not None else nombres)]
+    return {
+        "schema_version": PREVIEWS_SCHEMA_VERSION,
+        "kind": "bl_previews",
+        "source_repo": source_repo,
+        "generated_at": ahora.isoformat(timespec="seconds"),
+        "as_of": _date_or_none(as_of),
+        "horizon_months": int(horizon_months),
+        "horizon_days": dias,
+        "horizon_end": fin,
+        "horizon_trading_days": _int_or_none(horizon_trading_days),
+        "risk_profile": _profile(risk_profile),
+        "tau": _num_or_none(tau),
+        "delta_mkt": _num_or_none(delta_mkt),
+        "delta_mkt_mode": delta_mode,
+        "units": {
+            "returns": (f"decimal log-return accumulated over the configured horizon "
+                        f"({int(horizon_months)} month(s)); not annualized"),
+            "volatility": (f"decimal standard deviation over the configured horizon "
+                           f"({int(horizon_months)} month(s)); not annualized"),
+            "w_mkt": "fraction of the market-cap weights; sums to 1 over `universe`",
+            "diff": "mu_historico - pi_eq (> 0: historical return above equilibrium)",
+            "vol_horizon": "sqrt(diag(Sigma_P)) at the horizon (Q->P adjusted covariance)",
+            "iv_horizon": ("ATM implied vol at the horizon from the SSVI/ATM block; "
+                           "null when the ticker has no usable option surface"),
+        },
+        "universe": nombres,
+        "universe_requested": pedido,
+        "universe_excluded": [t for t in pedido if t not in set(nombres)],
+        "tickers": por_ticker,
+    }
+
+
+def write_previews(payload, out=None, env=None, now=None):
+    """Escribe el JSON de pre-views y devuelve su ruta.
+
+    Destino: `out` (o BL_PREVIEWS_OUT). Si es un directorio existente, termina
+    en `/` o no tiene extension, se crea `previews_<YYYYMMDDTHHMMSS>.json`
+    dentro; si no, se toma como la ruta del archivo. Sin destino, el directorio
+    es el mismo de los portafolios (PORTFOLIO_OUT_DIR o el default). A diferencia
+    de `export_portfolio`, un fallo de escritura lanza: el JSON es el unico
+    producto de esa corrida.
+    """
+    entorno = os.environ if env is None else env
+    crudo = out if out is not None else entorno.get("BL_PREVIEWS_OUT")
+    sello = (now or datetime.now(BOGOTA)).strftime("%Y%m%dT%H%M%S")
+    nombre = f"previews_{sello}.json"
+    if crudo is None or not str(crudo).strip():
+        destino = Path(entorno.get("PORTFOLIO_OUT_DIR") or DEFAULT_PORTFOLIO_DIR) / nombre
+    else:
+        texto = str(crudo).strip()
+        ruta = Path(texto)
+        es_dir = ruta.is_dir() or texto.endswith(("/", os.sep)) or ruta.suffix == ""
+        destino = ruta / nombre if es_dir else ruta
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    texto_json = json.dumps(_jsonify(payload), indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    _atomic_write(destino, texto_json)
+    return str(destino)
+
+
 def _cli_risk_profile(argv):
     for i, arg in enumerate(argv):
         if arg == "--risk-profile":
@@ -150,7 +331,9 @@ def load_bl_input(path):
     """Lee BL_INPUT_FILE. None si no hay ruta, si falta el archivo o si el JSON no es valido.
 
     Acepta un universo (solo se usa `tickers`; `views` queda None) o un archivo
-    de views. No lanza.
+    de views. Puede traer `horizon_months` (entero 1..12; None si falta).
+    No lanza, salvo InvalidHorizonError: un horizonte invalido no se degrada a
+    un aviso porque cambiaria en silencio todo el calculo.
     """
     if path is None:
         return None
@@ -165,6 +348,8 @@ def load_bl_input(path):
     try:
         data = json.loads(archivo.read_text(encoding="utf-8"))
         return _validate_bl_input(data)
+    except InvalidHorizonError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         print(f"ADVERTENCIA: BL_INPUT_FILE={path} invalido ({exc}). "
               "Se usan los TICKERS y las views fijos del script.")
@@ -382,6 +567,9 @@ def _validate_bl_input(data):
         raise ValueError("el JSON debe ser un objeto")
     if "schema_version" in data and data["schema_version"] != 1:
         raise ValueError("schema_version debe ser 1")
+    horizon_months = None
+    if data.get("horizon_months") is not None:
+        horizon_months = parse_horizon_months(data["horizon_months"], "horizon_months (BL_INPUT_FILE)")
     tickers = data.get("tickers")
     if not isinstance(tickers, list) or not tickers:
         raise ValueError("tickers debe ser una lista no vacia")
@@ -400,7 +588,7 @@ def _validate_bl_input(data):
     source = data.get("source")
     if source is not None and not isinstance(source, str):
         raise ValueError("source debe ser texto")
-    return {"tickers": clean, "views": views, "source": source}
+    return {"tickers": clean, "views": views, "source": source, "horizon_months": horizon_months}
 
 
 def _parse_views(raw):

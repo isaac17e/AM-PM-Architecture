@@ -117,14 +117,17 @@ RISK_PROFILE=agresivo
 | `POLYGON_SNAPSHOT_TTL_MIN` | Kept for compatibility. Live snapshots and anything dated today are not written to the cache. |
 | `POLYGON_CACHE_DIR` | Cache directory, shared across runs. Default `~/.cache/am-pm/polygon` (outside the repo and the run folder). |
 | `PORTFOLIO_OUT_DIR` | Where each optimizer writes `portfolio_latest.json` at the end of a run. Default `/workspace/pipeline/portfolio`. If the directory cannot be created or written, the script prints a warning and finishes anyway. |
-| `BL_INPUT_FILE` | Optional JSON for `black_litterman.py`. If unset, missing, or invalid, the hardcoded `TICKERS` and views are used. |
+| `BL_INPUT_FILE` | Optional JSON for `black_litterman.py`. If unset, missing, or invalid, the hardcoded `TICKERS` and views are used. It may also carry `horizon_months` (see `BL_HORIZON_MONTHS`). |
+| `BL_HORIZON_MONTHS` | Horizon of `black_litterman.py` in months, an integer from 1 to 12 (default **2**, the old hardcoded `MESES_HORIZONTE`). Precedence: `horizon_months` in `BL_INPUT_FILE` > `BL_HORIZON_MONTHS` > 2. Anything else (`0`, `13`, `2.5`, text) stops the run with a clear error, including a bad `horizon_months` inside an otherwise valid input file. Everything derived from it follows: trading days, weekly scale factor, SSVI target `tau`, maximum option expiry, bootstrap block, rf at the horizon, and `horizon_days` / `horizon_end` / `params.meses_horizonte` in the portfolio JSON. |
+| `BL_MODE` | `full` (default) or `previews`. `previews` (or the `--previews` flag, which wins) runs `black_litterman.py` through Block 5 and stops: no views, no optimization, no portfolio export. It writes the previews JSON instead (see [Previews JSON](#previews-json)). |
+| `BL_PREVIEWS_OUT` | Where previews mode writes. A directory (existing, ending in `/`, or without an extension) gets `previews_<YYYYMMDDTHHMMSS>.json`; any other value is the file path. Unset: the same folder as the portfolio JSON (`PORTFOLIO_OUT_DIR`, default `/workspace/pipeline/portfolio`). A write failure stops the run, because that file is the only output. |
 | `RISK_PROFILE` | `conservador`, `moderado`, or `agresivo`. Applies that optimizer's preset. Unset keeps the profile already written in the file (`agresivo` in every optimizer). `--risk-profile` overrides this variable. |
 | `RISK_FREE_RATE` | Annual risk-free rate as a decimal (`0.052` = 5.2%), read once at startup by `pipeline_io.resolve_risk_free_rate`. Unset keeps each file's value (`0.047` in minimum variance and quadratic utility and their seasonal copies, `0.046` in Black-Litterman). Everything derived uses it: weekly/monthly rf, rf at the horizon, Sharpe/Sortino, BS greeks and the delta filter, the IV carry calibration and the BKM pricing rate. A non-number or a value outside `0 <= rf < 0.5` stops the run with a clear error (a percent such as `5.2` is rejected). The value used is written to the portfolio JSON as `params.risk_free_rate`. |
 | `MFIS_MAX_MINUTES` | Wall-clock limit of the historical MFIS block in quadratic utility (and its seasonal copy), in minutes. Default `60` (`bkm_hist_max_minutes`). Seasonal copy: pre-run estimate only. `0` or `unlimited` removes the budget. An invalid value prints a warning and keeps 60. |
 
 `bkm_hist_max_minutes` (default **60**, top of `quadratic_utility.py` and its seasonal copy, or `MFIS_MAX_MINUTES`) is a budget, not a switch that skips the whole historical z-score. The script counts only US tickers with a finite current MFIS, charges about `bkm_hist_contracts_estimate` (26) priced contracts per uncached date, and walks the MFIS queue until the call budget is used. The queue is ordered by relevance (`qm.orden_prioridad_mfis`): S&P 500 market cap first, largest first, then the pre-filter `h_score` ranking, then the candidate order. A budget cut therefore leaves the smallest names unscored, not LLY. The order is printed as `Orden de la cola MFIS`. The budget is minutes × `POLYGON_CALLS_PER_MINUTE`, so on the paid options plan raise that cap (or set it to `unlimited`) before raising the minutes. Names that do not fit are logged as `historia_no_procesada_presupuesto`. `bkm_hist_max_minutes` is also a real wall-clock limit in `quadratic_utility.py`: each ticker and each contract download checks the clock, and once it expires the remaining names are logged `historia_no_procesada_tiempo`. Unprocessed names are excluded from the final pool (`qm.pool_sin_no_procesados_mfis`); only if that would leave fewer than `bkm_min_survivors` (12) do the best-ranked ones stay, with a printed warning, and they are listed in the portfolio JSON as `mfis_unscreened` (`mfis_excluded_unprocessed` lists the dropped ones). Each OTM contract's daily aggregates are requested once for the span of sample dates, then sliced with the same ±5 day rule. The on-disk key is `mfis_hist_v3`. Only dates strictly before today are stored, so the next run pays the uncached dates. `bkm_max_workers` defaults to 12; the rate limiter is still global.
 
-**Parameters are edited in the configuration block at the top of each file.** The only CLI flag is `--risk-profile` (`conservador`, `moderado`, or `agresivo`), which overrides `RISK_PROFILE`. With neither set, the run keeps the profile hardcoded in that file. Run a script with `python script_name.py`. Plotly charts open in the browser.
+**Parameters are edited in the configuration block at the top of each file.** The CLI flags are `--risk-profile` (`conservador`, `moderado`, or `agresivo`), which overrides `RISK_PROFILE`, and `--previews` (`black_litterman.py` only, same as `BL_MODE=previews`). With neither profile option set, the run keeps the profile hardcoded in that file. Run a script with `python script_name.py`. Plotly charts open in the browser.
 
 `minimum_variance.py`, `minimum_variance_(seasonal_version).py`, `quadratic_utility.py`, and `quadratic_utility_(seasonal_version).py` each keep a `RISK_PRESETS` dict (the columns in `docs/risk_profile_audit.html`). The numbers above that dict are the agresivo preset, so an unset profile does not change the book.
 
@@ -254,7 +257,35 @@ A views file. Each view is one row of `P` and one entry of `Q`, in horizon-retur
 }
 ```
 
-`views: []` means no views (the Gaussian posterior stays at equilibrium). Omitting `views` keeps the defaults. An invalid file is ignored with a warning.
+Either shape accepts an optional `"horizon_months": 3` (integer 1 to 12). It beats `BL_HORIZON_MONTHS`.
+
+`views: []` means no views (the Gaussian posterior stays at equilibrium). Omitting `views` keeps the defaults. An invalid file is ignored with a warning, except an invalid `horizon_months`, which stops the run.
+
+### Previews JSON
+
+`BL_MODE=previews` (or `python black_litterman.py --previews`) stops after Block 5, the reference table for views, and writes `previews_<YYYYMMDDTHHMMSS>.json` (location: `BL_PREVIEWS_OUT`, see above). No `portfolio_latest.json` is written. Top level: `schema_version` (1), `kind` (`bl_previews`), `source_repo`, `generated_at`, `as_of`, `horizon_months`, `horizon_days` and `horizon_end` (calendar, same rule as the portfolio JSON), `horizon_trading_days`, `risk_profile`, `tau`, `delta_mkt`, `delta_mkt_mode`, `units`, `universe` (tickers that survived the data filter), `universe_requested`, `universe_excluded`, and `tickers`. Every return and volatility is a decimal at the configured horizon, not annualized (`units` says so in the file). Per ticker:
+
+| Field | Meaning |
+|---|---|
+| `pi_eq` | Equilibrium return (`delta_mkt * Sigma_P * w_mkt`) |
+| `mu_historico` | Historical mean log-return scaled to the horizon |
+| `diff` | `mu_historico - pi_eq` (the table's `Diff_Hist_Pi`, unrounded) |
+| `vol_horizon` | `sqrt(diag(Sigma_P))`, the Q to P adjusted volatility at the horizon |
+| `iv_horizon` | ATM implied volatility at the horizon from the SSVI block; `null` without a usable surface (international tickers, fallbacks, `USAR_IV_POLYGON = False`) |
+| `iv_source` | `ssvi` or `atm` when `iv_horizon` is set, else `null` |
+| `w_mkt` | Market-cap weight, summing to 1 over `universe` |
+
+```json
+{
+  "schema_version": 1, "kind": "bl_previews", "as_of": "2026-10-15",
+  "horizon_months": 3, "horizon_days": 92, "horizon_end": "2027-01-15", "horizon_trading_days": 63,
+  "risk_profile": "agresivo", "tau": 0.1, "delta_mkt": 6.38, "universe": ["AAPL", "MSFT"],
+  "tickers": {
+    "AAPL": {"pi_eq": 0.0232, "mu_historico": 0.0438, "diff": 0.0206, "vol_horizon": 0.1031,
+             "iv_horizon": null, "iv_source": null, "w_mkt": 0.5}
+  }
+}
+```
 
 ## Tests
 
@@ -262,7 +293,7 @@ A views file. Each view is one row of `P` and one entry of `Q`, in horizon-retur
 python -m pytest
 ```
 
-Tests cover the shared modules and the extracted optimizer logic (FX and calendar alignment, quadprog constraints, time scaling, Cornish-Fisher, Polygon client behavior with recorded responses, quadratic-utility metrics, Black-Litterman units, delta modes, and log-return drawdown). `tests/test_pipeline_io.py` checks the portfolio JSON writer and `BL_INPUT_FILE` parsing with no network. `tests/test_script_smoke.py` parses every optimizer for a module-level name that shadows an import (`rk = ...` used to hide `risk_estimators`) and runs `black_litterman.py` under `AMPM_SMOKE=1` with mocked prices. They do not call Polygon and they do not run a full universe.
+Tests cover the shared modules and the extracted optimizer logic (FX and calendar alignment, quadprog constraints, time scaling, Cornish-Fisher, Polygon client behavior with recorded responses, quadratic-utility metrics, Black-Litterman units, delta modes, and log-return drawdown). `tests/test_pipeline_io.py` checks the portfolio JSON writer and `BL_INPUT_FILE` parsing with no network. `tests/test_script_smoke.py` parses every optimizer for a module-level name that shadows an import (`rk = ...` used to hide `risk_estimators`) and runs `black_litterman.py` under `AMPM_SMOKE=1` with mocked prices. `tests/test_bl_horizonte_previews.py` covers the horizon precedence (input file > `BL_HORIZON_MONTHS` > 2), the validation, that every horizon-derived quantity is computed after the value is resolved, and the previews JSON shape and stop point. They do not call Polygon and they do not run a full universe.
 
 ---
 

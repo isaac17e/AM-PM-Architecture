@@ -7,6 +7,7 @@ warnings.filterwarnings("ignore")
 
 import math
 import os
+import sys
 import time
 from datetime import date, timedelta
 
@@ -55,7 +56,14 @@ TICKERS = [
 # ------------------------------------------------------------------------------
 # 2. HORIZONTE TEMPORAL
 # ------------------------------------------------------------------------------
-MESES_HORIZONTE = 2
+# Precedencia: `horizon_months` de BL_INPUT_FILE > BL_HORIZON_MONTHS > default (2).
+# Entero 1..12. Todo lo que depende del horizonte (MAX_DIAS_VENCIMIENTO,
+# BOOTSTRAP_BLOQUE, horizonte_dias, factor_anualizacion, tau_horizonte, Rf_h,
+# horizon_days/horizon_end del export) se calcula despues de esta linea.
+MESES_HORIZONTE_DEFECTO = 2
+_bl_entrada = pipeline_io.load_bl_input(os.environ.get("BL_INPUT_FILE"))
+MESES_HORIZONTE, _fuente_horizonte = pipeline_io.resolve_horizon(
+    MESES_HORIZONTE_DEFECTO, _bl_entrada)
 DIAS_HABILES_MES = 21
 SEMANAS_MES = 4.33
 
@@ -63,6 +71,14 @@ SEMANAS_MES = 4.33
 # 3. PERFIL DE RIESGO
 # ------------------------------------------------------------------------------
 PERFIL_RIESGO = pipeline_io.resolve_risk_profile("agresivo")
+
+# ------------------------------------------------------------------------------
+# 3B. MODO DE EJECUCION
+# ------------------------------------------------------------------------------
+# "full" (default) o "previews" (BL_MODE=previews o --previews): corre hasta el
+# BLOQUE 5, escribe el JSON de pre-views y termina sin views ni optimizacion.
+MODO_EJECUCION = pipeline_io.resolve_bl_mode()
+MODO_PREVIEWS = MODO_EJECUCION == "previews"
 
 # ------------------------------------------------------------------------------
 # 4. PARAMETROS DE OPTIMIZACION (POR PERFIL)
@@ -176,7 +192,6 @@ MAX_ESCENARIOS_LP = 4000
 # ------------------------------------------------------------------------------
 # ENTRADA OPCIONAL: UNIVERSO O VIEWS (BL_INPUT_FILE)
 # ------------------------------------------------------------------------------
-_bl_entrada = pipeline_io.load_bl_input(os.environ.get("BL_INPUT_FILE"))
 if _bl_entrada is not None:
     TICKERS = _bl_entrada["tickers"]
     _origen = _bl_entrada.get("source") or "archivo"
@@ -246,7 +261,8 @@ horizonte_semanas = MESES_HORIZONTE * SEMANAS_MES
 factor_anualizacion = round(52 * (MESES_HORIZONTE / 12))
 
 print("=== HORIZONTE TEMPORAL ===")
-print(f"Meses: {MESES_HORIZONTE}")
+print(f"Meses: {MESES_HORIZONTE}"
+      + ("" if _fuente_horizonte == "default" else f" (fuente: {_fuente_horizonte})"))
 print(f"Dias habiles: {horizonte_dias}")
 print(f"Factor de escala (semanas): {factor_anualizacion}\n")
 
@@ -1634,6 +1650,35 @@ referencia_views["Diff_Hist_Pi"] = np.round(referencia_views["Mu_historico"] - r
 print("\n=== REFERENCIA PARA FORMULAR VIEWS (Historico vs pi) ===")
 print("(Diff > 0: retorno historico supera el equilibrio de mercado)")
 print(referencia_views.sort_values("Diff_Hist_Pi", ascending=False).to_string(index=False))
+
+if MODO_PREVIEWS:
+    _iv_prev = {t: float(sigma_iv_horizon[t]) for t in tickers
+                if USAR_IV_POLYGON and fuente_vol.get(t) in ("ssvi", "atm")}
+    _payload_prev = pipeline_io.build_previews_payload(
+        as_of=fecha_fin,
+        horizon_months=MESES_HORIZONTE,
+        horizon_trading_days=horizonte_dias,
+        risk_profile=PERFIL_RIESGO,
+        tau=tau,
+        delta_mkt=delta_mkt,
+        delta_mode=delta_info["mode"],
+        tickers=tickers,
+        pi_eq=pi_eq,
+        mu_historico=mu_historico,
+        vol_horizon=np.sqrt(np.diag(Sigma_mat)),
+        w_mkt=w_mkt,
+        iv_horizon=_iv_prev,
+        iv_source={t: fuente_vol[t] for t in _iv_prev},
+        universe_requested=TICKERS,
+    )
+    _ruta_prev = pipeline_io.write_previews(_payload_prev)
+    print("\n" + "=" * 79)
+    print("MODO PREVIEWS: tabla de referencia lista; no se corren views ni optimizacion")
+    print("=" * 79)
+    print(f"  Horizonte: {MESES_HORIZONTE} mes(es) | Perfil: {PERFIL_RIESGO.upper()} | "
+          f"Universo: {n} tickers")
+    print(f"  JSON de pre-views: {_ruta_prev}")
+    sys.exit(0)
 
 # ==============================================================================
 # BLOQUE 6: VIEWS DEL GESTOR
