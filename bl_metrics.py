@@ -202,6 +202,25 @@ def ssvi_total_variance(k, theta, rho, eta, gamma):
     )
 
 
+SSVI_RMSE_REL_MAX = 0.20
+SSVI_GJ_MAX = 4.0
+
+
+class SSVICalibrationError(ValueError):
+    """Fallo de calibracion de la superficie, con un `code` estable.
+
+    Sigue siendo ValueError (mismo mensaje de siempre). `code` es uno de
+    chain_empty, chain_incomplete, no_valid_ivs, no_expiries_in_window,
+    fewer_than_2_expiries, no_atm_vol. `rmse_rel` y `gj_max` solo vienen en no_atm_vol.
+    """
+
+    def __init__(self, message, code, rmse_rel=None, gj_max=None):
+        super().__init__(message)
+        self.code = code
+        self.rmse_rel = rmse_rel
+        self.gj_max = gj_max
+
+
 def _ssvi_vacio(n_strikes, k_min, k_max):
     return {
         "rho": np.nan, "eta": np.nan, "gamma": np.nan,
@@ -233,7 +252,7 @@ def _thetas_gatheral(slice_index, theta_por_fila, theta_fijo):
 
 
 def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
-             gtol=1e-5, maxiter=2000, rmse_rel_max=0.20,
+             gtol=1e-5, maxiter=2000, rmse_rel_max=SSVI_RMSE_REL_MAX,
              weights=None, k_abs_max=0.5, normalizar_vencimiento=True):
     """Calibra (rho, eta, gamma) y acepta el ajuste por residuo, no por opt.success.
 
@@ -358,7 +377,7 @@ def fit_ssvi(k, w, theta_por_fila, theta_fijo, slice_index=None,
         rel = rmse / escala if escala > 0 else float("inf")
     _, gj = _penalty(rho, eta, gamma)
     gj_max = float(np.max(gj))
-    aceptado = bool(np.isfinite(rel) and rel <= float(rmse_rel_max) and gj_max <= 4.0 + 1e-6)
+    aceptado = bool(np.isfinite(rel) and rel <= float(rmse_rel_max) and gj_max <= SSVI_GJ_MAX + 1e-6)
     return {
         "rho": rho, "eta": eta, "gamma": gamma,
         "rmse": rmse, "rmse_rel": rel, "gj_max": gj_max,
@@ -613,7 +632,7 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
                              max_dias=243, min_vencimientos=3, k_abs_max=0.5,
                              k_sd_max=3.0, precio_min=0.10, oi_min=10.0,
                              rho_abs_max=0.95, k_side_min=0.10, min_per_side=2,
-                             rmse_rel_max=0.20, normalizar_vencimiento=True):
+                             rmse_rel_max=SSVI_RMSE_REL_MAX, normalizar_vencimiento=True):
     """Ajusta una SSVI conjunta a una cadena ya parseada.
 
     `df` lleva strike, expiracion, tipo, iv y, si existen, precio, oi y spot.
@@ -630,7 +649,7 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
     iv = df["iv"].to_numpy(dtype=float)
     df = df[np.isfinite(iv) & (iv > 0)].copy()
     if len(df) == 0:
-        raise ValueError("Sin IVs validas")
+        raise SSVICalibrationError("Sin IVs validas", "no_valid_ivs")
 
     hoy = _fecha_naive(hoy)
     df["expiracion"] = pd.to_datetime(df["expiracion"])
@@ -639,7 +658,8 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
     df["dias"] = (df["expiracion"] - hoy).dt.days
     df = df[df["dias"] >= int(min_dias)].copy()
     if len(df) == 0:
-        raise ValueError("Sin vencimientos dentro del minimo de dias")
+        raise SSVICalibrationError(
+            "Sin vencimientos dentro del minimo de dias", "no_expiries_in_window")
 
     vencimientos = sorted(df["expiracion"].unique())
     dias_venc = np.array([(pd.Timestamp(v) - hoy).days for v in vencimientos], dtype=float)
@@ -743,7 +763,8 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
         dias_usados.append(int((pd.Timestamp(venc) - hoy).days))
 
     if len(puntos) < 2:
-        raise ValueError("Menos de 2 vencimientos utilizables")
+        raise SSVICalibrationError(
+            "Menos de 2 vencimientos utilizables", "fewer_than_2_expiries")
 
     tope = float(max_dias) if max_dias is not None and np.isfinite(max_dias) else np.inf
     extendio = bool(any(d > tope + 1e-9 for d in dias_usados))
@@ -780,9 +801,10 @@ def calibrar_superficie_ssvi(df, tau_obj, hoy, min_strikes=5, min_dias=5,
         ajuste, sigma_atm_annual, n_put=n_put, n_call=n_call,
         rho_abs_max=rho_abs_max, k_side_min=k_side_min, min_per_side=min_per_side)
     if decision["fuente"] == "historica":
-        raise ValueError(
+        raise SSVICalibrationError(
             f"SSVI sin vol ATM (rmse_rel={ajuste['rmse_rel']:.3f}, "
-            f"GJ_max={ajuste['gj_max']:.3f})"
+            f"GJ_max={ajuste['gj_max']:.3f})",
+            "no_atm_vol", rmse_rel=ajuste["rmse_rel"], gj_max=ajuste["gj_max"],
         )
 
     motivos = list(decision.get("motivos") or [])
@@ -849,6 +871,90 @@ def momentos_fallback(modo, skew_hist, kurt_hist, skew_sector=None, kurt_sector=
     if par is not None:
         return {"mfis": par[0], "mfik": par[1], "fuente": "historico"}
     return {"mfis": 0.0, "mfik": 3.0, "fuente": "neutro"}
+
+
+def _fit_rejection_text(rmse_rel, gj_max, rmse_rel_max):
+    partes = []
+    if rmse_rel is None or not np.isfinite(rmse_rel) or float(rmse_rel) > float(rmse_rel_max):
+        valor = "n/d" if rmse_rel is None or not np.isfinite(rmse_rel) else f"{float(rmse_rel):.3f}"
+        partes.append(f"rmse_rel={valor} > {float(rmse_rel_max):.2f} threshold")
+    if gj_max is not None and np.isfinite(gj_max) and float(gj_max) > SSVI_GJ_MAX + 1e-6:
+        partes.append(f"gj_max={float(gj_max):.3f} > {SSVI_GJ_MAX:.1f} (arbitrage bound)")
+    return "; ".join(partes) or "fit not accepted"
+
+
+_CALIBRATION_REASONS = {
+    "chain_empty": ("no_options_data", "option chain returned no contracts"),
+    "chain_incomplete": ("options_chain_unavailable", "option chain could not be fetched completely"),
+    "no_valid_ivs": ("no_options_data", "chain has no contracts with a valid implied vol"),
+    "no_expiries_in_window": (
+        "fewer_than_2_usable_expiries", "0 usable expiries (none beyond the minimum DTE)"),
+    "fewer_than_2_expiries": (
+        "fewer_than_2_usable_expiries", "fewer than 2 expiries survive the liquidity/strike filters"),
+}
+
+
+def moment_source_info(*, iv_enabled=True, is_us=True, calib_error=None, surface=None,
+                       bkm=None, applied_fallback=None, rmse_rel_max=SSVI_RMSE_REL_MAX):
+    """Origen de los momentos superiores (MFIS/MFIK) de un ticker en previews.
+
+    Devuelve {"source": "iv" | "hist", "reason": str}. "iv" solo si BKM termino
+    con momentos implicitos propios (`bkm["fuente_momentos"] == "ssvi"`). Todo
+    lo demas es "hist" (no hay momentos implicitos propios) y `reason` lleva
+    `<codigo>: <detalle>` con la causa real y, si se conoce, el fallback aplicado
+    (historico | sector | neutro). Orden de causas: IV apagada, sin opciones US,
+    error de calibracion, sonrisa rechazada/degenerada, fallo en BKM.
+
+    `calib_error` es la excepcion de `calibrar_superficie_ssvi`/la cadena; `surface`
+    su resultado; `bkm` el dict de momentos del ticker.
+    """
+    bkm = bkm or {}
+    if bkm.get("fuente_momentos") == "ssvi" and iv_enabled:
+        det = surface or {}
+        rel = det.get("rmse_rel")
+        extra = f" (SSVI fit rmse_rel={float(rel):.3f} <= {float(rmse_rel_max):.2f})" \
+            if rel is not None and np.isfinite(rel) else ""
+        return {"source": "iv", "reason": f"implied_moments: BKM on accepted SSVI smile{extra}"}
+
+    if not iv_enabled:
+        causa = "iv_disabled: implied vol extraction is off (USAR_IV_POLYGON=False)"
+    elif not is_us:
+        causa = "no_options_data: ticker has no US-listed options (sin_opciones_us)"
+    elif calib_error is not None:
+        code = getattr(calib_error, "code", None)
+        if code == "no_atm_vol":
+            causa = ("ssvi_fit_rejected: " + _fit_rejection_text(
+                getattr(calib_error, "rmse_rel", None), getattr(calib_error, "gj_max", None),
+                rmse_rel_max) + "; no ATM vol available")
+        elif code in _CALIBRATION_REASONS:
+            nombre, detalle = _CALIBRATION_REASONS[code]
+            causa = f"{nombre}: {detalle} ({calib_error})"
+        else:
+            causa = f"calibration_error: {calib_error}"
+    elif surface is not None and not surface.get("usar_alas", False):
+        if not surface.get("aceptado", True):
+            causa = "ssvi_fit_rejected: " + _fit_rejection_text(
+                surface.get("rmse_rel"), surface.get("gj_max"), rmse_rel_max)
+            otros = [m for m in (surface.get("motivos") or []) if not str(m).startswith("rmse_rel=")]
+            if otros:
+                causa += "; " + ", ".join(otros)
+        else:
+            motivos = ", ".join(surface.get("motivos") or []) or "wings not usable"
+            causa = f"ssvi_degenerate: {motivos}"
+        causa += "; ATM vol kept, wings not used"
+    elif bkm.get("motivo_fallback") == "mfiv_fuera_de_banda":
+        causa = "mfiv_out_of_band: model-free implied variance outside the ATM-variance band"
+    elif bkm.get("motivo_fallback") == "momentos_inadmisibles":
+        causa = "moments_inadmissible: implied MFIS/MFIK outside admissible bounds"
+    elif bkm.get("motivo_fallback"):
+        causa = f"bkm_error: {bkm['motivo_fallback']}"
+    elif not bkm:
+        causa = "no_options_data: no implied moments were computed"
+    else:
+        causa = "implied_moments_unavailable: BKM did not produce usable moments"
+    if applied_fallback:
+        causa += f" | fallback applied: {applied_fallback}"
+    return {"source": "hist", "reason": causa}
 
 
 def elegir_spot_momentos(ultimo_cierre, fecha_cierre, fecha_cadena, spot_cadena=None):

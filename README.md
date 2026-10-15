@@ -270,10 +270,12 @@ Either shape accepts an optional `"horizon_months": 3` (integer 1 to 12). It bea
 | `pi_eq` | Equilibrium return (`delta_mkt * Sigma_P * w_mkt`) |
 | `mu_historico` | Historical mean log-return scaled to the horizon |
 | `diff` | `mu_historico - pi_eq` (the table's `Diff_Hist_Pi`, unrounded) |
-| `vol_horizon` | `sqrt(diag(Sigma_P))`, the Q to P adjusted volatility at the horizon |
+| `vol_horizon` | Implied / P-adjusted volatility: `sqrt(diag(Sigma_P))` at the horizon, the volatility the model uses (semantics unchanged) |
+| `vol_hist_horizon` | Historical volatility: `sqrt(diag(Sigma_hist))` at the horizon (EWMA + shrinkage covariance scaled to `horizon_months`), with no implied-vol adjustment |
 | `iv_horizon` | ATM implied volatility at the horizon from the SSVI block; `null` without a usable surface (international tickers, fallbacks, `USAR_IV_POLYGON = False`) |
 | `iv_source` | `ssvi` or `atm` when `iv_horizon` is set, else `null` |
 | `w_mkt` | Market-cap weight, summing to 1 over `universe` |
+| `moment_source` | `{"source": "iv" \| "hist", "reason": str}`: where the higher moments (MFIS/MFIK) come from. `iv` only when BKM ran on the ticker's own accepted SSVI smile. `hist` means no own implied moments were used (the moment fallback mode applies: `historico`, `sector` or `neutro`). `reason` is `<code>: <detail>` with the real cause: `iv_disabled`, `no_options_data`, `options_chain_unavailable`, `fewer_than_2_usable_expiries`, `ssvi_fit_rejected` (fit error vs the 0.20 `rmse_rel` threshold, or GJ bound), `ssvi_degenerate`, `mfiv_out_of_band`, `moments_inadmissible`, `bkm_error`, `calibration_error`, plus `fallback applied: <mode>` |
 
 ```json
 {
@@ -282,7 +284,8 @@ Either shape accepts an optional `"horizon_months": 3` (integer 1 to 12). It bea
   "risk_profile": "agresivo", "tau": 0.1, "delta_mkt": 6.38, "universe": ["AAPL", "MSFT"],
   "tickers": {
     "AAPL": {"pi_eq": 0.0232, "mu_historico": 0.0438, "diff": 0.0206, "vol_horizon": 0.1031,
-             "iv_horizon": null, "iv_source": null, "w_mkt": 0.5}
+             "vol_hist_horizon": 0.0987, "iv_horizon": null, "iv_source": null, "w_mkt": 0.5,
+             "moment_source": {"source": "hist", "reason": "iv_disabled: implied vol extraction is off (USAR_IV_POLYGON=False) | fallback applied: historico"}}
   }
 }
 ```

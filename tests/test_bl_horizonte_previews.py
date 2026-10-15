@@ -170,8 +170,8 @@ def test_previews_payload_shape():
     assert "3 month(s)" in p["units"]["returns"] and "not annualized" in p["units"]["returns"]
     assert list(p["tickers"]) == ["AAPL", "MSFT"]
     aapl = p["tickers"]["AAPL"]
-    assert set(aapl) == {"pi_eq", "mu_historico", "diff", "vol_horizon", "iv_horizon",
-                         "iv_source", "w_mkt"}
+    assert set(aapl) == {"pi_eq", "mu_historico", "diff", "vol_horizon", "vol_hist_horizon",
+                         "iv_horizon", "iv_source", "w_mkt", "moment_source"}
     assert aapl["diff"] == pytest.approx(0.05 - 0.02)
     assert aapl["iv_horizon"] == 0.12 and aapl["iv_source"] == "ssvi"
     assert aapl["w_mkt"] == 0.6 and aapl["vol_horizon"] == 0.11

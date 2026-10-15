@@ -149,10 +149,20 @@ def resolve_bl_mode(argv=None, env=None):
     return modo
 
 
+def _moment_source_or_none(info):
+    if not info:
+        return None
+    fuente = str(info.get("source"))
+    if fuente not in ("iv", "hist"):
+        raise ValueError(f"moment_source.source invalido: {fuente!r} (use 'iv' o 'hist')")
+    return {"source": fuente, "reason": str(info.get("reason", ""))}
+
+
 def build_previews_payload(*, as_of, horizon_months, horizon_trading_days, risk_profile,
                            tau, delta_mkt, tickers, pi_eq, mu_historico, vol_horizon,
                            w_mkt, iv_horizon=None, iv_source=None, universe_requested=None,
-                           delta_mode=None, source_repo=SOURCE_REPO, now=None):
+                           delta_mode=None, vol_hist_horizon=None, moment_source=None,
+                           source_repo=SOURCE_REPO, now=None):
     """Diccionario del JSON de pre-views (BL_MODE=previews), listo para `json.dumps`.
 
     `tickers`, `pi_eq`, `mu_historico`, `vol_horizon` y `w_mkt` van alineados
@@ -160,6 +170,13 @@ def build_previews_payload(*, as_of, horizon_months, horizon_trading_days, risk_
     horizonte (solo los tickers con superficie SSVI/ATM; el resto, None);
     `iv_source` dict ticker -> "ssvi" | "atm". Todo retorno y toda volatilidad
     estan al horizonte configurado, no anualizados.
+
+    `vol_horizon` es la vol implicita/ajustada a P (sqrt(diag(Sigma_P))), la
+    que usa el modelo; `vol_hist_horizon` es la vol historica pura al mismo
+    horizonte (sqrt(diag(Sigma_hist))), sin ajuste por IV. Opcional y alineada
+    por posicion; sin ella el campo va en null. `moment_source` es un dict
+    ticker -> {"source": "iv" | "hist", "reason": str} con el origen de los
+    momentos superiores (MFIS/MFIK); sin el ticker, null.
     """
     ahora = now or datetime.now(BOGOTA)
     nombres = [str(t) for t in tickers]
@@ -170,8 +187,12 @@ def build_previews_payload(*, as_of, horizon_months, horizon_trading_days, risk_
     for nombre, valores in columnas.items():
         if len(valores) != len(nombres):
             raise ValueError(f"{nombre} tiene {len(valores)} valores y hay {len(nombres)} tickers")
+    if vol_hist_horizon is not None and len(vol_hist_horizon) != len(nombres):
+        raise ValueError(
+            f"vol_hist_horizon tiene {len(vol_hist_horizon)} valores y hay {len(nombres)} tickers")
     iv_horizon = iv_horizon or {}
     iv_source = iv_source or {}
+    moment_source = moment_source or {}
     dias, fin = horizon_from_months(as_of, horizon_months)
     por_ticker = {}
     for i, ticker in enumerate(nombres):
@@ -183,9 +204,12 @@ def build_previews_payload(*, as_of, horizon_months, horizon_trading_days, risk_
             "mu_historico": mu,
             "diff": None if pi is None or mu is None else mu - pi,
             "vol_horizon": _num_or_none(columnas["vol_horizon"][i]),
+            "vol_hist_horizon": (None if vol_hist_horizon is None
+                                 else _num_or_none(vol_hist_horizon[i])),
             "iv_horizon": iv,
             "iv_source": iv_source.get(ticker) if iv is not None else None,
             "w_mkt": _num_or_none(columnas["w_mkt"][i]),
+            "moment_source": _moment_source_or_none(moment_source.get(ticker)),
         }
     pedido = [str(t) for t in (universe_requested if universe_requested is not None else nombres)]
     return {
@@ -209,7 +233,15 @@ def build_previews_payload(*, as_of, horizon_months, horizon_trading_days, risk_
                            f"({int(horizon_months)} month(s)); not annualized"),
             "w_mkt": "fraction of the market-cap weights; sums to 1 over `universe`",
             "diff": "mu_historico - pi_eq (> 0: historical return above equilibrium)",
-            "vol_horizon": "sqrt(diag(Sigma_P)) at the horizon (Q->P adjusted covariance)",
+            "vol_horizon": ("implied/P-adjusted vol: sqrt(diag(Sigma_P)) at the horizon "
+                            "(Q->P adjusted covariance; the vol the model uses)"),
+            "vol_hist_horizon": ("historical vol: sqrt(diag(Sigma_hist)) at the horizon "
+                                 "(EWMA+shrinkage covariance scaled to horizon_months; "
+                                 "no implied-vol adjustment)"),
+            "moment_source": ("origin of the higher moments (MFIS/MFIK): source 'iv' only when "
+                              "implied moments from the ticker's own SSVI smile were used, "
+                              "'hist' otherwise (any fallback: historical, sector or neutral); "
+                              "`reason` names the actual cause"),
             "iv_horizon": ("ATM implied vol at the horizon from the SSVI/ATM block; "
                            "null when the ticker has no usable option surface"),
         },

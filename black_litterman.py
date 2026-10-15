@@ -510,7 +510,8 @@ if USAR_IV_POLYGON:
                f"{pc.polygon_format_ticker(ticker)}?limit=250")
         results, completo, status = pc.get_all(url, api_key=api_key, max_pages=max_pages)
         if not completo:
-            raise ValueError(f"cadena incompleta (status {status})")
+            raise bm.SSVICalibrationError(
+                f"cadena incompleta (status {status})", "chain_incomplete")
         return results
 
     def parse_chain(chain_raw):
@@ -553,7 +554,7 @@ if USAR_IV_POLYGON:
                               min_dias=MIN_DIAS_VENCIMIENTO):
         chain_raw = polygon_fetch_chain(ticker, api_key)
         if len(chain_raw) == 0:
-            raise ValueError("Cadena vacia")
+            raise bm.SSVICalibrationError("Cadena vacia", "chain_empty")
         df = parse_chain(chain_raw)
         return bm.calibrar_superficie_ssvi(
             df, tau_obj, pd.Timestamp(date.today()),
@@ -596,6 +597,7 @@ if USAR_IV_POLYGON:
     detalle_ssvi = {}
     resultado_ssvi = {}
     motivo_calibracion = {}
+    error_calibracion = {}
     detalle_sector = {}
 
     for tk in tickers:
@@ -614,6 +616,7 @@ if USAR_IV_POLYGON:
             print(f"FALLBACK ({e}) ", end="")
             resultado = None
             motivo_calibracion[tk] = str(e)
+            error_calibracion[tk] = e
 
         if resultado is not None and resultado.get("usar_alas"):
             anual = resultado["sigma_atm_annual"]
@@ -691,6 +694,7 @@ else:
     detalle_ssvi = {}
     resultado_ssvi = {}
     motivo_calibracion = {}
+    error_calibracion = {}
     detalle_sector = {}
 
 
@@ -1654,6 +1658,14 @@ print(referencia_views.sort_values("Diff_Hist_Pi", ascending=False).to_string(in
 if MODO_PREVIEWS:
     _iv_prev = {t: float(sigma_iv_horizon[t]) for t in tickers
                 if USAR_IV_POLYGON and fuente_vol.get(t) in ("ssvi", "atm")}
+    _moment_source_prev = {
+        t: bm.moment_source_info(
+            iv_enabled=USAR_IV_POLYGON, is_us=pc.is_us_ticker(t),
+            calib_error=error_calibracion.get(t), surface=resultado_ssvi.get(t),
+            bkm=bkm_moments.get(t),
+            applied_fallback=(bkm_moments[t].get("fuente_momentos")
+                              if bkm_moments[t].get("fuente_momentos") != "ssvi" else None))
+        for t in tickers}
     _payload_prev = pipeline_io.build_previews_payload(
         as_of=fecha_fin,
         horizon_months=MESES_HORIZONTE,
@@ -1666,6 +1678,8 @@ if MODO_PREVIEWS:
         pi_eq=pi_eq,
         mu_historico=mu_historico,
         vol_horizon=np.sqrt(np.diag(Sigma_mat)),
+        vol_hist_horizon=np.sqrt(np.diag(Sigma_hist)),
+        moment_source=_moment_source_prev,
         w_mkt=w_mkt,
         iv_horizon=_iv_prev,
         iv_source={t: fuente_vol[t] for t in _iv_prev},
